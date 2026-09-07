@@ -108,14 +108,17 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                       description="Allow optional LLM consolidation (requires API key below)",
                       inline=True),
         ProviderField("llm_base_url", "LLM base URL", KIND_TEXT,
-                      default="https://api.deepseek.com/v1",
-                      description="OpenAI-compatible base URL for consolidation"),
+                      default="",
+                      description="Only used with a dedicated API key. "
+                                  "Leave EMPTY to follow Hermes' active provider URL"),
         ProviderField("llm_model", "LLM model", KIND_TEXT,
-                      default="deepseek-chat",
-                      description="Model used for consolidation"),
+                      default="",
+                      description="Only used with a dedicated API key. "
+                                  "Leave EMPTY to follow Hermes' active model"),
         ProviderField("llm_api_key", "LLM API key", KIND_SECRET,
                       env_key="NEUROMATRIX_API_KEY",
-                      description="API key for consolidation (secret; stored in env)",
+                      description="Leave EMPTY to auto-reuse Hermes' active LLM provider "
+                                  "(e.g. DeepSeek); set only to force a dedicated key",
                       inline=True),
         ProviderField("llm_daily_budget", "Daily LLM budget", KIND_NUMBER,
                       default="20",
@@ -168,17 +171,20 @@ LEGACY_CONFIG_SCHEMA = [
     },
     {
         "key": "llm_base_url",
-        "description": "OpenAI-compatible base URL for consolidation",
-        "default": "https://api.deepseek.com/v1",
+        "description": "Only used with a dedicated API key. "
+                       "Leave EMPTY to follow Hermes' active provider URL",
+        "default": "",
     },
     {
         "key": "llm_model",
-        "description": "Model used for consolidation",
-        "default": "deepseek-chat",
+        "description": "Only used with a dedicated API key. "
+                       "Leave EMPTY to follow Hermes' active model",
+        "default": "",
     },
     {
         "key": "llm_api_key",
-        "description": "API key for consolidation (secret; stored in .env)",
+        "description": "Leave EMPTY to auto-reuse Hermes' active LLM provider (e.g. DeepSeek); "
+                       "set only to force a dedicated key (stored in .env)",
         "secret": True,
         "env_var": "NEUROMATRIX_API_KEY",
     },

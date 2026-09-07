@@ -1,5 +1,5 @@
 name: neuromatrix
-version: 0.5.1
+version: 0.5.2
 description: "NeuroMatrix memory — local-first temporal knowledge-graph provider: cross-session entity IDs, alias merging, weighted decaying associations, sleep-style consolidation into dossiers (SQLite+FTS5, LLM-optional)."
 hooks:
   - on_session_end

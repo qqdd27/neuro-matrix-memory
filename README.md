@@ -146,9 +146,10 @@ s.close()
 ```
 
 Then install as a Hermes provider (Option A in “Install”), restart Hermes, run
-`hermes memory setup` and pick **neuromatrix**. Set `NEUROMATRIX_API_KEY`
-(any OpenAI-compatible key; DeepSeek works) only if you want LLM
-consolidation/rerank — without it everything runs in extractive mode.
+`hermes memory setup` and pick **neuromatrix**. LLM consolidation/rerank works
+out of the box: the provider **reuses Hermes' active model** (reads the model
+block of config.yaml + its `*_API_KEY` env). Set `NEUROMATRIX_API_KEY` only to
+force a dedicated provider — without any key everything runs in extractive mode.
 
 ## Development
 

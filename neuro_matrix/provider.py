@@ -114,7 +114,7 @@ except Exception:  # pragma: no cover - standalone dev / unit tests w/o hermes t
 
 
 from .config_schema import LEGACY_CONFIG_SCHEMA as CONFIG_SCHEMA  # noqa: E402
-from .llm import LLMClient  # noqa: E402
+from .llm import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient, resolve_hermes_llm_config  # noqa: E402
 from .store import NeuroMatrixStore  # noqa: E402
 
 NAME = "neuromatrix"
@@ -265,24 +265,43 @@ class NeuromatrixMemoryProvider(MemoryProvider):
 
         llm_enabled = is_truthy_value(self._config.get("llm_enabled", "true"))
         api_key = os.environ.get("NEUROMATRIX_API_KEY", "")
-        if llm_enabled and api_key:
-            client = LLMClient(
-                api_key=api_key,
-                base_url=str(self._config.get("llm_base_url") or DEFAULT_BASE_URL),
-                model=str(self._config.get("llm_model") or DEFAULT_MODEL),
-            )
-            self._store.llm = client
+        client = None
+        hers: dict = {}
+        if llm_enabled:
+            if not api_key:
+                # No dedicated key: reuse the LLM provider Hermes already uses.
+                hers = resolve_hermes_llm_config() or {}
+                if hers:
+                    client = LLMClient(
+                        api_key=hers["api_key"],
+                        base_url=hers["base_url"],
+                        model=hers["model"],
+                    )
+                    logger.info("neuromatrix LLM: reusing Hermes provider %s (%s)",
+                                hers.get("provider") or "?", hers["model"])
+            if api_key:
+                # Dedicated key: empty base/model fields follow Hermes' provider.
+                hers = hers or resolve_hermes_llm_config() or {}
+                client = LLMClient(
+                    api_key=api_key,
+                    base_url=str(self._config.get("llm_base_url") or hers.get("base_url")
+                                 or DEFAULT_BASE_URL),
+                    model=str(self._config.get("llm_model") or hers.get("model")
+                              or DEFAULT_MODEL),
+                )
+            if client is not None and self._store is not None:
+                self._store.llm = client
         ws = str(self._config.get("workspace_db") or "").replace(
             "$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
         if ws and os.path.abspath(ws) != os.path.abspath(db_path):
             try:
                 self._shared = NeuroMatrixStore(ws)
                 self._shared.llm_daily_budget = self._store.llm_daily_budget
-                if llm_enabled and api_key:
+                if client is not None:
                     self._shared.llm = LLMClient(
-                        api_key=api_key,
-                        base_url=str(self._config.get("llm_base_url") or DEFAULT_BASE_URL),
-                        model=str(self._config.get("llm_model") or DEFAULT_MODEL),
+                        api_key=client.api_key,
+                        base_url=client.base_url,
+                        model=client.model,
                     )
                 logger.info("neuromatrix shared workspace ready: %s", ws)
             except Exception as e:  # shared pool must never break the provider
