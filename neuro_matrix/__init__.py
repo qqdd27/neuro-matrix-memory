@@ -12,6 +12,12 @@ __version__ = "0.5.0"
 
 from .store import NeuroMatrixStore
 
+try:  # Hermes runtime: expose the provider for discovery/instantiation
+    from .provider import NAME, NeuromatrixMemoryProvider  # noqa: F401
+except Exception:  # standalone / tests: the provider layer stays optional
+    NAME = "neuromatrix"
+    NeuromatrixMemoryProvider = None  # type: ignore[assignment]
+
 
 def register(ctx) -> None:
     """Entry point used by directory installs
