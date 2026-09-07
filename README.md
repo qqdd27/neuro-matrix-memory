@@ -64,14 +64,18 @@ facts verbatim. Fully private, works offline, zero cost.
 ## Tools the agent gains
 
 One tool, `neuromatrix`, with actions:
-`search` (associative recall incl. dossiers) · `remember` (episodic fact) ·
-`probe` (entity dossier + aliases) · `link` (merge aliases) ·
+`search` (associative recall incl. dossiers, optional `rerank=true` LLM pass) ·
+`remember` (episodic fact) · `probe` (entity dossier + aliases) · `link` ·
 `decide` / `supersede` / `decisions` (decision evolution with trail & lessons) ·
 `remember_goal` / `remember_constraint` (intent ledger) ·
 `feedback` (reinforcement) · `contradict` (conflict scan) ·
 `artifact_store` / `artifact_get` / `artifact_find` / `artifact_delete`
 (big-data layer) · `foresight` / `reminders` (time-bounded signals) ·
+`ask` (grounded synthesis) · `ops` (memory-ops journal) ·
 `budget` (LLM quota) · `consolidate` (sleep cycle) · `stats`.
+Writes accept `scope: private|shared` — `shared` targets the workspace pool
+(`workspace_db` config) so several profiles/agents exchange durable context;
+reads (`search`, `probe`, `reminders`, `artifact_find`) merge both pools.
 
 Recalled context is injected automatically between turns (`prefetch`, bounded
 by `max_recall_chars`); built-in memory writes are mirrored into the graph
@@ -92,6 +96,31 @@ hermes neuromatrix import out.db   # restore
 ```
 
 Standalone: `python -m neuro_matrix.cli <command> [--db path]`.
+
+## CLI
+
+```bash
+python -m neuro_matrix.cli status --db ~/.hermes/neuromatrix.db
+python -m neuro_matrix.cli search "id_777" --db ...
+python -m neuro_matrix.cli remind-cron   # one line per due foresight (exit 0) — cron-friendly
+python -m neuro_matrix.cli consolidate --db ...
+python -m neuro_matrix.cli ingest [state.db]   # cold start from Hermes session db
+python -m neuro_matrix.cli export backup.db && python -m neuro_matrix.cli import backup.db
+```
+
+## MCP surface
+
+Same engine behind a standard MCP stdio server (JSON-RPC over stdio, zero
+dependencies — works with any MCP client):
+
+```bash
+python -m neuro_matrix.mcp --db ~/.hermes/neuromatrix.db
+```
+
+Tools: `memory_search`, `memory_remember`, `memory_probe`,
+`memory_decide`, `memory_decisions`, `memory_foresight`,
+`memory_reminders`, `memory_stats`. Register in Hermes via the MCP
+registry pointing at `python -m neuro_matrix.mcp`.
 
 ## Development
 

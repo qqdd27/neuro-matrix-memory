@@ -625,6 +625,110 @@ def test_ask_requires_llm_and_ops_tool():
     p.shutdown()
 
 
+def test_rerank_orders_by_llm():
+    """LLM rerank reorders heuristic top-k and spends exactly one budget call."""
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "m28.db")
+    store = NeuroMatrixStore(path)
+
+    class _FakeLLM:
+        calls = 0
+
+        @staticmethod
+        def available() -> bool:
+            return True
+
+        def chat_json(self, _messages):
+            type(self).calls += 1
+            return {"order": [b_id, a_id, c_id]}  # deliberately non-heuristic
+
+    ids = [store.remember(f"Токен {t} растёт на бирже X.", source="test") for t in ("AAA", "BBB", "CCC")]
+    a_id, b_id, c_id = ids
+    store.llm = _FakeLLM()
+    plain = store.search("CCC AAA BBB", limit=3, rerank=False)
+    store._cache.clear()
+    reranked = store.search("CCC AAA BBB", limit=3, rerank=True)
+    assert [int(r["fact_id"]) for r in reranked][:3] == [b_id, a_id, c_id]
+    assert _FakeLLM.calls == 1
+    assert [int(r["fact_id"]) for r in plain] != [b_id, a_id, c_id]
+    store.close()
+
+
+def test_shared_workspace_scope():
+    """scope=shared writes/reads the workspace pool across provider instances."""
+    import json as _json
+    from neuro_matrix.provider import NeuromatrixMemoryProvider
+    tmp = tempfile.mkdtemp()
+    wsp = os.path.join(tmp, "workspace.db")
+    prov_a = NeuromatrixMemoryProvider(config={
+        "db_path": os.path.join(tmp, "a.db"), "workspace_db": wsp,
+        "llm_enabled": "false", "auto_consolidate": "false"})
+    prov_a.initialize("sa", hermes_home=tmp)
+    r = prov_a.handle_tool_call("neuromatrix", {
+        "action": "remember", "content": "id_333 общий кошелёк команды", "scope": "shared"})
+    assert _json.loads(r)["ok"]
+    r = prov_a.handle_tool_call("neuromatrix", {
+        "action": "remember", "content": "id_333 приватный секрет владельца", "scope": "private"})
+    assert _json.loads(r)["ok"]
+    prov_a.shutdown()
+
+    prov_b = NeuromatrixMemoryProvider(config={
+        "db_path": os.path.join(tmp, "b.db"), "workspace_db": wsp,
+        "llm_enabled": "false", "auto_consolidate": "false"})
+    prov_b.initialize("sb", hermes_home=tmp)
+    hits = _json.loads(prov_b.handle_tool_call("neuromatrix", {
+        "action": "search", "query": "id_333"}))["results"]
+    texts = " ".join(h["text"] for h in hits)
+    assert "общий кошелёк команды" in texts and "приватный секрет" not in texts, texts
+    prov_b.shutdown()
+
+
+def test_prefetch_daily_foresight_reminder():
+    """Due foresight surfaces once per day in prefetch; not duplicated same day."""
+    import json as _json
+    from neuro_matrix.provider import NeuromatrixMemoryProvider
+    tmp = os.path.join(tempfile.mkdtemp(), "m30.db")
+    p = NeuromatrixMemoryProvider(config={"db_path": tmp, "llm_enabled": "false"})
+    p.initialize("s", hermes_home=os.path.dirname(tmp))
+    r = _json.loads(p.handle_tool_call("neuromatrix", {
+        "action": "foresight", "content": "Проверить листинг к марту",
+        "trigger_at": str(time.time() - 60)}))
+    assert r["ok"]
+    first = p.prefetch("ничего важного")
+    assert "⏰" in first and "листинг" in first
+    second = p.prefetch("ничего важного")
+    assert second.count("⏰") == 0 or first.count("⏰") == second.count("⏰")
+    p.shutdown()
+
+
+def test_mcp_stdio_protocol():
+    """MCP server: initialize/tools/list/tools/call/ping over pure handler."""
+    import json as _json
+    from neuro_matrix.mcp import TOOLS, handle_message
+    tmp = os.path.join(tempfile.mkdtemp(), "m31.db")
+    store = NeuroMatrixStore(tmp)
+    try:
+        init = handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                               "params": {}}, store)
+        assert init["result"]["serverInfo"]["name"] == "neuromatrix"
+        listed = handle_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, store)
+        assert len(listed["result"]["tools"]) == len(TOOLS) >= 8
+        called = handle_message({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                 "params": {"name": "memory_remember",
+                                            "arguments": {"content": "id_999 документ MCP"}}}, store)
+        payload = _json.loads(called["result"]["content"][0]["text"])
+        assert payload["fact_id"] > 0
+        found = handle_message({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                                "params": {"name": "memory_search",
+                                           "arguments": {"query": "id_999"}}}, store)
+        assert "документ MCP" in found["result"]["content"][0]["text"]
+        assert handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, store) is None
+        bad = handle_message({"jsonrpc": "2.0", "id": 5, "method": "nope"}, store)
+        assert bad["error"]["code"] == -32601
+    finally:
+        store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

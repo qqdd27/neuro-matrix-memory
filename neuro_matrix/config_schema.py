@@ -68,4 +68,15 @@ CONFIG_SCHEMA = [
         "description": "Sidecar payload files for the artifact layer",
         "default": "$HERMES_HOME/artifacts",
     },
+    {
+        "key": "workspace_db",
+        "description": "Shared workspace pool (SQLite) across profiles/agents — scope=shared reads/writes it",
+        "default": "",
+    },
+    {
+        "key": "llm_rerank",
+        "description": "Enable optional LLM rerank of search results (action=search rerank=true)",
+        "default": "true",
+        "choices": ["true", "false"],
+    },
 ]

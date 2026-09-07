@@ -85,6 +85,20 @@ def _cmd_remind(args: argparse.Namespace) -> int:
         s.close()
 
 
+def _cmd_remind_cron(args: argparse.Namespace) -> int:
+    s = NeuroMatrixStore(_resolve_db(args))
+    try:
+        due = s.foresights_due()
+        if not due:
+            print("(none)")
+            return 0
+        for d in due:
+            print(f"⏰ {d.get('text', '')[:300]}")
+        return 0
+    finally:
+        s.close()
+
+
 def _cmd_ingest(args: argparse.Namespace) -> int:
     """Cold start: replay recent user/assistant rows from a Hermes session DB
     (``state.db``) into the graph.  Heuristic table discovery: any table with a
@@ -203,6 +217,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("remind", parents=[common], help="list due foresights")
     sp.set_defaults(func=_cmd_remind)
+
+    sp = sub.add_parser("remind-cron", parents=[common],
+                        help="cron-friendly: one line per due foresight, exit 0 always")
+    sp.set_defaults(func=_cmd_remind_cron)
 
     sp = sub.add_parser("ingest", parents=[common], help="cold-start from a session DB (state.db)")
     sp.add_argument("source", nargs="?", default=None)

@@ -166,6 +166,14 @@ CREATE INDEX IF NOT EXISTS idx_ops_ts ON ops_log(ts);
 """
 
 
+def logger_debug_rerank(exc: Exception) -> None:  # pragma: no cover — best-effort noise
+    try:
+        import logging
+        logging.getLogger("neuro_matrix").debug("rerank skipped: %s", exc)
+    except Exception:
+        pass
+
+
 class NeuroMatrixStore:
     def __init__(
         self,
@@ -197,6 +205,7 @@ class NeuroMatrixStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         try:
             self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute("PRAGMA busy_timeout = 5000")
         except sqlite3.Error:
             pass
         self._conn.executescript(SCHEMA)
@@ -367,6 +376,7 @@ class NeuroMatrixStore:
         session_id: str = "",
         now: Optional[float] = None,
         as_of: Optional[float] = None,
+        rerank: bool = False,
     ) -> list[dict[str, Any]]:
         """Hybrid associative recall.
 
@@ -383,7 +393,7 @@ class NeuroMatrixStore:
         """
         now = now if now is not None else time.time()
         act_t = as_of if as_of is not None else now
-        cache_key = f"{query}|{limit}|{include_dossiers}|{as_of!r}"
+        cache_key = f"{query}|{limit}|{include_dossiers}|{as_of!r}|rerank={rerank}"
         hit = self._cache.get(cache_key)
         if hit and now - hit[0] < self._cache_ttl:
             return hit[1]
@@ -467,6 +477,31 @@ class NeuroMatrixStore:
                 "via": matched,
             })
         results.sort(key=lambda x: x["score"], reverse=True)
+
+        # LLM rerank (§10, optional): heuristic top-k -> LLM order.  Only when a
+        # client is configured, budget remains and the caller asked for it.
+        if rerank and as_of is None and results and self.llm is not None \
+                and getattr(self.llm, "available", lambda: False)() \
+                and self.llm_budget_remaining() > 0:
+            try:
+                cand = results[: max(limit * 3, 8)]
+                lines = "\n".join(
+                    f"[{h['fact_id']}] {h['kind']}: {h['text'][:300]}" for h in cand)
+                content = self.llm.chat_json([
+                    {"role": "system",
+                     "content": (
+                         "Rank the memory items by relevance to the question. "
+                         'Return JSON {"order": [<ids from most to least relevant>]}.')},
+                    {"role": "user", "content": f"QUESTION: {query}\n\nITEMS:\n{lines}"}])
+                self.llm_spend(1)
+                if isinstance(content, dict) and isinstance(content.get("order"), list):
+                    wanted = [int(i) for i in content["order"] if isinstance(i, (int, float))]
+                    by_id = {int(h["fact_id"]): h for h in cand}
+                    ordered = [by_id[i] for i in wanted if i in by_id]
+                    ordered += [h for h in cand if int(h["fact_id"]) not in by_id]
+                    results = ordered + [h for h in results if int(h["fact_id"]) not in by_id]
+            except Exception as e:  # noqa: BLE001  — rerank must never break recall
+                logger_debug_rerank(e)
 
         # Dossiers first — consolidated knowledge outranks raw episodes
         # (current-truth only; point-in-time reads skip dossiers).

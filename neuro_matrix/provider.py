@@ -174,6 +174,11 @@ NM_TOOL_SCHEMA = {
             "trigger_at": {"type": "string", "description": "ISO time or epoch seconds when a foresight becomes due."},
             "max_chars": {"type": "integer", "description": "Snippet limit (artifact_get, default 4000)."},
             "limit": {"type": "integer", "description": "Max results (default 6)."},
+            "scope": {"type": "string", "enum": ["private", "shared"],
+                      "description": "Storage scope (default 'private'). 'shared' writes/reads the "
+                                     "workspace pool (workspace_db) shared across profiles/agents."},
+            "rerank": {"type": "boolean",
+                       "description": "LLM rerank of heuristic results (action=search; spends 1 LLM call)."},
         },
         "required": ["action"],
     },
@@ -196,6 +201,7 @@ class NeuromatrixMemoryProvider(MemoryProvider):
     def __init__(self, config: Optional[dict] = None):
         self._config = config or _load_plugin_config()
         self._store: Optional[NeuroMatrixStore] = None
+        self._shared: Optional[NeuroMatrixStore] = None
         self._session_id = ""
         self._recall: Optional[RecallStatus] = None
         self._active = False
@@ -254,11 +260,28 @@ class NeuromatrixMemoryProvider(MemoryProvider):
         llm_enabled = is_truthy_value(self._config.get("llm_enabled", "true"))
         api_key = os.environ.get("NEUROMATRIX_API_KEY", "")
         if llm_enabled and api_key:
-            self._store.llm = LLMClient(
+            client = LLMClient(
                 api_key=api_key,
                 base_url=str(self._config.get("llm_base_url") or DEFAULT_BASE_URL),
                 model=str(self._config.get("llm_model") or DEFAULT_MODEL),
             )
+            self._store.llm = client
+        ws = str(self._config.get("workspace_db") or "").replace(
+            "$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
+        if ws and os.path.abspath(ws) != os.path.abspath(db_path):
+            try:
+                self._shared = NeuroMatrixStore(ws)
+                self._shared.llm_daily_budget = self._store.llm_daily_budget
+                if llm_enabled and api_key:
+                    self._shared.llm = LLMClient(
+                        api_key=api_key,
+                        base_url=str(self._config.get("llm_base_url") or DEFAULT_BASE_URL),
+                        model=str(self._config.get("llm_model") or DEFAULT_MODEL),
+                    )
+                logger.info("neuromatrix shared workspace ready: %s", ws)
+            except Exception as e:  # shared pool must never break the provider
+                logger.error("neuromatrix workspace %s failed: %s", ws, e)
+                self._shared = None
         self._retention_days = float(self._config.get("retention_days", 365) or 365)
         self._auto_consolidate = is_truthy_value(self._config.get("auto_consolidate", "true"))
         ctx = kwargs.get("agent_context")
@@ -289,34 +312,44 @@ class NeuromatrixMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Background recall for the upcoming turn; MUST be fast (store caches).
-        Respects the recall budget: min-score gate + max_recall_chars cap."""
+        Respects the recall budget: min-score gate + max_recall_chars cap.
+        Surfaces due foresights once per day (v0.3 cron-free bridge)."""
         self._recall = None
-        if self._store is None or not query:
+        if self._store is None:
             return ""
+        parts: list[str] = []
         try:
-            results = self._store.search(query, limit=6)
+            today = time.strftime("%Y%m%d", time.gmtime())
+            if self._store.get_meta("nm:remind_day") != today:
+                self._store.set_meta("nm:remind_day", today)
+                for d in self._store.foresights_due(limit=3):
+                    parts.append(f"- ⏰ {d['text'][:180]}")
         except Exception as e:
-            logger.debug("neuromatrix prefetch failed: %s", e)
+            logger.debug("neuromatrix reminders failed: %s", e)
+        if query:
+            results: list[dict[str, Any]] = []
+            try:
+                results = self._store.search(query, limit=6)
+            except Exception as e:
+                logger.debug("neuromatrix prefetch failed: %s", e)
+            gate = getattr(self, "_min_recall_score", 0.0)
+            if gate:
+                results = [r for r in results if float(r.get("score", 0.0)) >= gate]
+            budget = int(getattr(self, "_max_recall_chars", 1500))
+            used = 0
+            lines: list[str] = []
+            for r in results:
+                line = self._format_hit(r)
+                if lines and used + len(line) > budget:
+                    break
+                lines.append(line)
+                used += len(line) + 1
+            parts.extend(lines)
+            if lines:
+                self._recall = RecallStatus(provider_label="NeuroMatrix", count=len(lines))
+        if not parts:
             return ""
-        gate = getattr(self, "_min_recall_score", 0.0)
-        if gate:
-            results = [r for r in results
-                       if float(r.get("score", 0.0)) >= gate]
-        if not results:
-            return ""
-        budget = int(getattr(self, "_max_recall_chars", 1500))
-        lines: list[str] = []
-        used = 0
-        for r in results:
-            line = self._format_hit(r)
-            if lines and used + len(line) > budget:
-                break
-            lines.append(line)
-            used += len(line) + 1
-        if not lines:
-            return ""
-        self._recall = RecallStatus(provider_label="NeuroMatrix", count=len(lines))
-        return f"## {DISPLAY}\n" + "\n".join(lines)
+        return f"## {DISPLAY}\n" + "\n".join(parts)
 
     def recall_status(self) -> Optional[RecallStatus]:
         return self._recall
@@ -437,28 +470,42 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 self._store.close()
             except Exception as e:
                 logger.debug("neuromatrix shutdown close() failed: %s", e)
+        if self._shared is not None:
+            try:
+                self._shared.close()
+            except Exception as e:
+                logger.debug("neuromatrix shutdown shared close() failed: %s", e)
         self._store = None
+        self._shared = None
         self._recall = None
 
 
 def _tool_search(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    res = prov._store.search(a["query"], limit=int(a.get("limit", 6))) if prov._store else []
+    if not prov._store:
+        return tool_error("provider not initialized")
+    query = a.get("query")
+    if not query:
+        return tool_error("search requires 'query'")
+    rerank = is_truthy_value(a.get("rerank"))
+    res = _search_merged(prov, query, int(a.get("limit", 6)), rerank=rerank)
     out = [{"text": r["text"], "source": r["source"], "score": r["score"],
-            "via": r.get("via", [])} for r in res]
+            "via": r.get("via", []),
+            **({"workspace": "shared"} if r.get("workspace") else {})} for r in res]
     return json.dumps({"ok": True, "count": len(out), "results": out}, ensure_ascii=False)
 
 
 def _tool_remember(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
-    fid = prov._store.remember(a["content"], source="tool", session_id=prov._session_id)
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("shared workspace not configured (workspace_db); scope=shared unavailable")
+    fid = store.remember(a["content"], source="tool", session_id=prov._session_id)
     return json.dumps({"ok": True, "fact_id": fid})
 
 
 def _tool_probe(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     if not prov._store:
         return tool_error("provider not initialized")
-    ent = prov._store.entity(a["entity"])
+    ent = _probe_merged(prov, a["entity"])
     if ent is None:
         return json.dumps({"ok": True, "found": False, "entity": a["entity"]})
     return json.dumps({"ok": True, "found": True, **ent}, ensure_ascii=False)
@@ -481,12 +528,53 @@ def _as_list(v: Any) -> list[str]:
     return [str(v)]
 
 
+def _ws(prov: NeuromatrixMemoryProvider, a: dict) -> Optional[NeuroMatrixStore]:
+    """Route an op to the private or shared store by scope."""
+    scope = str(a.get("scope") or "private")
+    if scope == "shared":
+        return getattr(prov, "_shared", None)
+    return prov._store
+
+
+def _search_merged(prov: NeuromatrixMemoryProvider, query: str, limit: int,
+                   rerank: bool = False) -> list[dict[str, Any]]:
+    """Private pool first, then shared pool (workspace); score-merged."""
+    out = []
+    if prov._store:
+        out = prov._store.search(query, limit=limit if not prov._shared else limit * 2,
+                                 rerank=rerank)
+    if prov._shared:
+        seen = {r["text"] for r in out}
+        for h in prov._shared.search(query, limit=limit):
+            if h["text"] not in seen:
+                hh = dict(h)
+                hh["workspace"] = "shared"
+                out.append(hh)
+        out.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    return out[:limit]
+
+
+def _probe_merged(prov: NeuromatrixMemoryProvider, key: str) -> Optional[dict[str, Any]]:
+    if prov._store:
+        ent = prov._store.entity(key)
+        if ent is not None:
+            return ent
+    if prov._shared:
+        ent2 = prov._shared.entity(key)
+        if ent2 is not None:
+            ent2 = dict(ent2)
+            ent2["workspace"] = "shared"
+            return ent2
+    return None
+
+
 def _tool_decide(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
     if not a.get("concept") or not a.get("choice"):
         return tool_error("decide requires 'concept' and 'choice'")
-    fid = prov._store.decide(
+    fid = store.decide(
         a["concept"], a["choice"],
         criteria=_as_list(a.get("criteria")),
         scope_tags=_as_list(a.get("scope_tags")),
@@ -498,11 +586,12 @@ def _tool_decide(prov: NeuromatrixMemoryProvider, a: dict) -> str:
 
 
 def _tool_supersede(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
     if not a.get("decision_id") or not a.get("choice"):
         return tool_error("supersede requires 'decision_id' and 'choice'")
-    fid = prov._store.supersede(
+    fid = store.supersede(
         int(a["decision_id"]), a["choice"],
         criteria=_as_list(a.get("criteria")),
         scope_tags=_as_list(a.get("scope_tags")),
@@ -514,25 +603,27 @@ def _tool_supersede(prov: NeuromatrixMemoryProvider, a: dict) -> str:
 
 
 def _tool_decisions(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
     if not a.get("concept"):
         return tool_error("decisions requires 'concept'")
-    return json.dumps({"ok": True, **prov._store.decisions(a["concept"])},
+    return json.dumps({"ok": True, **store.decisions(a["concept"])},
                       ensure_ascii=False)
 
 
 def _tool_remember_goal(prov: NeuromatrixMemoryProvider, a: dict, kind: str) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
     if not a.get("content"):
         return tool_error(f"{kind} requires 'content'")
     if kind == "goal":
-        fid = prov._store.remember_goal(a["content"], entity=a.get("entity"),
-                                         session_id=prov._session_id)
+        fid = store.remember_goal(a["content"], entity=a.get("entity"),
+                                  session_id=prov._session_id)
     else:
-        fid = prov._store.remember_constraint(a["content"], entity=a.get("entity"),
-                                              session_id=prov._session_id)
+        fid = store.remember_constraint(a["content"], entity=a.get("entity"),
+                                        session_id=prov._session_id)
     return json.dumps({"ok": True, "fact_id": fid, "kind": kind})
 
 
@@ -555,15 +646,16 @@ def _tool_contradict(prov: NeuromatrixMemoryProvider, a: dict) -> str:  # noqa: 
 
 
 def _tool_artifact_store(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
     if not a.get("name"):
         return tool_error("artifact_store requires 'name'")
     has_text = bool(a.get("text"))
     has_file = bool(a.get("file_path"))
     if has_text == has_file:
         return tool_error("artifact_store requires exactly one of 'text'|'file_path'")
-    res = prov._store.store_artifact(
+    res = store.store_artifact(
         a["name"], text=a.get("text") if has_text else None,
         file_path=a.get("file_path") if has_file else None,
         kind=a.get("kind") or "document", topic=a.get("topic"),
@@ -574,9 +666,10 @@ def _tool_artifact_store(prov: NeuromatrixMemoryProvider, a: dict) -> str:
 
 
 def _tool_artifact_get(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
-    res = prov._store.artifact_get(
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    res = store.artifact_get(
         int(a["artifact_id"]) if a.get("artifact_id") is not None else None,
         name=a.get("name"), max_chars=int(a.get("max_chars", 4000)))
     if res is None:
@@ -589,16 +682,19 @@ def _tool_artifact_find(prov: NeuromatrixMemoryProvider, a: dict) -> str:
         return tool_error("provider not initialized")
     if not a.get("query"):
         return tool_error("artifact_find requires 'query'")
-    return json.dumps({"ok": True, "results": prov._store.artifact_find(a["query"])},
-                      ensure_ascii=False)
+    out = list(prov._store.artifact_find(a["query"]))
+    if prov._shared:
+        out += list(prov._shared.artifact_find(a["query"]))
+    return json.dumps({"ok": True, "results": out}, ensure_ascii=False)
 
 
 def _tool_artifact_delete(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
     if not a.get("artifact_id"):
         return tool_error("artifact_delete requires 'artifact_id'")
-    ok = prov._store.artifact_delete(int(a["artifact_id"]))
+    ok = store.artifact_delete(int(a["artifact_id"]))
     return json.dumps({"ok": ok, "deleted": bool(ok)})
 
 
@@ -625,16 +721,17 @@ def _as_ts(v: Any) -> float:
 
 
 def _tool_foresight(prov: NeuromatrixMemoryProvider, a: dict) -> str:
-    if not prov._store:
-        return tool_error("provider not initialized")
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
     if not a.get("content") or not a.get("trigger_at"):
         return tool_error("foresight requires 'content' and 'trigger_at'")
     try:
         trig = _as_ts(a["trigger_at"])
     except ValueError as e:
         return tool_error(str(e))
-    fid = prov._store.plan_foresight(a["content"], trig, entity=a.get("entity"),
-                                     session_id=prov._session_id)
+    fid = store.plan_foresight(a["content"], trig, entity=a.get("entity"),
+                               session_id=prov._session_id)
     return json.dumps({"ok": True, "foresight_id": fid, "trigger_at": trig})
 
 
@@ -642,6 +739,9 @@ def _tool_reminders(prov: NeuromatrixMemoryProvider, a: dict) -> str:  # noqa: A
     if not prov._store:
         return tool_error("provider not initialized")
     due = prov._store.foresights_due()
+    if prov._shared:
+        due += prov._shared.foresights_due()
+    due = sorted(due, key=lambda d: d.get("trigger_at", 0.0))
     return json.dumps({"ok": True, "due": due, "count": len(due)}, ensure_ascii=False)
 
 
@@ -658,7 +758,7 @@ def _tool_ask(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     if llm is None or not getattr(llm, "available", lambda: False)():
         return tool_error("ask requires an LLM key (NEUROMATRIX_API_KEY) — use 'search' instead")
     try:
-        hits = store.search(query, limit=8)
+        hits = _search_merged(prov, query, 8)
     except Exception as e:  # noqa: BLE001
         return tool_error(f"search failed: {e}")
     if not hits:
