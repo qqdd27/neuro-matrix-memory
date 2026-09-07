@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuro-matrix-memory"
+version = "0.2.0"
+description = "Local-first temporal knowledge-graph memory provider for Hermes Agent (NeuroMatrix). Cross-session entity IDs, weighted associations, sleep-style consolidation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["hermes-agent", "memory", "knowledge-graph", "llm", "agents"]
+dependencies = []
+
+[project.entry-points."hermes_agent.memory_providers"]
+neuromatrix = "neuro_matrix.provider:register"
+
+[tool.setuptools]
+packages = ["neuro_matrix"]
