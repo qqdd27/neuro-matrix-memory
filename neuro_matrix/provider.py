@@ -146,6 +146,7 @@ NM_TOOL_SCHEMA = {
                          "remember_constraint", "feedback", "contradict",
                          "artifact_store", "artifact_get", "artifact_find",
                          "artifact_delete", "foresight", "reminders", "ask",
+                         "cite", "explain", "skill",
                          "ops", "budget",
                          "consolidate", "stats"],
             },
@@ -179,6 +180,10 @@ NM_TOOL_SCHEMA = {
                                      "workspace pool (workspace_db) shared across profiles/agents."},
             "rerank": {"type": "boolean",
                        "description": "LLM rerank of heuristic results (action=search; spends 1 LLM call)."},
+            "evidence_ids": {"type": "array", "items": {"type": "integer"},
+                             "description": "Source fact ids backing a claim (action=cite)."},
+            "out_dir": {"type": "string",
+                        "description": "Output directory for the skill draft (action=skill)."},
         },
         "required": ["action"],
     },
@@ -698,6 +703,47 @@ def _tool_artifact_delete(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     return json.dumps({"ok": ok, "deleted": bool(ok)})
 
 
+def _tool_explain(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Render a claim with evidence citations; falls back to the shared pool."""
+    if not prov._store:
+        return tool_error("provider not initialized")
+    fid = int(a.get("fact_id") or 0)
+    if not fid:
+        return tool_error("explain requires 'fact_id'")
+    store = prov._store
+    res = store.explain_fact(fid)
+    if res is None and prov._shared:
+        res = prov._shared.explain_fact(fid)
+    if res is None:
+        return json.dumps({"ok": True, "found": False, "fact_id": fid})
+    return json.dumps({"ok": True, "found": True, **res}, ensure_ascii=False)
+
+
+def _tool_cite(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    fid = int(a.get("fact_id") or 0)
+    ev = [int(i) for i in (a.get("evidence_ids") or []) if isinstance(i, (int, float))]
+    if not fid or not ev:
+        return tool_error("cite requires 'fact_id' and non-empty 'evidence_ids'")
+    res = store.attach_evidence(fid, ev)
+    if res is None:
+        return tool_error(f"cite failed: fact {fid} missing/archived or empty evidence")
+    return json.dumps({"ok": True, **res}, ensure_ascii=False)
+
+
+def _tool_skill(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    concept = a.get("concept")
+    if not concept:
+        return tool_error("skill requires 'concept'")
+    res = store.skill_propose(concept, out_dir=a.get("out_dir"))
+    return json.dumps({"ok": True, **res}, ensure_ascii=False)
+
+
 def _tool_budget(prov: NeuromatrixMemoryProvider, a: dict) -> str:  # noqa: ARG001
     if not prov._store:
         return tool_error("provider not initialized")
@@ -824,6 +870,9 @@ _HANDLERS = {
     "foresight": _tool_foresight,
     "reminders": _tool_reminders,
     "ask": _tool_ask,
+    "cite": _tool_cite,
+    "explain": _tool_explain,
+    "skill": _tool_skill,
     "ops": _tool_ops,
     "budget": _tool_budget,
     "consolidate": _tool_consolidate,

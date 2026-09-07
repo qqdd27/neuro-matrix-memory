@@ -729,6 +729,43 @@ def test_mcp_stdio_protocol():
         store.close()
 
 
+def test_cite_explain_and_skill_propose():
+    """Claims carry provenance citations; skill bridge writes a reviewable draft."""
+    import json as _json
+    from neuro_matrix.provider import NeuromatrixMemoryProvider
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "m32.db")
+    store = NeuroMatrixStore(path)
+    e1 = store.remember("id_500 пароль кошелька сменён 1 сентября.", source="test", session_id="sessA")
+    e2 = store.remember("id_777 связан с тем же кошельком.", source="test", session_id="sessB")
+    claim = store.remember("id_777 теперь под новым паролем.", source="test", session_id="sessC")
+    res = store.attach_evidence(claim, [e1, e2])
+    assert res is not None and res["evidence"] == [e1, e2]
+    exp = store.explain_fact(claim)
+    assert exp["cited_text"].startswith("id_777 теперь")
+    assert f"[fact #{e1}, session sessA]" in exp["cited_text"]
+    assert f"[fact #{e2}, session sessB]" in exp["cited_text"]
+    assert any(o["op"] == "LINK" for o in store.ops_view())
+
+    d1 = store.decide("stack_full", "Supabase", criteria=["sql"], reason="RLS")
+    store.supersede(d1, "Firebase", criteria=["offline", "mobile"], reason="сроки")
+    rep = store.skill_propose("stack_full", out_dir=os.path.join(tmp, "skills"))
+    assert os.path.exists(rep["path"])
+    with open(rep["path"], encoding="utf-8") as f:
+        md = f.read()
+    assert "# Proposed skill" in md and "Supabase" in md and "Firebase" in md
+    assert "[fact #" not in md or "episodes" in rep  # citations optional here
+    store.close()
+
+    # provider-level roundtrip (private scope)
+    p = NeuromatrixMemoryProvider(config={"db_path": path, "llm_enabled": "false"})
+    p.initialize("s", hermes_home=tmp)
+    out = _json.loads(p.handle_tool_call("neuromatrix", {
+        "action": "explain", "fact_id": claim}))
+    assert out["found"] and "session sessA" in out["cited_text"]
+    p.shutdown()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

@@ -71,7 +71,9 @@ One tool, `neuromatrix`, with actions:
 `feedback` (reinforcement) · `contradict` (conflict scan) ·
 `artifact_store` / `artifact_get` / `artifact_find` / `artifact_delete`
 (big-data layer) · `foresight` / `reminders` (time-bounded signals) ·
-`ask` (grounded synthesis) · `ops` (memory-ops journal) ·
+`ask` (grounded synthesis) · `cite` / `explain` (claim provenance with
+`[fact #N, session]` citations) · `skill` (procedure → reviewable skill draft) ·
+`ops` (memory-ops journal) ·
 `budget` (LLM quota) · `consolidate` (sleep cycle) · `stats`.
 Writes accept `scope: private|shared` — `shared` targets the workspace pool
 (`workspace_db` config) so several profiles/agents exchange durable context;

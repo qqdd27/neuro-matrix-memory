@@ -7,6 +7,7 @@ also runnable standalone: ``python -m neuro_matrix.cli <command>``.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -80,6 +81,16 @@ def _cmd_remind(args: argparse.Namespace) -> int:
         for d in due:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(d["trigger_at"]))
             print(f"[#{d['foresight_id']} due {when}] {d['text']}")
+        return 0
+    finally:
+        s.close()
+
+
+def _cmd_skill_propose(args: argparse.Namespace) -> int:
+    s = NeuroMatrixStore(_resolve_db(args))
+    try:
+        rep = s.skill_propose(args.concept, out_dir=args.out)
+        print(json.dumps(rep, ensure_ascii=False))
         return 0
     finally:
         s.close()
@@ -221,6 +232,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("remind-cron", parents=[common],
                         help="cron-friendly: one line per due foresight, exit 0 always")
     sp.set_defaults(func=_cmd_remind_cron)
+
+    sp = sub.add_parser("skill-propose", parents=[common],
+                        help="distill a decision concept into a reviewable skill draft")
+    sp.add_argument("concept")
+    sp.add_argument("--out", default=None)
+    sp.set_defaults(func=_cmd_skill_propose)
 
     sp = sub.add_parser("ingest", parents=[common], help="cold-start from a session DB (state.db)")
     sp.add_argument("source", nargs="?", default=None)

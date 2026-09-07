@@ -739,6 +739,130 @@ class NeuroMatrixStore:
             (now, concept_eid))
         self._conn.commit()
 
+    def attach_evidence(self, fact_id: int, evidence_ids: list[int],
+                        now: Optional[float] = None) -> Optional[dict[str, Any]]:
+        """EMem-style provenance (§19.1): mark source facts as the evidence of a
+        synthesized claim.  The claim can then be quoted with ``[fact #N, session]``
+        markers instead of being trusted on faith."""
+        row = self._conn.execute(
+            "SELECT meta, text FROM facts WHERE id = ? AND archived = 0",
+            (fact_id,)).fetchone()
+        if row is None:
+            return None
+        now = now if now is not None else time.time()
+        keep: list[int] = []
+        ev_ids = [int(i) for i in evidence_ids if i and i != fact_id]
+        if not ev_ids:
+            return None
+        meta = json.loads(row["meta"] or "{}") or {}
+        prev = [int(i) for i in (meta.get("evidence") or [])]
+        for i in prev + ev_ids:
+            if i not in keep:
+                keep.append(i)
+        meta["evidence"] = keep[-32:]
+        self._conn.execute(
+            "UPDATE facts SET meta = ? WHERE id = ?",
+            (json.dumps(meta, ensure_ascii=False), fact_id))
+        self._oplog("LINK", f"evidence:{fact_id}", fact_id,
+                    detail=",".join(str(i) for i in keep[-32:]), now=now)
+        self._conn.commit()
+        self._cache.clear()
+        return {"fact_id": fact_id, "evidence": keep[-32:], "text": row["text"]}
+
+    def explain_fact(self, fact_id: int) -> Optional[dict[str, Any]]:
+        """Render a claim with its evidence trail and citation markers."""
+        row = self._conn.execute(
+            "SELECT text, kind, session_id, ts, meta FROM facts WHERE id = ?",
+            (fact_id,)).fetchone()
+        if row is None:
+            return None
+        meta = json.loads(row["meta"] or "{}") or {}
+        ev = [int(i) for i in (meta.get("evidence") or [])]
+        evidence: list[dict[str, Any]] = []
+        if ev:
+            q = ",".join("?" * len(ev))
+            for r in self._conn.execute(
+                    f"SELECT id, text, session_id, ts FROM facts WHERE id IN ({q})",
+                    ev).fetchall():
+                evidence.append({"fact_id": int(r["id"]), "text": r["text"][:500],
+                                 "session_id": r["session_id"] or "", "ts": r["ts"]})
+        evidence.sort(key=lambda x: x["ts"])
+        markers = []
+        for e in evidence:
+            sid = e["session_id"]
+            markers.append(f"[fact #{e['fact_id']}, session {sid or '?'}]")
+        cited = row["text"] + (" " + " ".join(markers) if markers else "")
+        return {"fact_id": fact_id, "text": row["text"], "kind": row["kind"],
+                "session_id": row["session_id"] or "", "cited_text": cited,
+                "evidence": evidence}
+
+    def skill_propose(self, concept: str,
+                      out_dir: Optional[str] = None) -> dict[str, Any]:
+        """Memp/MemTool procedure bridge (§19.5): distill a decision concept
+        (trail + lessons + recent episodes) into a reviewable skill draft on
+        disk.  Human reviews it before it ever becomes a real skill."""
+        dec = self.decisions(concept)
+        out_dir = out_dir or os.path.join(
+            os.path.dirname(os.path.abspath(self.path)), "skills")
+        os.makedirs(out_dir, exist_ok=True)
+        trail = dec.get("trail") or []
+        trail_ids = {int(t["decision_id"]) for t in trail}
+        lessons: list[str] = []
+        rows = self._conn.execute(
+            "SELECT id, text, meta, ts FROM facts WHERE kind = 'lesson' "
+            "AND archived = 0 ORDER BY id DESC LIMIT 300").fetchall()
+        for r in rows:
+            m = json.loads(r["meta"] or "{}") or {}
+            old, new = m.get("old_decision"), m.get("new_decision")
+            same_concept = (m.get("concept") and _norm(m["concept"]) == _norm(concept))
+            if (old in trail_ids and new in trail_ids) or same_concept:
+                lessons.append(r["text"])
+        lessons = list(dict.fromkeys(reversed(lessons)))
+        episodes: list[dict[str, Any]] = []
+        ce = self._entity_id_lookup(_norm(concept))
+        if ce is not None:
+            for r in self._conn.execute(
+                    "SELECT f.id, f.text, f.session_id, f.ts FROM facts f "
+                    "JOIN fact_entities fe ON fe.fact_id = f.id AND fe.entity_id = ? "
+                    "WHERE f.kind IN ('episodic','episode') AND f.archived = 0 "
+                    "ORDER BY f.ts DESC LIMIT 6", (ce,)).fetchall():
+                episodes.append({"fact_id": int(r["id"]), "text": r["text"][:300],
+                                 "session_id": r["session_id"] or ""})
+        episodes.reverse()
+        active = dec.get("active")
+        safe = re.sub(r"[^\w\-]+", "_", _norm(concept))[:80] or "concept"
+        lines = [f"# Proposed skill: {concept}",
+                 f"> Reviewable draft — promote to a real skill only after human review.",
+                 "", "## Trigger",
+                 f"Use when the topic **{concept}** comes up and a decision or procedure is needed.",
+                 "", "## Context (why we chose what)",
+                 "| # | Choice | Status | Criteria | Reason |"]
+        for i, t in enumerate(trail, 1):
+            lines.append(f"| {i} | {t['choice']} | {t['status']} | "
+                         f"{', '.join(t['criteria'] or []) or '-'} | "
+                         f"{t.get('reason') or '-'} |")
+        if active:
+            lines.append("")
+            lines.append(f"**Active:** {active['choice']} "
+                         f"(decision #{active['decision_id']})")
+        lines.append("")
+        lines.append("## Proposed procedure")
+        if lessons:
+            lines += [f"- {l}" for l in lessons]
+        else:
+            lines.append("- (no consolidated lessons yet — propose again after a "
+                         "decision change or corrections)")
+        if episodes:
+            lines.append("")
+            lines.append("## Recent episodes backing this")
+            for e in episodes:
+                lines.append(f"- {e['text']} — [fact #{e['fact_id']}, "
+                             f"session {e['session_id'] or '?'}]")
+        path = os.path.join(out_dir, f"{safe}.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return {"path": path, "concept": concept, "lessons": len(lessons),
+                "episodes": len(episodes), "active": (active or {}).get("choice")}
     def decisions(self, concept: str) -> dict[str, Any]:
         """Current active decision + full evolution trail for a concept."""
         cn = _norm(concept)
@@ -1850,7 +1974,8 @@ _thread_safe([
     "remember_constraint", "feedback", "contradictions", "rollup_session",
     "store_artifact", "artifact_get", "artifact_find", "artifact_delete",
     "llm_budget_remaining", "llm_spend", "plan_foresight", "foresights_due",
-    "export_markdown", "ops_view",
+    "export_markdown", "ops_view", "attach_evidence", "explain_fact",
+    "skill_propose",
 ])
 
 __all__ = ["NeuroMatrixStore", "extract_entities", "extract_alias_pairs"]
