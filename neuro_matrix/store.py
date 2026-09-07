@@ -323,8 +323,9 @@ class NeuroMatrixStore:
         # Importance gate on the user side: bare single-anchor questions
         # ("what about id_777?") are ephemeral — the assistant's answer below
         # carries the durable statement.  Store the user turn only when it is
-        # substantive (>=2 anchors, an alias statement, or a long message).
-        if user_content and not _is_trivial(user_content):
+        # substantive (>=2 anchors, an alias statement, or a long message) and
+        # is not system/background boilerplate.
+        if user_content and not _is_trivial(user_content) and not _is_notification(user_content):
             user_keys = extract_entities(user_content)
             user_worth = (
                 len(user_keys) >= 2
@@ -2049,6 +2050,23 @@ def _is_trivial(text: str) -> bool:
         "hi", "hey", "hello", "continue", "go ahead", "got it", "done",
         "спасибо", "ок", "окей", "да", "нет", "привет", "понятно", "ага",
     }
+
+
+_NOTIFICATION_MARKERS = (
+    "[important:",
+    "[important]",
+    "background process proc_",
+    "background task proc_",
+    "команда завершена",
+    "процесс завершён",
+)
+
+
+def _is_notification(text: str) -> bool:
+    """System/background boilerplate (process-done notices surfaced as user
+    turns) is not user intent — keep the assistant's answer, drop the notice."""
+    head = (text or "").strip()[:300].lower()
+    return any(marker in head for marker in _NOTIFICATION_MARKERS)
 
 
 def _thread_safe(names: list[str]) -> None:
