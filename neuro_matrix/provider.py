@@ -113,7 +113,7 @@ except Exception:  # pragma: no cover - standalone dev / unit tests w/o hermes t
         return str(v or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-from .config_schema import CONFIG_SCHEMA  # noqa: E402
+from .config_schema import LEGACY_CONFIG_SCHEMA as CONFIG_SCHEMA  # noqa: E402
 from .llm import LLMClient  # noqa: E402
 from .store import NeuroMatrixStore  # noqa: E402
 
