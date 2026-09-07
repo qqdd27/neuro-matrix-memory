@@ -147,6 +147,7 @@ NM_TOOL_SCHEMA = {
                          "artifact_store", "artifact_get", "artifact_find",
                          "artifact_delete", "foresight", "reminders", "ask",
                          "cite", "explain", "skill",
+                         "persona", "policy",
                          "ops", "budget",
                          "consolidate", "stats"],
             },
@@ -435,6 +436,18 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 self._store.set_meta("last_prune_day", today)
                 if n:
                     logger.info("neuromatrix prune: archived %d old facts", n)
+            if self._shared is not None:
+                # The workspace pool gets its own 'sleep' pass — shared episodic
+                # noise decays and consolidates too, without touching private data.
+                if self._auto_consolidate:
+                    srep = self._shared.consolidate(max_llm_calls=1)
+                    if srep.get("dossiers_updated") or srep.get("lessons"):
+                        logger.info("neuromatrix workspace consolidate: %s", srep)
+                if self._shared.get_meta("last_prune_day") != today:
+                    sn = self._shared.prune(retention_days=self._retention_days)
+                    self._shared.set_meta("last_prune_day", today)
+                    if sn:
+                        logger.info("neuromatrix workspace prune: %d old facts", sn)
         except Exception as e:
             logger.debug("neuromatrix on_session_end failed: %s", e)
 
@@ -744,6 +757,25 @@ def _tool_skill(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     return json.dumps({"ok": True, **res}, ensure_ascii=False)
 
 
+def _tool_persona(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Generate the reviewable persona/profile card (PersonaMem mirror)."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    res = store.export_profile_card(out_dir=a.get("out_dir"))
+    return json.dumps({"ok": True, **res}, ensure_ascii=False)
+
+
+def _tool_policy(prov: NeuromatrixMemoryProvider, a: dict) -> str:  # noqa: ARG001
+    """Learned-policy digest from the memory-ops journal (RL-ready data)."""
+    if not prov._store:
+        return tool_error("provider not initialized")
+    out: dict[str, Any] = {"private": prov._store.policy_report()}
+    if prov._shared:
+        out["shared"] = prov._shared.policy_report()
+    return json.dumps({"ok": True, **out}, ensure_ascii=False)
+
+
 def _tool_budget(prov: NeuromatrixMemoryProvider, a: dict) -> str:  # noqa: ARG001
     if not prov._store:
         return tool_error("provider not initialized")
@@ -873,6 +905,8 @@ _HANDLERS = {
     "cite": _tool_cite,
     "explain": _tool_explain,
     "skill": _tool_skill,
+    "persona": _tool_persona,
+    "policy": _tool_policy,
     "ops": _tool_ops,
     "budget": _tool_budget,
     "consolidate": _tool_consolidate,

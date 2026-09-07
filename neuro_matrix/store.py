@@ -796,6 +796,104 @@ class NeuroMatrixStore:
                 "session_id": row["session_id"] or "", "cited_text": cited,
                 "evidence": evidence}
 
+    def export_profile_card(self, out_dir: Optional[str] = None) -> dict[str, Any]:
+        """PersonaMem-style reviewable profile card: who this memory says the
+        user/agent is — top entities, active decisions, goals, constraints,
+        lessons.  Deterministic; the human audits the mirror."""
+        out_dir = out_dir or os.path.join(
+            os.path.dirname(os.path.abspath(self.path)), "profile")
+        os.makedirs(out_dir, exist_ok=True)
+        st = self.stats()
+        lines = ["# NeuroMatrix persona card (auto-generated, reviewable)",
+                 "> Derived from stored memory — a mirror for humans to audit.",
+                 "> Regenerate with `export_profile_card()` / CLI `profile-card`.",
+                 "",
+                 f"- facts: {st['facts']} | entities: {st['entities']} "
+                 f"({st['aliases']} aliases) | dossiers: {st['dossiers']}",
+                 ""]
+        ents = self._conn.execute(
+            "SELECT e.key, e.label, e.kind, e.hits FROM entities e "
+            "ORDER BY e.hits DESC LIMIT 15").fetchall()
+        if ents:
+            lines += ["## Top entities", ""]
+            for e in ents:
+                lines.append(f"- {e['label'] or e['key']} (`{e['key']}`, "
+                             f"kind={e['kind']}, {e['hits']} mentions)")
+            lines.append("")
+        decs = self._conn.execute(
+            "SELECT meta, ts FROM facts WHERE kind = 'decision' AND archived = 0 "
+            "AND active_until IS NULL ORDER BY ts DESC LIMIT 20").fetchall()
+        if decs:
+            lines += ["## Active decisions", ""]
+            for d in decs:
+                m = json.loads(d["meta"] or "{}") or {}
+                lines.append(f"- **{m.get('choice')}** ({m.get('concept')}) — "
+                             f"{', '.join(m.get('criteria') or []) or 'no criteria'}")
+            lines.append("")
+        goals = self._conn.execute(
+            "SELECT text FROM facts WHERE kind = 'goal' AND archived = 0 "
+            "ORDER BY ts DESC LIMIT 10").fetchall()
+        if goals:
+            lines += ["## Goals", ""] + [f"- {r['text']}" for r in goals] + [""]
+        cons = self._conn.execute(
+            "SELECT text FROM facts WHERE kind = 'constraint' AND archived = 0 "
+            "ORDER BY ts DESC LIMIT 10").fetchall()
+        if cons:
+            lines += ["## Constraints", ""] + [f"- {r['text']}" for r in cons] + [""]
+        less = self._conn.execute(
+            "SELECT text FROM facts WHERE kind = 'lesson' AND archived = 0 "
+            "ORDER BY ts DESC LIMIT 10").fetchall()
+        if less:
+            lines += ["## Lessons", ""] + [f"- {r['text']}" for r in less]
+        path = os.path.join(out_dir, "persona.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return {"path": path, "entities": len(ents), "decisions": len(decs),
+                "goals": len(goals), "constraints": len(cons), "lessons": len(less)}
+
+    def policy_report(self, limit: int = 2000) -> dict[str, Any]:
+        """Distill the memory-ops journal into a learned-policy summary
+        (§19.4, RL-ready).  Not a neural policy — an honest, deterministic
+        digest of what the memory actually does and which interventions help."""
+        rows = self._conn.execute(
+            "SELECT op, scope, detail, ts, fact_id FROM ops_log "
+            "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        by_op: dict[str, int] = {}
+        by_scope: dict[str, int] = {}
+        flips: dict[str, int] = {}
+        feedback = {"helpful": 0, "unhelpful": 0}
+        links = 0
+        for r in rows:
+            by_op[r["op"]] = by_op.get(r["op"], 0) + 1
+            s = (r["scope"] or "").split(":")[0]
+            by_scope[s] = by_scope.get(s, 0) + 1
+            if r["op"] == "SUPERSEDE":
+                flips[s] = flips.get(s, 0) + 1
+            if r["op"] == "LINK":
+                links += 1
+            if r["op"] == "UPDATE" and (r["detail"] or "").startswith("helpful="):
+                k = "helpful" if "helpful=True" in r["detail"] else "unhelpful"
+                feedback[k] += 1
+        scope = by_scope or {}
+        recommendations: list[str] = []
+        for sname, n in sorted(flips.items(), key=lambda x: -x[1]):
+            if n >= 2:
+                recommendations.append(
+                    f"concept area '{sname}': {n} decision flips — distil a "
+                    "lesson / re-check criteria before the next decide")
+        total_fb = feedback["helpful"] + feedback["unhelpful"]
+        if total_fb >= 3 and feedback["unhelpful"] / total_fb > 0.6:
+            recommendations.append(
+                "feedback skews unhelpful: raise min_recall_score or tighten "
+                "the anchor gate (reducing noisy recall)")
+        if not recommendations:
+            recommendations.append(
+                "default-NOOP is the learned baseline: no policy change yet "
+                "(collect more ops/feedback)")
+        return {"ops_analysed": len(rows), "by_op": by_op, "by_scope": scope,
+                "decision_flips": flips, "feedback": feedback,
+                "evidence_links": links, "recommendations": recommendations}
+
     def skill_propose(self, concept: str,
                       out_dir: Optional[str] = None) -> dict[str, Any]:
         """Memp/MemTool procedure bridge (§19.5): distill a decision concept
@@ -1975,7 +2073,7 @@ _thread_safe([
     "store_artifact", "artifact_get", "artifact_find", "artifact_delete",
     "llm_budget_remaining", "llm_spend", "plan_foresight", "foresights_due",
     "export_markdown", "ops_view", "attach_evidence", "explain_fact",
-    "skill_propose",
+    "skill_propose", "export_profile_card", "policy_report",
 ])
 
 __all__ = ["NeuroMatrixStore", "extract_entities", "extract_alias_pairs"]

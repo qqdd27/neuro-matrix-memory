@@ -96,6 +96,25 @@ def _cmd_skill_propose(args: argparse.Namespace) -> int:
         s.close()
 
 
+def _cmd_profile_card(args: argparse.Namespace) -> int:
+    s = NeuroMatrixStore(_resolve_db(args))
+    try:
+        rep = s.export_profile_card(out_dir=args.out)
+        print(json.dumps(rep, ensure_ascii=False))
+        return 0
+    finally:
+        s.close()
+
+
+def _cmd_policy(args: argparse.Namespace) -> int:
+    s = NeuroMatrixStore(_resolve_db(args))
+    try:
+        print(json.dumps(s.policy_report(), ensure_ascii=False))
+        return 0
+    finally:
+        s.close()
+
+
 def _cmd_remind_cron(args: argparse.Namespace) -> int:
     s = NeuroMatrixStore(_resolve_db(args))
     try:
@@ -238,6 +257,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("concept")
     sp.add_argument("--out", default=None)
     sp.set_defaults(func=_cmd_skill_propose)
+
+    sp = sub.add_parser("profile-card", parents=[common],
+                        help="write the reviewable persona card (PersonaMem mirror)")
+    sp.add_argument("--out", default=None)
+    sp.set_defaults(func=_cmd_profile_card)
+
+    sp = sub.add_parser("policy", parents=[common],
+                        help="learned-policy digest from the memory-ops journal")
+    sp.set_defaults(func=_cmd_policy)
 
     sp = sub.add_parser("ingest", parents=[common], help="cold-start from a session DB (state.db)")
     sp.add_argument("source", nargs="?", default=None)

@@ -766,6 +766,44 @@ def test_cite_explain_and_skill_propose():
     p.shutdown()
 
 
+def test_persona_policy_and_shared_sleep():
+    """Persona card + policy digest + workspace pool gets its own sleep pass."""
+    import json as _json
+    from neuro_matrix.provider import NeuromatrixMemoryProvider
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "m33.db")
+    store = NeuroMatrixStore(path)
+    store.remember_goal("Довести neuromatrix до продакшена.", entity="neuromatrix",
+                        session_id="s")
+    d1 = store.decide("stack_pc", "Supabase", criteria=["sql"])
+    store.supersede(d1, "Firebase", criteria=["offline"])
+    pc = store.export_profile_card(out_dir=os.path.join(tmp, "profile"))
+    assert os.path.exists(pc["path"])
+    with open(pc["path"], encoding="utf-8") as f:
+        md = f.read()
+    assert "Active decisions" in md and "Firebase" in md and "Goals" in md
+    pol = store.policy_report()
+    assert pol["ops_analysed"] >= 2
+    assert pol["by_op"].get("SUPERSEDE", 0) >= 1
+    assert pol["recommendations"], pol
+    store.close()
+
+    wsp = os.path.join(tmp, "workspace.db")
+    prov = NeuromatrixMemoryProvider(config={
+        "db_path": os.path.join(tmp, "a.db"), "workspace_db": wsp,
+        "llm_enabled": "false", "auto_consolidate": "true"})
+    prov.initialize("s", hermes_home=tmp)
+    prov.handle_tool_call("neuromatrix", {
+        "action": "remember", "content": "id_444 общий стандарт команды", "scope": "shared"})
+    prov.on_session_end([])  # sleep covers private AND the workspace pool
+    assert prov._shared is not None
+    today = time.strftime("%Y%m%d", time.gmtime())
+    assert prov._shared.get_meta("last_prune_day") == today
+    pol2 = _json.loads(prov.handle_tool_call("neuromatrix", {"action": "policy"}))
+    assert pol2["ok"] and "private" in pol2 and "shared" in pol2
+    prov.shutdown()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

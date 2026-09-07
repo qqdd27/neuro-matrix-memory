@@ -73,6 +73,8 @@ One tool, `neuromatrix`, with actions:
 (big-data layer) · `foresight` / `reminders` (time-bounded signals) ·
 `ask` (grounded synthesis) · `cite` / `explain` (claim provenance with
 `[fact #N, session]` citations) · `skill` (procedure → reviewable skill draft) ·
+`persona` (reviewable profile card) · `policy` (learned-policy digest from the
+memory-ops journal) ·
 `ops` (memory-ops journal) ·
 `budget` (LLM quota) · `consolidate` (sleep cycle) · `stats`.
 Writes accept `scope: private|shared` — `shared` targets the workspace pool
@@ -123,6 +125,30 @@ Tools: `memory_search`, `memory_remember`, `memory_probe`,
 `memory_decide`, `memory_decisions`, `memory_foresight`,
 `memory_reminders`, `memory_stats`. Register in Hermes via the MCP
 registry pointing at `python -m neuro_matrix.mcp`.
+
+## Test it yourself (10 minutes, no Hermes needed)
+
+```bash
+git clone https://github.com/qqdd27/neuro-matrix-memory && cd neuro-matrix-memory
+python tests/test_core.py       # 35 engine scenarios — expect "35/35 passed"
+python tests/test_contract.py   # provider lifecycle + concurrency — "2/2 passed"
+python scripts/bench_recall.py  # recall@5 on RU/EN scenarios — expect 5/5, ~2-4 ms
+
+# live smoke on a scratch DB:
+python -m neuro_matrix.cli status --db /tmp/nm_demo.db
+python -c "
+from neuro_matrix import NeuroMatrixStore
+s = NeuroMatrixStore('/tmp/nm_demo.db')
+s.add_turn('Кошелёк id_777 привязан к TON.', 'Понял, TON = id_777.', session_id='demo')
+print([h['text'] for h in s.search('id_777')])
+s.close()
+"
+```
+
+Then install as a Hermes provider (Option A in “Install”), restart Hermes, run
+`hermes memory setup` and pick **neuromatrix**. Set `NEUROMATRIX_API_KEY`
+(any OpenAI-compatible key; DeepSeek works) only if you want LLM
+consolidation/rerank — without it everything runs in extractive mode.
 
 ## Development
 

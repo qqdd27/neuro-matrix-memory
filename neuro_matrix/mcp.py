@@ -111,7 +111,7 @@ def handle_message(msg: dict[str, Any], store: Optional[NeuroMatrixStore]) -> Op
         return {"jsonrpc": "2.0", "id": mid,
                 "result": {"protocolVersion": "2025-06-18",
                            "capabilities": {"tools": {}},
-                           "serverInfo": {"name": "neuromatrix", "version": "0.3.0"}}}
+                           "serverInfo": {"name": "neuromatrix", "version": "0.5.0"}}}
     if method == "notifications/initialized" or method.startswith("notifications/"):
         return None
     if method == "ping":
