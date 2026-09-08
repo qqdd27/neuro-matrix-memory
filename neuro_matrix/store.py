@@ -44,7 +44,7 @@ from .entities import (
 # durable kinds never fade — they die only via `supersedes` or explicit action.
 ALL_KINDS = (
     "episodic", "episode", "decision", "goal", "constraint",
-    "lesson", "correction", "foresight", "artifact",
+    "lesson", "correction", "foresight", "artifact", "deadend",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -56,6 +56,23 @@ NEG_MARKERS = (
     "передел", "заменили", "заменим", "на самом деле", "вместо", "отменя",
     "wrong", "mistake", "didn't work", "doesn't work", "not right",
     "instead", "revert", "drop it",
+)
+
+# Outcome marking (dead ends, §closed-loop learning): phrases that flag an
+# attempt/approach as failed.  Detection is conservative: subject = nearest
+# strong anchor BEFORE the marker; reason = the clause after it.
+OUTCOME_MARKERS = (
+    "не работает", "не заработал", "не сработал", "не сработало", "не вышло",
+    "не получилось", "не взлетело", "не подошло", "не подошёл", "не подошла",
+    "не подошел", "не подходит", "сломал",
+    "сломался", "упал", "ошибк", "глючит", "не поддерживает", "не хватает",
+    "недостаточно", "dead end", "не справил", "doesn't work", "didn't work",
+    "not working", "not feasible", "failed", "broken", "broke", "error",
+    "doesn't fit", "didn't fit", "can't do", "cannot do", "does not work",
+)
+OUTCOME_REASON_RE = re.compile(
+    r"(?:потому\s+что|так\s+как|из-за|из\s+за|причина|поскольку|"
+    r"ошибк|проблема|because|due\s+to|reason|error|the\s+problem)"
 )
 
 SCHEMA = """
@@ -358,6 +375,13 @@ class NeuroMatrixStore:
                 import logging
                 logging.getLogger("neuro_matrix").debug(
                     "auto_decide skipped", exc_info=True)
+        if getattr(self, "outcome_enabled", True) and user_content and not _is_notification(user_content):
+            try:
+                self._auto_outcome_from_turn(user_content, now_)
+            except Exception:
+                import logging
+                logging.getLogger("neuro_matrix").debug(
+                    "auto_outcome skipped", exc_info=True)
         return ids
 
     # ------------------------------------------------- auto decision capture
@@ -1315,6 +1339,126 @@ class NeuroMatrixStore:
         self._cache.clear()
         return {"fact_id": fact_id, "confidence": round(conf, 4),
                 "archived": bool(archived)}
+
+    # ------------------------------------------------ outcome marking (dead ends)
+
+    def _auto_outcome_from_turn(self, user_text: str, now: float) -> Optional[int]:
+        """Closed-loop learning, write path: 'Flutter не подошёл, потому что
+        производительность низкая.' -> a durable deadend fact about Flutter
+        with the reason.  Conservative: subject = nearest strong anchor before
+        the failure marker (fallback: first anchor after it), reason = the
+        clause after the marker.  Questions are never outcomes."""
+        if not user_text or "?" in user_text or len(user_text) < 10:
+            return None
+        tl = user_text.lower()
+        marker, idx = None, -1
+        for m in OUTCOME_MARKERS:
+            i = tl.find(m)
+            if i != -1 and (idx == -1 or i < idx):
+                marker, idx = m, i
+        if marker is None:
+            return None
+        before = user_text[max(0, idx - 260):idx]
+        keys = extract_entities(before)
+        subject = keys[-1] if keys else None
+        if subject is None:
+            after_head = user_text[idx + len(marker): idx + len(marker) + 120]
+            keys = extract_entities(after_head)
+            if keys:
+                # reason-ish words ('потому', 'слишком') are not subjects
+                subject = next((k for k in keys
+                                if k.lower() not in self._DECIDE_SKIP), None)
+            if subject is None:
+                # lowercase tech words ('v2 migration') are not anchors, but
+                # right after a failure marker they usually ARE the subject
+                _junk = self._DECIDE_SKIP | {"of", "the", "on", "in", "at",
+                                             "to", "from", "and", "for", "with",
+                                             "by", "rate", "limits", "error"}
+                for _t in re.findall(r"[a-zA-Z0-9_]{2,}", after_head):
+                    if _t.lower() not in _junk:
+                        subject = _t
+                        break
+        if not subject or len(subject) < 2 or subject.lower() in self._DECIDE_SKIP:
+            return None
+        after = user_text[idx + len(marker): idx + len(marker) + 260]
+        seg = after
+        rm = OUTCOME_REASON_RE.search(after)
+        if rm:
+            seg = after[rm.end():]
+        seg = seg.split("?")[0].split(".")[0].split("!")[0]
+        seg = seg.strip(" ,;:-—").replace("и теперь", "").replace("и надо", "")
+        seg = seg.strip(" ,;:-—")
+        if (len(seg) < 3 or seg.lower().startswith(
+                ("мы ", "я ", "надо ", "нужно ", "давай", "перейд", "осталось", "попробу"))):
+            seg = ""
+        reason = seg[:160] if seg else marker
+        try:
+            return self.mark_deadend(subject, reason, source="auto", ts=now)
+        except Exception:
+            return None
+
+    def mark_deadend(self, subject: str, reason: str, *, source: str = "manual",
+                     ts: Optional[float] = None,
+                     target_fact_id: Optional[int] = None,
+                     session_id: str = "") -> Optional[int]:
+        """Record a failed attempt as a durable fact: '[dead-end] <subject>:
+        <reason>'.  Kind 'deadend' never decays — the whole point is that the
+        system keeps knowing what NOT to re-try.  A same-subject deadend within
+        14 days is deduped (returns the existing id)."""
+        with self._lock:
+            now_ = ts if ts is not None else time.time()
+            dup = self._conn.execute(
+                "SELECT id FROM facts WHERE kind='deadend' AND archived=0 "
+                "AND json_extract(meta,'$.subject')=? COLLATE NOCASE "
+                "AND ts > ? LIMIT 1",
+                (subject, now_ - 14 * 86400)).fetchone()
+            if dup:
+                return int(dup["id"])
+            text = f"[dead-end] {subject}: {reason}".strip()
+            fid = self.remember(
+                text, kind="deadend", source="deadend", session_id=session_id, ts=now_,
+                importance=1.0,
+                meta={"subject": subject, "reason": reason,
+                      "outcome": "failed", "source": source},
+            )
+            if not fid:
+                return None
+            if target_fact_id:
+                try:
+                    self.attach_evidence(fid, [target_fact_id])
+                except Exception:
+                    pass
+            self._conn.execute(
+                "INSERT INTO ops_log (ts, op, scope, fact_id, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (now_, "MARK", "deadend", fid, f"{subject} :: {reason[:120]}"))
+            return fid
+
+    def deadends(self, subject: Optional[str] = None, limit: int = 20) -> list[dict]:
+        """Active dead ends — optionally filtered by subject entity (NOCASE).
+        Ordered newest-first; only non-archived rows (durable kind)."""
+        with self._lock:
+            q = ("SELECT id, text, ts, meta FROM facts "
+                 "WHERE kind='deadend' AND archived=0")
+            params: list = []
+            if subject:
+                q += " AND json_extract(meta,'$.subject')=? COLLATE NOCASE"
+                params.append(subject)
+            q += " ORDER BY ts DESC LIMIT ?"
+            params.append(limit)
+            rows = self._conn.execute(q, params).fetchall()
+            out = []
+            for r in rows:
+                m = json.loads(r["meta"] or "{}") or {}
+                out.append({
+                    "id": int(r["id"]),
+                    "subject": m.get("subject", ""),
+                    "reason": m.get("reason", ""),
+                    "source": m.get("source", "manual"),
+                    "ts": float(r["ts"]),
+                    "text": str(r["text"])[:200],
+                })
+            return out
 
     def _detect_and_apply_correction(self, text: str, now: float) -> int:
         """Write-path correction (prediction error): negative markers + shared

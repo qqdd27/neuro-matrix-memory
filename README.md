@@ -21,6 +21,7 @@ implements the 2025–2026 agent-memory stack, not a naive co-occurrence graph:
 | Consolidation levers: importance → merge → decay → eviction | [Hindsight (arXiv 2512.12818)](https://arxiv.org/abs/2512.12818) | importance at write, alias/entity merge, exponential decay on edges, retention-based prune |
 | Offline "sleep" consolidation between sessions | [Anthropic Dreaming (2026)](https://kenhuangus.substack.com/p/why-ai-agents-are-starting-to-dream), SCM (arXiv 2604.20943) | `on_session_end` merges fresh facts into per-entity dossiers — LLM (batched, optional) or extractive |
 | Cross-session identity = hardest open problem | [State of Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026) | alias registry + explicit `link` tool (`id_777` ↔ `TON` ↔ `токен`) |
+| Failure-driven learning — don't repeat dead ends | MemoryAgentBench (2025: forgetting is the weakest agent competency) | outcome markers on the write path: “Flutter не подошёл, потому что …” → durable `kind='deadend'` fact with the reason + evidence trail to the original attempt (auto + manual `deadend` tool) |
 
 ## Install
 

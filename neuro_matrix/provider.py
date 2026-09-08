@@ -149,7 +149,8 @@ NM_TOOL_SCHEMA = {
                          "cite", "explain", "skill",
                          "persona", "policy",
                          "ops", "budget",
-                         "consolidate", "stats"],
+                         "consolidate", "stats",
+                         "deadend", "deadends"],
             },
             "query": {"type": "string", "description": "Search query (action=search)."},
             "content": {"type": "string", "description": "Fact statement (action=remember)."},
@@ -257,6 +258,8 @@ class NeuromatrixMemoryProvider(MemoryProvider):
         if self._store is not None:
             self._store.llm_daily_budget = max(0, int(self._config.get("llm_daily_budget", 20) or 20))
             self._store.auto_decide_enabled = is_truthy_value(
+                self._config.get("auto_decide", "true"))
+            self._store.outcome_enabled = is_truthy_value(
                 self._config.get("auto_decide", "true"))
             adir = str(self._config.get("artifacts_dir") or "").replace(
                 "$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
@@ -758,6 +761,34 @@ def _tool_artifact_delete(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     return json.dumps({"ok": ok, "deleted": bool(ok)})
 
 
+def _tool_deadend(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Record a failed attempt as a durable dead-end fact (closed-loop
+    learning): the system keeps knowing what NOT to re-try, with the reason."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    subject = (a.get("entity") or a.get("query") or "").strip()
+    reason = (a.get("reason") or a.get("content") or "").strip()
+    if not subject:
+        return tool_error("deadend requires 'entity' (the failed subject)")
+    if not reason:
+        return tool_error("deadend requires 'reason' (why it failed)")
+    fid = store.mark_deadend(subject, reason, source="tool")
+    return json.dumps({"ok": bool(fid), "deadend_id": fid, "subject": subject},
+                      ensure_ascii=False)
+
+
+def _tool_deadends(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Active dead ends, newest first; filter by subject entity (NOCASE)."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    rows = store.deadends((a.get("entity") or "").strip() or None,
+                          limit=int(a.get("limit") or 20))
+    return json.dumps({"ok": True, "count": len(rows), "deadends": rows},
+                      ensure_ascii=False)
+
+
 def _tool_explain(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     """Render a claim with evidence citations; falls back to the shared pool."""
     if not prov._store:
@@ -953,6 +984,8 @@ _HANDLERS = {
     "budget": _tool_budget,
     "consolidate": _tool_consolidate,
     "stats": _tool_stats,
+    "deadend": _tool_deadend,
+    "deadends": _tool_deadends,
 }
 
 

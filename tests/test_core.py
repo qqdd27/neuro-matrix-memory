@@ -873,6 +873,74 @@ def test_sweep_decisions_llm_dynamic():
     store.close()
 
 
+def test_deadend_auto_ru() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "de.db")
+    store = _fresh(path)
+    store.add_turn(
+        "Flutter не подошёл, потому что производительность низкая.",
+        "", session_id="s1",
+    )
+    ds = store.deadends("Flutter")
+    assert len(ds) == 1, ds
+    assert "производительность" in ds[0]["reason"], ds[0]
+    assert ds[0]["source"] == "auto" and ds[0]["subject"] == "flutter"
+    # dedup: second auto mark for the same subject returns the same id
+    fid2 = store._auto_outcome_from_turn(
+        "Flutter всё ещё не работает, потому что UI тормозит.", time.time())
+    assert len(store.deadends("Flutter")) == 1
+    store.close()
+
+
+def test_deadend_auto_en_fallback_subject() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "de.db")
+    store = _fresh(path)
+    store.add_turn(
+        "does not work: the v2 migration keeps failing because of rate limits",
+        "", session_id="s1",
+    )
+    # subject comes from the anchor AFTER the marker here ('migration')
+    ds = store.deadends()
+    assert len(ds) == 1 and ds[0]["subject"] == "v2", ds
+    assert "rate limits" in ds[0]["reason"], ds[0]
+    store.close()
+
+
+def test_deadend_manual_and_no_question_marks() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "de.db")
+    store = _fresh(path)
+    # questions must never become outcomes
+    assert store._auto_outcome_from_turn("Flutter не работает? надо чинить", time.time()) is None
+    fid = store.mark_deadend("хромодрайвер", "не грузится на CI", session_id="s1")
+    assert fid
+    rows = store.deadends("хромодрайвер")
+    assert len(rows) == 1 and rows[0]["source"] == "manual"
+    # no subject filter lists it too
+    assert any(r["subject"] == "хромодрайвер" for r in store.deadends())
+    # durable: consolidation must not archive dead ends
+    store.consolidate()
+    assert len(store.deadends("хромодрайвер")) == 1
+    store.close()
+
+
+def test_deadend_episode_wiring_and_explain() -> None:
+    """The failed attempt stays an episodic fact; the deadend fact points at it
+    via evidence, so explain() shows the trail back to the original try."""
+    path = os.path.join(tempfile.mkdtemp(), "de.db")
+    store = _fresh(path)
+    try_fid = store.remember(
+        "Перешли на Solana RPC для цен", source="decision",
+        meta={"concept": "rpc", "choice": "solana", "status": "superseded"},
+    )
+    end_fid = store.mark_deadend("solana", "rate limit на бесплатном tier",
+                                 target_fact_id=try_fid)
+    assert end_fid and try_fid
+    explain = store.explain_fact(end_fid)
+    joined = explain if isinstance(explain, str) else str(explain)
+    assert str(try_fid) in joined, joined
+    store.close()
+
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
