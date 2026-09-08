@@ -349,6 +349,18 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 self._store.set_meta("nm:remind_day", today)
                 for d in self._store.foresights_due(limit=3):
                     parts.append(f"- ⏰ {d['text'][:180]}")
+            # Daily 'sleep' bridge: sessions that end without a clean shutdown
+            # would leave unconsolidated facts behind forever — catch up once a
+            # day on the first prefetch (budget-gated, 2 LLM calls max).
+            if self._auto_consolidate and self._store.get_meta("nm:cons_day") != today:
+                self._store.set_meta("nm:cons_day", today)
+                uncons = self._store._conn.execute(
+                    "SELECT COUNT(*) c FROM facts WHERE archived = 0 AND consolidated = 0"
+                ).fetchone()["c"] if self._store is not None else 0
+                if uncons >= 20 and self._store.llm_budget_remaining() > 0:
+                    rep = self._store.consolidate(max_llm_calls=2)
+                    if rep.get("dossiers_updated") or rep.get("lessons"):
+                        logger.info("neuromatrix daily catch-up consolidate: %s", rep)
         except Exception as e:
             logger.debug("neuromatrix reminders failed: %s", e)
         if query:

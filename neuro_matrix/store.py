@@ -504,13 +504,40 @@ class NeuroMatrixStore:
             except Exception as e:  # noqa: BLE001  — rerank must never break recall
                 logger_debug_rerank(e)
 
-        # Dossiers first — consolidated knowledge outranks raw episodes
-        # (current-truth only; point-in-time reads skip dossiers).
+        # Dossiers first — consolidated knowledge outranks raw episodes, but at
+        # most 2 slots: a flat 5.0 score across many dossiers used to flood the
+        # top and bury far more relevant raw facts (seen live: 60+ rows returned
+        # for limit=3).
         if include_dossiers and q_entities and as_of is None:
             dossiers = self._dossiers_for_entities(list(q_entities))
-            out = dossiers + results[: limit - len(dossiers)]
+            if dossiers:
+                # Keep only dossiers that plausibly answer THIS query (their
+                # own key/alias is a query token, or the summary shares one) —
+                # otherwise the whole graph's dossiers flood every recall.
+                qtokens = re.findall(r"[a-zа-яё0-9_]{2,}", query.lower())
+                qkeys = {_norm(t) for t in qtokens}
+                dossiers = [
+                    d for d in dossiers
+                    if (d.get("via") and _norm(str(d["via"][0])) in qkeys)
+                    or any(w in str(d.get("text", "")).lower() for w in qtokens)
+                ]
+            used = dossiers[:2]
+            out = used + results[: max(0, limit - len(used))]
         else:
             out = results[:limit]
+        out = out[:limit]
+
+        # De-duplicate identical texts in one recall (same notice or turn often
+        # arrives twice across sessions) — first occurrence keeps its rank.
+        _seen: set[str] = set()
+        _deduped: list[dict[str, Any]] = []
+        for _item in out:
+            _txt = str(_item.get("text", ""))
+            if _txt in _seen:
+                continue
+            _seen.add(_txt)
+            _deduped.append(_item)
+        out = _deduped
 
         # Reconsolidation on retrieval: rehearse returned facts (skip dossier
         # stubs and historical point-in-time reads — the past is not rehearsed).

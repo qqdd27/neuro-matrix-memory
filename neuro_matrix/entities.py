@@ -27,6 +27,10 @@ EN_STOP = {
     "one", "two", "new", "need", "know", "like", "want", "see", "say",
     "said", "tell", "please", "maybe", "well", "let", "us", "im", "ive",
     "dont", "cant", "isnt", "wasnt", "didnt", "youre", "its", "thats",
+    # Technical filler that produces false identity merges in raw API/UI text
+    # ("none -> profile", "unknown -> url" were real corruptions in the wild).
+    "none", "null", "undefined", "unknown", "surface", "self", "default",
+    "value", "false", "true", "object", "string", "boolean", "callback",
 }
 RU_STOP = {
     "это", "что", "как", "так", "для", "при", "без", "или", "если", "когда",
