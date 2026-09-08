@@ -1,0 +1,12 @@
+[
+  {"label": "GSC integration status", "query": "GSC property что сделано",
+   "must_contain": ["GSC", "property"]},
+  {"label": "Cloudflare key findings", "query": "Cloudflare аналитика ключ",
+   "must_contain": ["Cloudflare"]},
+  {"label": "Converter JSON-LD SEO round", "query": "converter btc usd JSON-LD SEO",
+   "must_contain": ["JSON-LD", "SEO"]},
+  {"label": "fiat currency badges", "query": "fiat иконки флаги endpoint",
+   "must_contain": ["fiat"]},
+  {"label": "dogecoin redirect fix", "query": "dogecoin 301 редирект slug",
+   "must_contain": ["dogecoin"]}
+]

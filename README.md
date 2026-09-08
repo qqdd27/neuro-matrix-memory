@@ -151,6 +151,18 @@ out of the box: the provider **reuses Hermes' active model** (reads the model
 block of config.yaml + its `*_API_KEY` env). Set `NEUROMATRIX_API_KEY` only to
 force a dedicated provider — without any key everything runs in extractive mode.
 
+## Evaluate it (baseline measured)
+
+```bash
+python scripts/eval_recall.py --db "path/to/neuromatrix.db" \
+    --scenarios scripts/scenarios.example.json      # semantic questions
+python scripts/eval_recall.py --db "path/to/neuromatrix.db" \
+    --auto 10 --out recall.md                        # dossier self-test
+```
+
+Baseline on the live profile db (2026-09-08): **recall@5 = 100% / 100%**
+(see `docs/recall-report-2026-09-08.md`). Product thesis: `docs/VISION.md`.
+
 ## Development
 
 ```bash

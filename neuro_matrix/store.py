@@ -665,6 +665,21 @@ class NeuroMatrixStore:
         # most 2 slots: a flat 5.0 score across many dossiers used to flood the
         # top and bury far more relevant raw facts (seen live: 60+ rows returned
         # for limit=3).
+        if include_dossiers and as_of is None and not q_entities:
+            # Lowercase queries ('cloudflare') are not anchors, so the entity
+            # path never fires and the entity's dossier stays hidden under
+            # weak FTS rows.  Match query tokens to entity keys/aliases
+            # case-insensitively as a dossier-only fallback.
+            _toks = re.findall(r"[a-z0-9_]{2,}", query.lower())[:6]
+            if _toks:
+                _ph = ",".join("?" * len(_toks))
+                _ids = [r["id"] for r in self._conn.execute(
+                    f"SELECT id FROM entities WHERE lower(key) IN ({_ph}) "
+                    f"UNION SELECT e.id FROM aliases a JOIN entities e "
+                    f"ON e.id = a.entity_id WHERE lower(a.alias) IN ({_ph})",
+                    _toks + _toks).fetchall()]
+                if _ids:
+                    q_entities = {i: 1.0 for i in _ids}
         if include_dossiers and q_entities and as_of is None:
             dossiers = self._dossiers_for_entities(list(q_entities))
             if dossiers:
