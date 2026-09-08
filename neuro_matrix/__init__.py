@@ -8,7 +8,7 @@ Package layout:
   provider.py  — Hermes ``MemoryProvider`` plugin (``memory.provider: neuromatrix``).
 """
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"
 
 from .store import NeuroMatrixStore
 

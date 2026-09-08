@@ -86,6 +86,36 @@ CAPABILITY_MARKERS = (
     "helps with", "solves ", "good for", "perfect for", "for ",
 )
 
+# RU morphological recall: FTS5 (unicode61) has no Russian stemming, so
+# 'правила' stored vs 'правило' asked never match.  Expand RU query tokens to
+# surface variants (strip known ending -> re-apply common endings) and OR them
+# inside the MATCH expression.  Deterministic, no dictionary, no LLM.
+_RU_SUFFIXES = (
+    "ами", "ями", "ыми", "ого", "его", "ому", "ему", "ую", "юю",
+    "ая", "яя", "ое", "ее", "ые", "ие", "ой", "ей", "ый", "ий",
+    "ах", "ях", "ам", "ям", "ов", "ев", "ом", "ем", "ою", "ею",
+    "а", "я", "у", "ю", "е", "ы", "и", "ь", "о",
+)
+_RU_ALTS = ("а", "ы", "е", "у", "ой", "ом", "ам", "ах", "ов", "ами",
+            "ями", "ая", "ые", "ое", "ого", "ую", "ем", "ей")
+
+
+def _ru_variants(tok: str) -> list[str]:
+    out = [tok]
+    for suf in _RU_SUFFIXES:
+        if len(tok) > len(suf) + 2 and tok.endswith(suf):
+            base = tok[:-len(suf)]
+            if base not in out and len(base) >= 3:
+                out.append(base)
+            for alt in _RU_ALTS:
+                cand = base + alt
+                if cand not in out and len(cand) >= 3:
+                    out.append(cand)
+                if len(out) >= 9:
+                    break
+            break
+    return out[:9]
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -625,7 +655,15 @@ class NeuroMatrixStore:
             if t not in STOPWORDS
         ]
         if tokens and len(scored) < limit * 4:
-            match_q = " OR ".join(f'"{t}"' for t in tokens[:6])
+            _match_parts: list[str] = []
+            for t in tokens[:6]:
+                if re.search(r"[а-яё]", t) and len(t) >= 4:
+                    _vs = _ru_variants(t)
+                    _match_parts.append(
+                        "( " + " OR ".join(f'"{v}"' for v in _vs) + " )")
+                else:
+                    _match_parts.append(f'"{t}"')
+            match_q = " OR ".join(_match_parts)
             ts_cond = " AND f.ts <= ?" if as_of is not None else ""
             try:
                 params: list[Any] = [match_q, act_t]

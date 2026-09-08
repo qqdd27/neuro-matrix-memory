@@ -14,7 +14,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neuro_matrix.entities import extract_alias_pairs, extract_entities
-from neuro_matrix.store import NeuroMatrixStore
+from neuro_matrix.store import NeuroMatrixStore, _ru_variants
 
 
 def _fresh(path: str) -> NeuroMatrixStore:
@@ -1019,6 +1019,32 @@ def test_session_project_status_rollup() -> None:
     latest = store.latest_statuses(1)[0]
     assert latest["session_id"] == "sess-engine-2"
     store.close()
+
+
+def test_ru_morphological_recall() -> None:
+    """FTS5 has no RU stemming: 'правила' stored, 'правило' asked.  Variant
+    expansion must close the gap."""
+    path = os.path.join(tempfile.mkdtemp(), "ru.db")
+    store = _fresh(path)
+    store.ingest_document(
+        "Все правила проекта лежат в папке docs рядом с движком.\n"
+        "Сборка движка запускается только после проверки правил линтера.",
+        title="Правила проекта",
+    )
+    # ask in a different grammatical form than stored
+    hits = store.search("правило проекта", limit=6)
+    joined = " | ".join(h["text"].lower() for h in hits)
+    assert "правила" in joined and "движка" in joined, joined
+    store.close()
+
+
+def test_ru_variants_unit() -> None:
+    vs = _ru_variants("правило")
+    assert "правило" in vs and "правила" in vs and "правилу" in vs, vs
+    assert len(vs) <= 9
+    # Latin tokens pass through untouched
+    assert _ru_variants("postgresql") == ["postgresql"]
+
 
 
 def _run_all() -> None:
