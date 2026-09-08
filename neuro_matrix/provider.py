@@ -256,6 +256,8 @@ class NeuromatrixMemoryProvider(MemoryProvider):
             return
         if self._store is not None:
             self._store.llm_daily_budget = max(0, int(self._config.get("llm_daily_budget", 20) or 20))
+            self._store.auto_decide_enabled = is_truthy_value(
+                self._config.get("auto_decide", "true"))
             adir = str(self._config.get("artifacts_dir") or "").replace(
                 "$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
             if adir:
@@ -361,6 +363,7 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     rep = self._store.consolidate(max_llm_calls=2)
                     if rep.get("dossiers_updated") or rep.get("lessons"):
                         logger.info("neuromatrix daily catch-up consolidate: %s", rep)
+                    self._store.sweep_decisions()
         except Exception as e:
             logger.debug("neuromatrix reminders failed: %s", e)
         if query:
@@ -461,6 +464,14 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 rep = self._store.consolidate(max_llm_calls=2)
                 if rep["dossiers_updated"] or rep["lessons"]:
                     logger.info("neuromatrix consolidate: %s", rep)
+            # Dynamic decision sweep — once per UTC day, phrasing-independent.
+            if self._active and getattr(self._store, "auto_decide_enabled", True):
+                sday = time.strftime("%Y%m%d", time.gmtime())
+                if self._store.get_meta("nm:sweep_day") != sday:
+                    self._store.set_meta("nm:sweep_day", sday)
+                    swept = self._store.sweep_decisions()
+                    if swept:
+                        logger.info("neuromatrix sweep: captured %d decisions", swept)
             today = time.strftime("%Y%m%d")
             if self._store.get_meta("last_prune_day") != today:
                 n = self._store.prune(retention_days=self._retention_days)

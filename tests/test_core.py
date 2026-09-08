@@ -804,6 +804,75 @@ def test_persona_policy_and_shared_sleep():
     prov.shutdown()
 
 
+def test_auto_decide_capture_from_turns():
+    """Explicit 'для X берём Y, потому что Z' turns become decision chains."""
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "m34.db")
+    store = NeuroMatrixStore(path)
+    store.add_turn(
+        "Для нового приложения берём Firebase, потому что offline-синк и сроки.",
+        "Согласен, Firebase.", session_id="s1")
+    dec = store.decisions("нового_приложения")
+    assert dec["count"] == 1, dec
+    assert dec["active"]["choice"] == "Firebase", dec
+    crit = dec["active"].get("criteria") or []
+    assert any("offline" in c for c in crit), crit
+    # Later flip in another session auto-chains (trail of 2, active = Supabase).
+    store.add_turn(
+        "Для нового приложения переходим на Supabase, потому что нужен SQL.",
+        "Ок.", session_id="s2")
+    dec2 = store.decisions("нового_приложения")
+    assert dec2["count"] == 2 and dec2["active"]["choice"] == "Supabase", dec2
+    choices = [t["choice"] for t in dec2["trail"]]
+    assert choices == ["Firebase", "Supabase"], choices
+    assert any(o["op"] == "ADD" for o in store.ops_view())
+    # No scope phrase -> no decision invented.
+    store.add_turn("Просто используем какой-то инструмент, хорошо?",
+                   "Хорошо.", session_id="s3")
+    assert store.decisions("какой_то")["count"] == 0
+    # Flag off disables capture entirely.
+    store.auto_decide_enabled = False
+    store.add_turn("Для бота берём Python, потому что быстро.",
+                   "Ок.", session_id="s4")
+    assert store.decisions("бота")["count"] == 0
+    store.close()
+
+
+def test_sweep_decisions_llm_dynamic():
+    """LLM sweep captures decisions the marker heuristic would miss (any phrasing)."""
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "m35.db")
+    store = NeuroMatrixStore(path)
+
+    class _FakeLLM:
+        calls = 0
+
+        @staticmethod
+        def available() -> bool:
+            return True
+
+        def chat_json(self, _messages):
+            type(self).calls += 1
+            return {"decisions": [
+                {"concept": "мобильное приложение", "choice": "Vue",
+                 "criteria": ["экосистема", "скорость"], "text_id": 1}]}
+
+    # Deliberately NO marker words («берём/используем/для…») — dynamic phrasing.
+    store.add_turn(
+        "Пишем мобильное приложение на Vue, а Flutter отбросили, экосистема нравится.",
+        "Ок.", session_id="s1")
+    assert store.decisions("мобильное_приложение")["count"] == 0
+    store.llm = _FakeLLM()
+    assert store.sweep_decisions() == 1
+    dec = store.decisions("мобильное_приложение")
+    assert dec["count"] == 1 and dec["active"]["choice"] == "Vue", dec
+    assert "экосистема" in (dec["active"].get("criteria") or []), dec
+    assert _FakeLLM.calls == 1
+    # Batch consumed: second sweep makes no further LLM call.
+    assert store.sweep_decisions() == 0 and _FakeLLM.calls == 1
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

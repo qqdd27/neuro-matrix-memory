@@ -188,6 +188,7 @@ class NeuroMatrixStore:
         artifacts_dir: Optional[str] = None,        # sidecar payload files
         artifact_max_bytes: int = 100 * 1024 * 1024,
         llm_daily_budget: int = 20,                 # shared consolidation budget
+        auto_decide: bool = True,                   # capture explicit decisions
     ) -> None:
         self.path = path
         self.edge_half_life_hours = edge_half_life_hours
@@ -200,6 +201,7 @@ class NeuroMatrixStore:
             os.path.dirname(os.path.abspath(path)), "artifacts")
         self.artifact_max_bytes = artifact_max_bytes
         self.llm_daily_budget = llm_daily_budget
+        self.auto_decide_enabled = auto_decide
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -346,7 +348,162 @@ class NeuroMatrixStore:
             )
             if fid:
                 ids.append(fid)
+        if getattr(self, "auto_decide_enabled", True) and (user_content or assistant_content):
+            try:
+                self._auto_decide_from_turn(
+                    user_content or "", assistant_content or "", session_id, now_)
+            except Exception:
+                # Auto-extraction must never break the write path.
+                import logging
+                logging.getLogger("neuro_matrix").debug(
+                    "auto_decide skipped", exc_info=True)
         return ids
+
+    # ------------------------------------------------- auto decision capture
+
+    _DECIDE_SCOPE_RE = re.compile(
+        r"(?:для|по|в|на|за|for|with|in)\s+([^.,;:!?\n]{2,70}?)\s*"
+        r"(?:мы\s+|we\s+)?(?:бер[её]м|используем|переход[ия]м\s+на|перешли\s+на|"
+        r"выбрали|остановились\s+на|ставим|делаем\s+на|применяем|выбираю|"
+        r"выбрал|go\s+with|we\s+go\s+with|we\s+use|we\s+chose|we\s+picked|"
+        r"switching\s+to|moving\s+to|use|pick|chose|adopt)",
+        re.IGNORECASE,
+    )
+    _DECIDE_REASON_RE = re.compile(
+        r"(?:потому\s+что|так\s+как|из-за|из\s+за|причина|причины|поскольку|"
+        r"для\s+того\s+чтобы|чтобы|because|due\s+to|reason|as\s+we\s+need)",
+        re.IGNORECASE,
+    )
+    _DECIDE_SKIP = {"the", "this", "that", "these", "for", "with", "our",
+                    "your", "new", "one", "not", "them", "then", "use"}
+
+    def _auto_decide_from_turn(self, user_text: str, assistant_text: str,
+                               session_id: str, now: float) -> None:
+        """Heuristic capture of explicit user decisions, e.g.
+        "для нового приложения берём Firebase, потому что offline и сроки".
+
+        Conservative on purpose: fires only when a scope phrase precedes a
+        decision verb AND the chosen thing is a strong anchor (TitleCase /
+        ALL-CAPS / id_ / 0x).  Nothing invented — no scope, no decision.
+        Reasons after "потому что / because / ..." become criteria, which is
+        exactly what later lessons and supersede chains need."""
+        def _find(text: str) -> None:
+            m = self._DECIDE_SCOPE_RE.search(text)
+            if not m:
+                return
+            scope = m.group(1)
+            # The scope match consumed the verb; everything after it is the
+            # choice clause.
+            tail = text[m.end():]
+            tail = tail.split("\n", 1)[0]
+            tail = re.split(r"[.!?;]", tail, maxsplit=1)[0][:120]
+            concept = self._concept_key(scope)
+            if not concept:
+                return
+            rm = self._DECIDE_REASON_RE.search(tail)
+            if rm:
+                clause = tail[rm.end():]
+                reasons = [c.strip().rstrip(".,").lower()[:64]
+                           for c in re.split(r"[,;]", clause)][:5]
+                reasons = [c for c in reasons if c and not _is_trivial(c)
+                           and len(c) >= 3]
+                pre = tail[:rm.start()]
+            else:
+                pre = tail
+            # First strong anchor AFTER the verb, by position (TitleCase /
+            # ALL-CAPS / id_ / 0x).  Position beats anchor-class: in
+            # 'переходим на Supabase, потому что нужен SQL' the choice is
+            # Supabase even though SQL is also an anchor.
+            display = ""
+            for mm in re.finditer(
+                    r"(?i)\b(?:id[-_]?[a-z0-9]{1,20}|0x[0-9a-f]{2,})\b|"
+                    r"[A-Za-zА-Яа-яЁё]{2,}", pre):
+                tok = mm.group(0)
+                tl = tok.lower()
+                if tl in self._DECIDE_SKIP:
+                    continue
+                if ((tok[0].isupper() and any(ch.islower() for ch in tok)
+                     and len(tok) >= 2)
+                        or (tok.isupper() and len(tok) >= 2)
+                        or re.fullmatch(r"(?i)(?:id[-_]?\w+|0x[0-9a-f]+)", tok)):
+                    display = tok
+                    break
+            if not display:
+                return
+            try:
+                self.decide(concept, display, criteria=reasons, reason="",
+                            session_id=session_id)
+            except Exception:
+                pass
+
+        _find(user_text)
+
+    def sweep_decisions(self, *, batch: int = 8, max_items: int = 6) -> int:
+        """Dynamic (LLM) decision capture: read recent user turns and let the
+        model extract explicit decisions as structured JSON, then apply them
+        through ``decide()``.  Phrasing-independent — complements the cheap
+        marker heuristic, not bound to any fixed words.  Spends 1 LLM call."""
+        llm = self.llm
+        if llm is None or not getattr(llm, "available", lambda: False)() \
+                or self.llm_budget_remaining() <= 0:
+            return 0
+        rows = self._conn.execute(
+            "SELECT id, text, meta FROM facts WHERE source = 'turn:user' "
+            "AND kind = 'episodic' AND archived = 0 AND consolidated = 0 "
+            "AND (meta IS NULL OR meta NOT LIKE '%\"swept\"%') "
+            "ORDER BY ts DESC LIMIT ?", (batch,)).fetchall()
+        if not rows:
+            return 0
+        texts = "\n".join(f"[{r['id']}] {r['text'][:700]}" for r in rows)
+        content = llm.chat_json([
+            {"role": "system",
+             "content": (
+                 "You read user turns from an agent memory. Extract ONLY "
+                 "explicit, unambiguous decisions where the user chose something "
+                 "for a scope (e.g. 'для нового приложения берём Firebase, "
+                 "потому что offline', 'we are building the app on Vue'). "
+                 'Return JSON {"decisions": [{"concept": "...", "choice": "...", '
+                 '"criteria": ["..."], "text_id": <id>}]} with at most 6 items. '
+                 "Skip questions, opinions and vague talk — do not invent.")},
+            {"role": "user", "content": texts}])
+        self.llm_spend(1)
+        applied = 0
+        if isinstance(content, dict):
+            for d in (content.get("decisions") or [])[:max_items]:
+                if not isinstance(d, dict):
+                    continue
+                concept = str(d.get("concept") or "").strip()
+                choice = str(d.get("choice") or "").strip()
+                if len(concept) < 3 or len(choice) < 2:
+                    continue
+                crit = [str(c).strip().lower()[:64]
+                        for c in (d.get("criteria") or []) if c][:6]
+                try:
+                    self.decide(concept[:80], choice[:80], criteria=crit,
+                                reason="", session_id="")
+                    applied += 1
+                except Exception:
+                    continue
+        # Mark the whole batch swept (do not re-ask the same turns).
+        for r in rows:
+            meta = json.loads(r["meta"] or "{}") or {}
+            meta["swept"] = 1
+            self._conn.execute(
+                "UPDATE facts SET meta = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=False), r["id"]))
+        self._conn.commit()
+        self._cache.clear()
+        return applied
+
+    @staticmethod
+    def _concept_key(scope_text: str) -> str:
+        """'для нового приложения мы' -> 'нового_приложения' (stable key)."""
+        tokens = [t for t in re.findall(r"[a-zа-яё0-9_]+", scope_text.lower())
+                  if t not in {"мы", "будем", "хотим", "нашего", "наш", "этого",
+                               "своего", "свой", "проекта", "the", "our", "for",
+                               "with", "a", "an", "to", "of"}]
+        key = "_".join(tokens[:4])[:48]
+        return key
 
     def link(self, alias_a: str, alias_b: str, *, label: Optional[str] = None) -> None:
         """Explicit cross-session identity statement: alias_a <-> alias_b refer
@@ -2118,7 +2275,7 @@ _thread_safe([
     "store_artifact", "artifact_get", "artifact_find", "artifact_delete",
     "llm_budget_remaining", "llm_spend", "plan_foresight", "foresights_due",
     "export_markdown", "ops_view", "attach_evidence", "explain_fact",
-    "skill_propose", "export_profile_card", "policy_report",
+    "skill_propose", "export_profile_card", "policy_report", "sweep_decisions",
 ])
 
 __all__ = ["NeuroMatrixStore", "extract_entities", "extract_alias_pairs"]

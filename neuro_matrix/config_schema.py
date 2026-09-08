@@ -140,6 +140,11 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                       default="true", options=_tf(TRUE_FALSE),
                       description="Enable optional LLM rerank of search results "
                                   "(action=search rerank=true)"),
+        ProviderField("auto_decide", "Auto-capture decisions", KIND_SELECT,
+                      default="true", options=_tf(TRUE_FALSE),
+                      description="Record explicit choices from turns ('для X берём Y, "
+                                  "потому что Z') as decision facts with criteria",
+                      inline=True),
     ),
 )
 
@@ -221,6 +226,13 @@ LEGACY_CONFIG_SCHEMA = [
         "key": "llm_rerank",
         "description": "Enable optional LLM rerank of search results "
                        "(action=search rerank=true)",
+        "default": "true",
+        "choices": ["true", "false"],
+    },
+    {
+        "key": "auto_decide",
+        "description": "Record explicit choices from turns ('для X берём Y, потому что Z') "
+                       "as decision facts with criteria",
         "default": "true",
         "choices": ["true", "false"],
     },
