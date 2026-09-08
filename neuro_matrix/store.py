@@ -22,6 +22,7 @@ model, no network — <1 ms typical on local SQLite.
 from __future__ import annotations
 
 import functools
+import difflib
 import hashlib
 import json
 import math
@@ -669,7 +670,9 @@ class NeuroMatrixStore:
             # Lowercase queries ('cloudflare') are not anchors, so the entity
             # path never fires and the entity's dossier stays hidden under
             # weak FTS rows.  Match query tokens to entity keys/aliases
-            # case-insensitively as a dossier-only fallback.
+            # case-insensitively as a dossier-only fallback; when no exact
+            # key exists, try typo-tolerant close matches ('cloudflre' ->
+            # cloudflare) — retrieval suggestion only, never a persisted merge.
             _toks = re.findall(r"[a-z0-9_]{2,}", query.lower())[:6]
             if _toks:
                 _ph = ",".join("?" * len(_toks))
@@ -678,19 +681,38 @@ class NeuroMatrixStore:
                     f"UNION SELECT e.id FROM aliases a JOIN entities e "
                     f"ON e.id = a.entity_id WHERE lower(a.alias) IN ({_ph})",
                     _toks + _toks).fetchall()]
+                if not _ids and max(len(t) for t in _toks) >= 5:
+                    _cand = [r["key"] for r in self._conn.execute(
+                        "SELECT key FROM entities WHERE hits > 0 AND length(key) BETWEEN ? AND ?",
+                        (min(len(t) for t in _toks) - 2, max(len(t) for t in _toks) + 2)
+                    ).fetchall()]
+                    for _t in _toks:
+                        _near = difflib.get_close_matches(_t, _cand, n=1, cutoff=0.8)
+                        if _near:
+                            _row = self._conn.execute(
+                                "SELECT id FROM entities WHERE key = ?", (_near[0],)).fetchone()
+                            if _row and _row["id"] not in _ids:
+                                _ids.append(_row["id"])
                 if _ids:
                     q_entities = {i: 1.0 for i in _ids}
         if include_dossiers and q_entities and as_of is None:
             dossiers = self._dossiers_for_entities(list(q_entities))
             if dossiers:
                 # Keep only dossiers that plausibly answer THIS query (their
-                # own key/alias is a query token, or the summary shares one) —
+                # own key/alias is a query token, the summary shares one, or
+                # the entity itself was matched — incl. fuzzy typo matches) —
                 # otherwise the whole graph's dossiers flood every recall.
                 qtokens = re.findall(r"[a-zа-яё0-9_]{2,}", query.lower())
                 qkeys = {_norm(t) for t in qtokens}
+                _qrows = self._conn.execute(
+                    f"SELECT key FROM entities WHERE id IN "
+                    f"({','.join('?' * len(q_entities))})",
+                    list(q_entities)).fetchall() if q_entities else []
+                _allowed_keys = {_norm(r["key"]) for r in _qrows}
                 dossiers = [
                     d for d in dossiers
                     if (d.get("via") and _norm(str(d["via"][0])) in qkeys)
+                    or (d.get("via") and _norm(str(d["via"][0])) in _allowed_keys)
                     or any(w in str(d.get("text", "")).lower() for w in qtokens)
                 ]
             used = dossiers[:2]

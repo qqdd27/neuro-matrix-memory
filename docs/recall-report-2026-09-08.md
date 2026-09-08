@@ -8,11 +8,14 @@
 
 | Suite | recall@5 |
 |---|---|
-| Semantic scenarios (5 real past-work questions: GSC, Cloudflare, converter JSON-LD, fiat badges, dogecoin redirect) | **5/5 = 100%** |
+| Semantic scenarios (7 real past-work questions incl. typos `cloudflre` / `cloudfare` → Cloudflare) | **7/7 = 100%** |
 | Dossier self-test (top-10 dossier entities; query = entity key; ground truth = the dossier itself must resurface in top-5) | **10/10 = 100%** |
 
 ## What the run taught us (already fixed)
 
+- Typo tolerance added: `cloudflre`/`cloudfare` resolve to the `cloudflare`
+  dossier via difflib close-match (retrieval suggestion only, never a
+  persisted merge) — semantic suite 7/7.
 - Lowercase queries (`cloudflare`, `url`, `api`) are not anchors, so the entity
   path never fired and the entity's dossier stayed hidden under weak FTS rows →
   added a case-insensitive entity-key/alias fallback for dossier retrieval

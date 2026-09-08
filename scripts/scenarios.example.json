@@ -8,5 +8,9 @@
   {"label": "fiat currency badges", "query": "fiat иконки флаги endpoint",
    "must_contain": ["fiat"]},
   {"label": "dogecoin redirect fix", "query": "dogecoin 301 редирект slug",
-   "must_contain": ["dogecoin"]}
+   "must_contain": ["dogecoin"]},
+  {"label": "typo cloudflre", "query": "cloudflre аналитика",
+   "must_contain": ["Cloudflare"]},
+  {"label": "typo cloudfare", "query": "cloudfare ключ доступ",
+   "must_contain": ["Cloudflare"]}
 ]
