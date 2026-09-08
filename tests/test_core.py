@@ -1105,6 +1105,45 @@ def test_invent_proposes_novel_combinations() -> None:
     store.close()
 
 
+def test_deadend_warning_at_recall() -> None:
+    """A recalled fact whose entity has a known dead end must carry the
+    warning into the result — the loop closes at the point of use."""
+    path = os.path.join(tempfile.mkdtemp(), "dw.db")
+    store = _fresh(path)
+    store.add_turn("", "Redis caching layer для API.", session_id="s1")
+    store.mark_deadend("Redis", "rate limits на бесплатном tier")
+    hits = store.search("Redis", limit=5)
+    warns = [h for h in hits if h["source"] == "deadend-warning"]
+    assert warns, hits
+    assert "rate limits" in warns[0]["text"], warns
+    store.close()
+
+
+def test_resolved_invalidation_when_source_dies() -> None:
+    """If the underlying fact of an auto-resolved answer is archived, the
+    frozen answer must retire instead of lying."""
+    path = os.path.join(tempfile.mkdtemp(), "ri.db")
+    store = _fresh(path)
+    fid = store.remember("Engine burns Kerosene fuel.",
+                         source="turn:assistant", session_id="s1")
+    rid = store.remember(
+        "[resolved] Q: engine fuel\nA: Engine burns Kerosene fuel.",
+        kind="resolved", source="resolved",
+        meta={"query": "engine fuel", "top_fact": fid, "auto": True})
+    t0 = time.time()
+    r1 = store.search("engine fuel", limit=3, now=t0)
+    assert len(r1) == 1 and r1[0]["source"] == "resolved", r1
+    # the source fact is negated/archived -> resolved must retire
+    store._conn.execute("UPDATE facts SET archived = 1 WHERE id = ?", (fid,))
+    store._conn.commit()
+    r2 = store.search("engine fuel", limit=3, now=t0 + 40)
+    assert not any(h["source"] == "resolved" for h in r2), r2
+    dead = store._conn.execute(
+        "SELECT archived FROM facts WHERE id = ?", (rid,)).fetchone()
+    assert dead and bool(dead["archived"]), dead
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

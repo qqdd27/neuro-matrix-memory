@@ -652,30 +652,57 @@ class NeuroMatrixStore:
                 _qn = _qnorm(query)
                 if _qn:
                     _res = self._conn.execute(
-                        "SELECT id, text, ts FROM facts WHERE kind='resolved' "
+                        "SELECT id, text, ts, meta FROM facts WHERE kind='resolved' "
                         "AND archived=0 AND json_extract(meta,'$.query')=? "
                         "COLLATE NOCASE AND ts > ? ORDER BY ts DESC LIMIT 1",
                         (_qn, now - RESOLVED_TTL)).fetchone()
                     if _res:
-                        try:
-                            self._rehearse(int(_res["id"]), now)
-                        except Exception:
-                            pass
-                        return [{
-                            "fact_id": int(_res["id"]),
-                            "text": str(_res["text"]),
-                            "kind": "resolved",
-                            "source": "resolved",
-                            "session_id": "",
-                            "ts": float(_res["ts"]),
-                            "importance": 1.0,
-                            "confidence": 1.0,
-                            "retrieval_count": 0,
-                            "active_until": None,
-                            "supersedes": None,
-                            "score": 9.0,
-                            "via": [],
-                        }]
+                        # Invalidation: if the underlying top fact died
+                        # (archived / negated / expired), the frozen answer is
+                        # a lie — retire the resolved row and fall through to a
+                        # fresh search instead of serving a stale answer.
+                        _rmeta = json.loads(_res["meta"] or "{}") or {}
+                        _top = _rmeta.get("top_fact")
+                        _stale = False
+                        if _top:
+                            _tf = self._conn.execute(
+                                "SELECT archived, active_until, meta FROM facts "
+                                "WHERE id = ?", (int(_top),)).fetchone()
+                            _stale = _tf is None or bool(_tf["archived"])
+                            if not _stale and _tf["active_until"] is not None \
+                                    and float(_tf["active_until"]) <= now:
+                                _stale = True
+                            if not _stale:
+                                _tm = json.loads(_tf["meta"] or "{}") or {}
+                                if _tm.get("negated"):
+                                    _stale = True
+                        if _stale:
+                            try:
+                                self._conn.execute(
+                                    "UPDATE facts SET archived = 1 WHERE id = ?",
+                                    (int(_res["id"]),))
+                            except sqlite3.Error:
+                                pass
+                        else:
+                            try:
+                                self._rehearse(int(_res["id"]), now)
+                            except Exception:
+                                pass
+                            return [{
+                                "fact_id": int(_res["id"]),
+                                "text": str(_res["text"]),
+                                "kind": "resolved",
+                                "source": "resolved",
+                                "session_id": "",
+                                "ts": float(_res["ts"]),
+                                "importance": 1.0,
+                                "confidence": 1.0,
+                                "retrieval_count": 0,
+                                "active_until": None,
+                                "supersedes": None,
+                                "score": 9.0,
+                                "via": [],
+                            }]
             except sqlite3.Error:
                 pass
         hit = self._cache.get(cache_key)
@@ -865,6 +892,51 @@ class NeuroMatrixStore:
             _seen.add(_txt)
             _deduped.append(_item)
         out = _deduped
+
+        # Dead-end warnings at the point of need: when a recalled fact belongs
+        # to an entity with a known dead end, say so right here — 'we already
+        # tried this path, here is why it failed' — instead of letting the
+        # caller repeat it.
+        if as_of is None:
+            try:
+                _keyset: list[str] = []
+                for _it in out:
+                    for _v in (_it.get("via") or []):
+                        _ks = str(_v).lower()
+                        if _ks and _ks not in _keyset:
+                            _keyset.append(_ks)
+                if _keyset:
+                    _de_rows = self._conn.execute(
+                        "SELECT json_extract(meta,'$.subject') s, "
+                        "json_extract(meta,'$.reason') r, ts FROM facts "
+                        "WHERE kind='deadend' AND archived=0 "
+                        "AND json_extract(meta,'$.subject') IS NOT NULL "
+                        "ORDER BY ts DESC LIMIT 12").fetchall()
+                    _warns: list[dict[str, Any]] = []
+                    for _dr in _de_rows:
+                        if len(_warns) >= 2:
+                            break
+                        if str(_dr["s"]).lower() in _keyset:
+                            _warns.append({
+                                "fact_id": None,
+                                "text": (f"⚠ Known dead end: {_dr['s']} — "
+                                         f"{str(_dr['r'] or '')[:120]}"),
+                                "kind": "deadend",
+                                "source": "deadend-warning",
+                                "session_id": "",
+                                "ts": float(_dr["ts"]),
+                                "importance": 1.0,
+                                "confidence": 1.0,
+                                "retrieval_count": 0,
+                                "active_until": None,
+                                "supersedes": None,
+                                "score": 9.5,
+                                "via": [],
+                            })
+                    if _warns:
+                        out = _warns + out
+            except sqlite3.Error:
+                pass
 
         # Reconsolidation on retrieval: rehearse returned facts (skip dossier
         # stubs and historical point-in-time reads — the past is not rehearsed).
