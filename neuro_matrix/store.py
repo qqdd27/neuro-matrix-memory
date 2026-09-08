@@ -45,7 +45,7 @@ from .entities import (
 ALL_KINDS = (
     "episodic", "episode", "decision", "goal", "constraint",
     "lesson", "correction", "foresight", "artifact", "deadend",
-    "capability", "doc", "status",
+    "capability", "doc", "status", "resolved",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -115,6 +115,16 @@ def _ru_variants(tok: str) -> list[str]:
                     break
             break
     return out[:9]
+
+
+# Repeated-question cache: the 2nd distinct ask (>=2h after the first) of the
+# same normalized query freezes the best answer into a durable kind='resolved'
+# fact; later identical asks return it instantly (no graph walk, no FTS).
+RESOLVED_TTL = 90 * 86400.0
+
+
+def _qnorm(query: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё_]+", " ", query.lower()).strip()[:160]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -222,6 +232,13 @@ CREATE TABLE IF NOT EXISTS ops_log (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ops_ts ON ops_log(ts);
+
+CREATE TABLE IF NOT EXISTS ask_log (
+    qkey TEXT PRIMARY KEY,
+    first_ts REAL NOT NULL,
+    last_ts REAL NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -627,6 +644,40 @@ class NeuroMatrixStore:
         now = now if now is not None else time.time()
         act_t = as_of if as_of is not None else now
         cache_key = f"{query}|{limit}|{include_dossiers}|{as_of!r}|rerank={rerank}"
+        # Repeated-question cache: an identical normalized ask that was
+        # resolved before returns the frozen answer instantly (checked BEFORE
+        # the 30s LRU so even a same-minute repeat gets the cached answer).
+        if as_of is None and not rerank:
+            try:
+                _qn = _qnorm(query)
+                if _qn:
+                    _res = self._conn.execute(
+                        "SELECT id, text, ts FROM facts WHERE kind='resolved' "
+                        "AND archived=0 AND json_extract(meta,'$.query')=? "
+                        "COLLATE NOCASE AND ts > ? ORDER BY ts DESC LIMIT 1",
+                        (_qn, now - RESOLVED_TTL)).fetchone()
+                    if _res:
+                        try:
+                            self._rehearse(int(_res["id"]), now)
+                        except Exception:
+                            pass
+                        return [{
+                            "fact_id": int(_res["id"]),
+                            "text": str(_res["text"]),
+                            "kind": "resolved",
+                            "source": "resolved",
+                            "session_id": "",
+                            "ts": float(_res["ts"]),
+                            "importance": 1.0,
+                            "confidence": 1.0,
+                            "retrieval_count": 0,
+                            "active_until": None,
+                            "supersedes": None,
+                            "score": 9.0,
+                            "via": [],
+                        }]
+            except sqlite3.Error:
+                pass
         hit = self._cache.get(cache_key)
         if hit and now - hit[0] < self._cache_ttl:
             return hit[1]
@@ -826,6 +877,13 @@ class NeuroMatrixStore:
                 pass
 
         self._cache[cache_key] = (now, out)
+        # Repeated-ask tracking: 2nd distinct ask (>=2 h later) freezes the
+        # top answer into a durable 'resolved' fact for instant future reuse.
+        if as_of is None:
+            try:
+                self._note_ask(query, out, now)
+            except Exception:
+                pass
         return out
 
     def entity(self, key: str) -> Optional[dict[str, Any]]:
@@ -1724,6 +1782,139 @@ class NeuroMatrixStore:
                 "text": str(r["text"])[:500],
                 "ts": float(r["ts"]),
             } for r in rows]
+
+    # ------------------------------------------------------------ invention
+
+    def invent(self, goal: str, limit: int = 8, top_n: int = 60) -> list[dict[str, Any]]:
+        """'Fantasy' on the graph: given a problem, propose NOVEL combinations
+        of known components (wheel x engine = car).  Novelty = 1/(1+pair
+        co-occurrence count); relevance = shared graph neighbours with the
+        goal's entities.  Deterministic, no LLM, nothing is stored — these are
+        hypotheses for a human/agent gate, never facts."""
+        with self._lock:
+            gids: set[int] = set()
+            for k in extract_entities(goal):
+                row = self._conn.execute(
+                    "SELECT id FROM entities WHERE key = ? COLLATE NOCASE",
+                    (k,)).fetchone()
+                if row:
+                    gids.add(int(row["id"]))
+            rows = self._conn.execute(
+                "SELECT id, key FROM entities WHERE hits >= 2 "
+                "ORDER BY hits DESC, last_seen DESC LIMIT ?", (top_n,)).fetchall()
+            cands = [(int(r["id"]), str(r["key"])) for r in rows]
+            de_rows = self._conn.execute(
+                "SELECT DISTINCT json_extract(meta,'$.subject') s FROM facts "
+                "WHERE kind='deadend' AND archived=0 "
+                "AND json_extract(meta,'$.subject') IS NOT NULL").fetchall()
+            de = {str(r["s"]).lower() for r in de_rows}
+
+            def _neighbors(eid: int) -> dict[int, int]:
+                rs = self._conn.execute(
+                    "SELECT CASE WHEN a = ? THEN b ELSE a END nid, count "
+                    "FROM edges WHERE a = ? OR b = ?", (eid, eid, eid)).fetchall()
+                return {int(r["nid"]): int(r["count"]) for r in rs}
+
+            neigh = {cid: _neighbors(cid) for cid, _ in cands}
+            rels = {cid: len(set(neigh[cid]) & gids) + (1 if cid in gids else 0)
+                    for cid in neigh}
+            ordered = sorted(cands, key=lambda c: rels[c[0]], reverse=True)[:26]
+
+            out: list[dict[str, Any]] = []
+            seen: set[tuple[int, int]] = set()
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    a_id, a_key = ordered[i]
+                    b_id, b_key = ordered[j]
+                    if (a_id, b_id) in seen:
+                        continue
+                    seen.add((a_id, b_id))
+                    cnt = neigh[a_id].get(b_id, 0) + neigh[b_id].get(a_id, 0)
+                    novelty = round(1.0 / (1.0 + cnt), 3)
+                    rel = rels[a_id] + rels[b_id]
+                    score = round(rel * 1.0 + novelty * 2.0, 3)
+                    out.append({
+                        "a": a_key, "b": b_key, "a_id": a_id, "b_id": b_id,
+                        "novelty": novelty, "edge_count": cnt, "relevance": rel,
+                        "score": score,
+                        "a_deadend": a_key.lower() in de,
+                        "b_deadend": b_key.lower() in de,
+                    })
+            out.sort(key=lambda x: x["score"], reverse=True)
+            res: list[dict[str, Any]] = []
+            for o in out:
+                # already-tried territory: both components are known dead ends
+                if o["a_deadend"] and o["b_deadend"]:
+                    continue
+                o["hypothesis"] = (
+                    f"Combine '{o['a']}' x '{o['b']}' to solve: {goal[:90]}")
+                res.append(o)
+                if len(res) >= limit:
+                    break
+            return res
+
+    # ------------------------------------------------ repeated-question cache
+
+    def _note_ask(self, query: str, out: list[dict[str, Any]], now: float) -> None:
+        """Track distinct asks per normalized query; the 2nd one (>=2 h after
+        the first) freezes the top result into a durable 'resolved' fact."""
+        qn = _qnorm(query)
+        if len(qn) < 4 or not out:
+            return
+        row = self._conn.execute(
+            "SELECT first_ts, hits FROM ask_log WHERE qkey = ?", (qn,)).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO ask_log (qkey, first_ts, last_ts, hits) "
+                "VALUES (?, ?, ?, 1)", (qn, now, now))
+            return
+        hits = int(row["hits"]) + 1
+        self._conn.execute(
+            "UPDATE ask_log SET hits = ?, last_ts = ? WHERE qkey = ?",
+            (hits, now, qn))
+        if hits == 2 and now - float(row["first_ts"]) >= 7200.0:
+            _exists = self._conn.execute(
+                "SELECT id FROM facts WHERE kind='resolved' AND archived=0 "
+                "AND json_extract(meta,'$.query')=? COLLATE NOCASE LIMIT 1",
+                (qn,)).fetchone()
+            if _exists:
+                return
+            top = next((h for h in out
+                        if h.get("source") != "dossier" and h.get("text")), None)
+            if not top or float(top.get("score", 0.0)) < 0.15:
+                return
+            answer = str(top["text"])[:400].replace("\n", " ")
+            text = f"[resolved] Q: {qn[:100]}\nA: {answer}"
+            try:
+                self.remember(
+                    text, kind="resolved", source="resolved", ts=now,
+                    importance=1.0,
+                    meta={"query": qn, "answer": answer, "auto": True,
+                          "top_fact": top.get("fact_id"), "hits": 2},
+                )
+            except sqlite3.Error:
+                pass
+
+    def resolve_query(self, query: str, answer: str,
+                      ts: Optional[float] = None) -> Optional[int]:
+        """Manually freeze a question->answer pair as a durable resolved fact
+        (the agent/user says 'запомни ответ на это')."""
+        qn = _qnorm(query)
+        if len(qn) < 3 or not answer:
+            return None
+        now_ = ts if ts is not None else time.time()
+        answer = str(answer)[:400].replace("\n", " ")
+        text = f"[resolved] Q: {qn[:100]}\nA: {answer}"
+        fid = self.remember(
+            text, kind="resolved", source="resolved", ts=now_, importance=1.0,
+            meta={"query": qn, "answer": answer, "auto": False},
+        )
+        if fid:
+            self._conn.execute(
+                "INSERT INTO ops_log (ts, op, scope, fact_id, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (now_, "ADD", "resolved", fid, f"{qn[:80]} :: {answer[:80]}"))
+        return fid
 
     def _detect_and_apply_correction(self, text: str, now: float) -> int:
         """Write-path correction (prediction error): negative markers + shared

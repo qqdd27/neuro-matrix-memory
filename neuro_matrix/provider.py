@@ -152,7 +152,8 @@ NM_TOOL_SCHEMA = {
                          "consolidate", "stats",
                          "deadend", "deadends",
                          "capabilities", "ingest",
-                         "statuses"],
+                         "statuses", "resolve",
+                         "invent"],
             },
             "query": {"type": "string", "description": "Search query (action=search)."},
             "content": {"type": "string", "description": "Fact statement (action=remember)."},
@@ -851,6 +852,39 @@ def _tool_statuses(prov: NeuromatrixMemoryProvider, a: dict) -> str:
                       ensure_ascii=False)
 
 
+def _tool_resolve(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Manually freeze a question->answer pair: the same ask then returns this
+    answer instantly (no graph walk / FTS / LLM)."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    query = (a.get("query") or "").strip()
+    answer = (a.get("content") or a.get("answer") or "").strip()
+    if not query:
+        return tool_error("resolve requires 'query' (the question)")
+    if not answer:
+        return tool_error("resolve requires 'content' (the answer)")
+    fid = store.resolve_query(query, answer)
+    return json.dumps({"ok": bool(fid), "resolved_id": fid, "query": query},
+                      ensure_ascii=False)
+
+
+def _tool_invent(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """'Fantasy' tool: propose novel combinations of known components for a
+    goal/problem (wheel x engine -> car).  Deterministic novelty by graph
+    edge strength; dead-end pairs excluded.  Hypotheses only — nothing stored
+    until a human/agent approves (then decide/feedback)."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    goal = (a.get("query") or a.get("content") or "").strip()
+    if not goal:
+        return tool_error("invent requires 'query' (the goal/problem)")
+    rows = store.invent(goal, limit=int(a.get("limit") or 8))
+    return json.dumps({"ok": bool(rows), "count": len(rows), "ideas": rows},
+                      ensure_ascii=False)
+
+
 def _tool_explain(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     """Render a claim with evidence citations; falls back to the shared pool."""
     if not prov._store:
@@ -1051,6 +1085,8 @@ _HANDLERS = {
     "capabilities": _tool_capabilities,
     "ingest": _tool_ingest,
     "statuses": _tool_statuses,
+    "resolve": _tool_resolve,
+    "invent": _tool_invent,
 }
 
 

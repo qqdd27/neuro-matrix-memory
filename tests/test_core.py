@@ -1047,6 +1047,64 @@ def test_ru_variants_unit() -> None:
 
 
 
+def test_repeated_question_cache_auto() -> None:
+    """2nd distinct ask (>=2h later) freezes top answer into kind='resolved';
+    the 3rd ask returns it instantly via the pre-LRU shortcut."""
+    path = os.path.join(tempfile.mkdtemp(), "rc.db")
+    store = _fresh(path)
+    store.add_turn("двигатель?",
+                   "Engine runs on kerosene and liquid oxygen.",
+                   session_id="s1")
+    q = "engine fuel kerosene"
+    t0 = time.time()
+    r1 = store.search(q, limit=3, now=t0)
+    assert any("kerosene" in h["text"] for h in r1), r1
+    # backdate the first ask so the 2nd ask looks like a repeat hours later
+    store._conn.execute(
+        "UPDATE ask_log SET first_ts = ?, hits = 1 WHERE qkey = ?",
+        (t0 - 4 * 3600, q))
+    store._conn.commit()
+    r2 = store.search(q, limit=3, now=t0 + 31)  # past the 30s LRU window
+    assert any("kerosene" in h["text"] for h in r2), r2
+    r3 = store.search(q, limit=3, now=t0 + 61)
+    assert len(r3) == 1 and r3[0]["source"] == "resolved", r3
+    assert "kerosene" in r3[0]["text"] and r3[0]["kind"] == "resolved", r3
+    store.close()
+
+
+def test_repeated_question_cache_manual() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "rc.db")
+    store = _fresh(path)
+    fid = store.resolve_query("как ускорить сборку", "сборка идёт через Redis кэш")
+    assert fid
+    hits = store.search("как ускорить сборку", limit=3)
+    assert len(hits) == 1 and hits[0]["source"] == "resolved"
+    assert "redis" in hits[0]["text"].lower(), hits
+    store.close()
+
+
+
+def test_invent_proposes_novel_combinations() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "inv.db")
+    store = _fresh(path)
+    store.add_turn("", "Engine drives the Wheel.", session_id="s1")
+    store.add_turn("", "Engine burns Kerosene fuel.", session_id="s1")
+    store.add_turn("", "Wheel turns on the Axle.", session_id="s1")
+    rows = store.invent("need a movement transport for goods", limit=6)
+    assert rows, rows
+    for r in rows:
+        assert r["a"] != r["b"] and 0 < r["novelty"] <= 1.0
+        assert "hypothesis" in r and r["a"] in r["hypothesis"]
+    # dead-end gate: a pair of two known dead ends is never proposed
+    store.mark_deadend("Engine", "не тянет")
+    store.mark_deadend("Wheel", "ломается")
+    rows2 = store.invent("need a movement transport for goods", limit=6)
+    for r in rows2:
+        pair = {r["a"].lower(), r["b"].lower()}
+        assert not (pair == {"engine", "wheel"}), rows2
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
