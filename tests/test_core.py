@@ -983,6 +983,44 @@ def test_ingest_document_russian_no_anchors() -> None:
 
 
 
+def test_session_project_status_rollup() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "st.db")
+    store = _fresh(path)
+    sid = "sess-engine-1"
+    store.add_turn(
+        "Начинаем движок с нуля, решили стек?",
+        "Выбрали PostgreSQL для базы движка, продолжаем завтра.", session_id=sid,
+    )
+    store.add_turn(
+        "чертёж не открылся",
+        "DraftSight не работает, потому что нет лицензии на CI.",
+        session_id=sid,
+    )
+    store.add_turn(
+        "понял",
+        "Используем DraftSight для чертежей движка.", session_id=sid,
+    )
+    r1 = store.finalize_session(sid)
+    assert r1 and r1["new"] is True and r1["id"], r1
+    low = store.latest_statuses(1)[0]["text"].lower()
+    assert "postgresql" in low and "draftsight" in low, low
+    # dead-end subject surfaces in the status rollup too
+    assert "чертежей" in low or "dead-ends" in low, low
+    # idempotent: same session -> existing status, no duplicate
+    r2 = store.finalize_session(sid)
+    assert r2["new"] is False and r2["id"] == r1["id"]
+    cnt = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind='status' AND archived=0"
+    ).fetchone()["c"]
+    assert cnt == 1, cnt
+    # another session's status is listed newest-first
+    store.add_turn("идея", "Сделаем резервный вариант на Redis.", session_id="sess-engine-2")
+    store.finalize_session("sess-engine-2")
+    latest = store.latest_statuses(1)[0]
+    assert latest["session_id"] == "sess-engine-2"
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

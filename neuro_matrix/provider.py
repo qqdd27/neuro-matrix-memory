@@ -151,7 +151,8 @@ NM_TOOL_SCHEMA = {
                          "ops", "budget",
                          "consolidate", "stats",
                          "deadend", "deadends",
-                         "capabilities", "ingest"],
+                         "capabilities", "ingest",
+                         "statuses"],
             },
             "query": {"type": "string", "description": "Search query (action=search)."},
             "content": {"type": "string", "description": "Fact statement (action=remember)."},
@@ -393,6 +394,15 @@ class NeuromatrixMemoryProvider(MemoryProvider):
             parts.extend(lines)
             if lines:
                 self._recall = RecallStatus(provider_label="NeuroMatrix", count=len(lines))
+        # Project continuity: the NEW session's first turn should see where the
+        # previous session stopped (finalize_session rollup at session end).
+        if session_id and self._store is not None:
+            try:
+                st = self._store.latest_statuses(limit=1)
+                if st and str(st[0].get("session_id") or "") != session_id:
+                    parts.append(f"- 🧭 {st[0]['text'][:420]}")
+            except Exception as e:
+                logger.debug("neuromatrix status prefetch failed: %s", e)
         if not parts:
             return ""
         return f"## {DISPLAY}\n" + "\n".join(parts)
@@ -454,6 +464,13 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     archived += 1
         except Exception as e:
             logger.debug("neuromatrix on_pre_compress failed: %s", e)
+        # Crash-safe status rollup: sessions that never fire on_session_end
+        # still get a project-status fact (idempotent per session).
+        if self._store is not None and self._session_id:
+            try:
+                self._store.finalize_session(self._session_id)
+            except Exception as e:
+                logger.debug("neuromatrix finalize (pre-compress) failed: %s", e)
         return f"neuro-matrix checkpoint: archived {archived} pre-compress messages" if archived else ""
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
@@ -466,6 +483,10 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     self._store.rollup_session(self._session_id)
                 except Exception as e:
                     logger.debug("neuromatrix rollup failed: %s", e)
+                try:
+                    self._store.finalize_session(self._session_id)
+                except Exception as e:
+                    logger.debug("neuromatrix finalize failed: %s", e)
             if self._auto_consolidate:
                 rep = self._store.consolidate(max_llm_calls=2)
                 if rep["dossiers_updated"] or rep["lessons"]:
@@ -820,6 +841,16 @@ def _tool_ingest(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     return json.dumps({"ok": res["stored"] > 0, **res}, ensure_ascii=False)
 
 
+def _tool_statuses(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Newest session project-status rollups ('где мы остановились')."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    rows = store.latest_statuses(limit=int(a.get("limit") or 3))
+    return json.dumps({"ok": True, "count": len(rows), "statuses": rows},
+                      ensure_ascii=False)
+
+
 def _tool_explain(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     """Render a claim with evidence citations; falls back to the shared pool."""
     if not prov._store:
@@ -1019,6 +1050,7 @@ _HANDLERS = {
     "deadends": _tool_deadends,
     "capabilities": _tool_capabilities,
     "ingest": _tool_ingest,
+    "statuses": _tool_statuses,
 }
 
 

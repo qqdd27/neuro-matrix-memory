@@ -45,7 +45,7 @@ from .entities import (
 ALL_KINDS = (
     "episodic", "episode", "decision", "goal", "constraint",
     "lesson", "correction", "foresight", "artifact", "deadend",
-    "capability", "doc",
+    "capability", "doc", "status",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -386,18 +386,20 @@ class NeuroMatrixStore:
                 import logging
                 logging.getLogger("neuro_matrix").debug(
                     "auto_decide skipped", exc_info=True)
-        if getattr(self, "outcome_enabled", True) and user_content and not _is_notification(user_content):
-            try:
-                self._auto_outcome_from_turn(user_content, now_)
-            except Exception:
-                import logging
-                logging.getLogger("neuro_matrix").debug(
-                    "auto_outcome skipped", exc_info=True)
+        if getattr(self, "outcome_enabled", True):
+            for txt in (user_content or "", assistant_content or ""):
+                if txt and not _is_notification(txt) and not _is_trivial(txt):
+                    try:
+                        self._auto_outcome_from_turn(txt, now_, session_id)
+                    except Exception:
+                        import logging
+                        logging.getLogger("neuro_matrix").debug(
+                            "auto_outcome skipped", exc_info=True)
         if getattr(self, "capability_enabled", True):
             for txt in (assistant_content, user_content or ""):
                 if txt and not _is_notification(txt) and not _is_trivial(txt):
                     try:
-                        self._extract_capabilities(txt, now_)
+                        self._extract_capabilities(txt, now_, session_id)
                     except Exception:
                         pass
         return ids
@@ -1360,7 +1362,8 @@ class NeuroMatrixStore:
 
     # ------------------------------------------------ capabilities + doc ingest
 
-    def _extract_capabilities(self, text: str, now: float) -> Optional[int]:
+    def _extract_capabilities(self, text: str, now: float,
+                              session_id: str = "") -> Optional[int]:
         """Deterministic capability capture: '<Provider> используется для
         <что даёт>' -> durable kind='capability' fact tying the provider
         entity to what it is good for.  'Используем Riverpod для управления
@@ -1395,6 +1398,14 @@ class NeuroMatrixStore:
         if len(cap) < 4:
             return None
         cap = cap[:160]
+        for _stop in ("продолжаем", "дальше ", "потом ", "кроме того",
+                      "также ", "ещё ", "и завтра"):
+            _j = cap.lower().find(_stop)
+            if _j > 0:
+                cap = cap[:_j].strip(" ,;:—–-")
+                break
+        if len(cap) < 4:
+            return None
         with self._lock:
             dup = self._conn.execute(
                 "SELECT id FROM facts WHERE kind='capability' AND archived=0 "
@@ -1405,7 +1416,8 @@ class NeuroMatrixStore:
                 return int(dup["id"])
             fid = self.remember(
                 f"[capability] {provider}: {cap}", kind="capability",
-                source="capability", ts=now, importance=1.0,
+                source="capability", session_id=session_id, ts=now,
+                importance=1.0,
                 meta={"provider": provider, "capability": cap, "source": "auto"},
             )
             return fid
@@ -1476,7 +1488,8 @@ class NeuroMatrixStore:
 
     # ------------------------------------------------ outcome marking (dead ends)
 
-    def _auto_outcome_from_turn(self, user_text: str, now: float) -> Optional[int]:
+    def _auto_outcome_from_turn(self, user_text: str, now: float,
+                                session_id: str = "") -> Optional[int]:
         """Closed-loop learning, write path: 'Flutter не подошёл, потому что
         производительность низкая.' -> a durable deadend fact about Flutter
         with the reason.  Conservative: subject = nearest strong anchor before
@@ -1527,7 +1540,8 @@ class NeuroMatrixStore:
             seg = ""
         reason = seg[:160] if seg else marker
         try:
-            return self.mark_deadend(subject, reason, source="auto", ts=now)
+            return self.mark_deadend(subject, reason, source="auto", ts=now,
+                                     session_id=session_id)
         except Exception:
             return None
 
@@ -1593,6 +1607,85 @@ class NeuroMatrixStore:
                     "text": str(r["text"])[:200],
                 })
             return out
+
+    # ------------------------------------------------ session project status
+
+    def finalize_session(self, session_id: str) -> Optional[dict]:
+        """Session project-status rollup: at session end, distil what happened
+        into ONE durable kind='status' fact — decisions taken, dead ends hit,
+        capabilities discovered, entities touched.  The next session's first
+        prefetch surfaces it, so work on a long-running project (an engine,
+        an SEO push…) continues where it stopped instead of re-deriving state.
+        Deterministic, no LLM; idempotent per session."""
+        if not session_id:
+            return None
+        with self._lock:
+            ex = self._conn.execute(
+                "SELECT id FROM facts WHERE kind='status' AND session_id=? "
+                "AND archived=0 LIMIT 1", (session_id,)).fetchone()
+            if ex:
+                return {"id": int(ex["id"]), "session_id": session_id, "new": False}
+            n = self._conn.execute(
+                "SELECT COUNT(*) c FROM facts WHERE session_id=? AND archived=0",
+                (session_id,)).fetchone()["c"]
+            if not n:
+                return None
+            end_ts = self._conn.execute(
+                "SELECT MAX(ts) m FROM facts WHERE session_id=?", (session_id,)
+            ).fetchone()["m"] or time.time()
+            dec = [str(r["text"])[:120] for r in self._conn.execute(
+                "SELECT text FROM facts WHERE session_id=? AND kind='decision' "
+                "AND archived=0 ORDER BY ts DESC LIMIT 6", (session_id,)).fetchall()]
+            de = [str(r["s"]) for r in self._conn.execute(
+                "SELECT DISTINCT json_extract(meta,'$.subject') s FROM facts "
+                "WHERE session_id=? AND kind='deadend' AND archived=0 "
+                "AND json_extract(meta,'$.subject') IS NOT NULL LIMIT 6",
+                (session_id,)).fetchall()]
+            cp = [str(r["p"]) for r in self._conn.execute(
+                "SELECT DISTINCT json_extract(meta,'$.provider') p FROM facts "
+                "WHERE session_id=? AND kind='capability' AND archived=0 "
+                "AND json_extract(meta,'$.provider') IS NOT NULL LIMIT 6",
+                (session_id,)).fetchall()]
+            ents = [str(r["key"]) for r in self._conn.execute(
+                "SELECT e.key, COUNT(*) c FROM fact_entities fe "
+                "JOIN entities e ON e.id = fe.entity_id "
+                "JOIN facts f ON f.id = fe.fact_id "
+                "WHERE f.session_id=? AND f.archived=0 "
+                "GROUP BY e.key ORDER BY c DESC, e.last_seen DESC LIMIT 8",
+                (session_id,)).fetchall()]
+            day = time.strftime("%Y-%m-%d", time.localtime(end_ts))
+            text = (
+                f"[session-status] {day} sess:{session_id[:12]}: "
+                f"decisions: {('; '.join(dec)) or '—'} | "
+                f"dead-ends: {(', '.join(de)) or '—'} | "
+                f"capabilities: {(', '.join(cp)) or '—'} | "
+                f"touched: {(', '.join(ents)) or '—'}"
+            )[:1700]
+            fid = self.remember(
+                text, kind="status", source="session-status",
+                session_id=session_id, ts=end_ts, importance=1.0,
+                meta={"session_id": session_id, "decisions": dec,
+                      "deadends": de, "capabilities": cp,
+                      "entities": ents, "facts": int(n)},
+            )
+            if not fid:
+                return None
+            return {"id": fid, "session_id": session_id, "new": True}
+
+    def latest_statuses(self, limit: int = 3) -> list[dict]:
+        """Newest session-status rollups (for project continuity at start of
+        a new session)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text, session_id, ts FROM facts "
+                "WHERE kind='status' AND archived=0 "
+                "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+            return [{
+                "id": int(r["id"]),
+                "session_id": str(r["session_id"] or ""),
+                "text": str(r["text"])[:500],
+                "ts": float(r["ts"]),
+            } for r in rows]
 
     def _detect_and_apply_correction(self, text: str, now: float) -> int:
         """Write-path correction (prediction error): negative markers + shared
