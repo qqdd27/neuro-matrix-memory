@@ -941,6 +941,48 @@ def test_deadend_episode_wiring_and_explain() -> None:
 
 
 
+def test_capability_auto_ru_en() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "cap.db")
+    store = _fresh(path)
+    store.add_turn(
+        "Возьмём Riverpod для стейта?",
+        "Используем Riverpod для управления состоянием приложения.", session_id="s1",
+    )
+    store.add_turn(
+        "ок",
+        "We use Riverpod for state management and code generation.", session_id="s2",
+    )
+    caps = store.capabilities("Riverpod")
+    assert len(caps) == 2, caps
+    joined = " | ".join(c["capability"] for c in caps).lower()
+    assert "состоянием" in joined and "state management" in joined, joined
+    # dedup: identical statement again must not duplicate
+    store.add_turn("", "Используем Riverpod для управления состоянием приложения.",
+                   session_id="s3")
+    assert len(store.capabilities("riverpod")) == 2
+    store.close()
+
+
+def test_ingest_document_russian_no_anchors() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "doc.db")
+    store = _fresh(path)
+    doc = (
+        "Правило первое: никогда не пишем транзакции без проверки баланса.\n"
+        "Правило второе: каждый запрос к бирже обязан иметь таймаут.\n"
+        "Правило третье: перед деплоем всегда делаем бэкап базы данных, "
+        "потому что потерять прод нельзя. Проверяем это вручную и скриптом."
+    )
+    res = store.ingest_document(doc, title="Правила разработки", topic="dev")
+    assert res["stored"] == res["chunks"] >= 2, res
+    row = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind='doc' AND archived=0").fetchone()
+    assert row["c"] == res["stored"]
+    hits = store.search("таймаут", limit=5)
+    assert any("таймаут" in h["text"] for h in hits), hits
+    store.close()
+
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

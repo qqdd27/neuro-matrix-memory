@@ -22,6 +22,7 @@ implements the 2025–2026 agent-memory stack, not a naive co-occurrence graph:
 | Offline "sleep" consolidation between sessions | [Anthropic Dreaming (2026)](https://kenhuangus.substack.com/p/why-ai-agents-are-starting-to-dream), SCM (arXiv 2604.20943) | `on_session_end` merges fresh facts into per-entity dossiers — LLM (batched, optional) or extractive |
 | Cross-session identity = hardest open problem | [State of Agent Memory 2026](https://mem0.ai/blog/state-of-ai-agent-memory-2026) | alias registry + explicit `link` tool (`id_777` ↔ `TON` ↔ `токен`) |
 | Failure-driven learning — don't repeat dead ends | MemoryAgentBench (2025: forgetting is the weakest agent competency) | outcome markers on the write path: “Flutter не подошёл, потому что …” → durable `kind='deadend'` fact with the reason + evidence trail to the original attempt (auto + manual `deadend` tool) |
+| Knowledge preload + capability tags | — | `ingest_document()` chunks any reference doc (RU/technical, no anchors needed) into durable `kind='doc'` facts; “X используется для Y” turns into `kind='capability'` facts tying the entity to what it is good for — the raw material for `invent` |
 
 ## Install
 

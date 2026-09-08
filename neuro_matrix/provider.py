@@ -150,7 +150,8 @@ NM_TOOL_SCHEMA = {
                          "persona", "policy",
                          "ops", "budget",
                          "consolidate", "stats",
-                         "deadend", "deadends"],
+                         "deadend", "deadends",
+                         "capabilities", "ingest"],
             },
             "query": {"type": "string", "description": "Search query (action=search)."},
             "content": {"type": "string", "description": "Fact statement (action=remember)."},
@@ -260,6 +261,8 @@ class NeuromatrixMemoryProvider(MemoryProvider):
             self._store.auto_decide_enabled = is_truthy_value(
                 self._config.get("auto_decide", "true"))
             self._store.outcome_enabled = is_truthy_value(
+                self._config.get("auto_decide", "true"))
+            self._store.capability_enabled = is_truthy_value(
                 self._config.get("auto_decide", "true"))
             adir = str(self._config.get("artifacts_dir") or "").replace(
                 "$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
@@ -789,6 +792,34 @@ def _tool_deadends(prov: NeuromatrixMemoryProvider, a: dict) -> str:
                       ensure_ascii=False)
 
 
+def _tool_capabilities(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """What do we know <entity> is good for (durable capability facts,
+    captured automatically from 'X используется для Y' statements)."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    rows = store.capabilities((a.get("entity") or "").strip() or None,
+                              limit=int(a.get("limit") or 25))
+    return json.dumps({"ok": True, "count": len(rows), "capabilities": rows},
+                      ensure_ascii=False)
+
+
+def _tool_ingest(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Bulk knowledge preload: store a document (content) as durable doc
+    facts — chunked, no anchors required, always recallable afterwards."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    content = (a.get("content") or "").strip()
+    if not content:
+        return tool_error("ingest requires 'content' (the document text)")
+    res = store.ingest_document(
+        content, title=(a.get("topic") or a.get("name") or "ingested doc"),
+        topic=(a.get("entity") or ""),
+    )
+    return json.dumps({"ok": res["stored"] > 0, **res}, ensure_ascii=False)
+
+
 def _tool_explain(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     """Render a claim with evidence citations; falls back to the shared pool."""
     if not prov._store:
@@ -986,6 +1017,8 @@ _HANDLERS = {
     "stats": _tool_stats,
     "deadend": _tool_deadend,
     "deadends": _tool_deadends,
+    "capabilities": _tool_capabilities,
+    "ingest": _tool_ingest,
 }
 
 

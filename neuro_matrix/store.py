@@ -45,6 +45,7 @@ from .entities import (
 ALL_KINDS = (
     "episodic", "episode", "decision", "goal", "constraint",
     "lesson", "correction", "foresight", "artifact", "deadend",
+    "capability", "doc",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -73,6 +74,16 @@ OUTCOME_MARKERS = (
 OUTCOME_REASON_RE = re.compile(
     r"(?:потому\s+что|так\s+как|из-за|из\s+за|причина|поскольку|"
     r"ошибк|проблема|because|due\s+to|reason|error|the\s+problem)"
+)
+
+# Capability markers (§capabilities): '<Provider> <используется для/подходит
+# для/...> <что даёт или решает>'.  Provider = strong anchor just before the
+# marker; capability = the phrase after it (first sentence/clause).
+CAPABILITY_MARKERS = (
+    "используется для", "используем ", "применяем ", "применяется для",
+    "нужен для", "нужна для", "нужно для", "подходит для", "подходит под",
+    "для ", "юзаем ", "используется в", "is used for", "we use ", "used for",
+    "helps with", "solves ", "good for", "perfect for", "for ",
 )
 
 SCHEMA = """
@@ -382,6 +393,13 @@ class NeuroMatrixStore:
                 import logging
                 logging.getLogger("neuro_matrix").debug(
                     "auto_outcome skipped", exc_info=True)
+        if getattr(self, "capability_enabled", True):
+            for txt in (assistant_content, user_content or ""):
+                if txt and not _is_notification(txt) and not _is_trivial(txt):
+                    try:
+                        self._extract_capabilities(txt, now_)
+                    except Exception:
+                        pass
         return ids
 
     # ------------------------------------------------- auto decision capture
@@ -1339,6 +1357,122 @@ class NeuroMatrixStore:
         self._cache.clear()
         return {"fact_id": fact_id, "confidence": round(conf, 4),
                 "archived": bool(archived)}
+
+    # ------------------------------------------------ capabilities + doc ingest
+
+    def _extract_capabilities(self, text: str, now: float) -> Optional[int]:
+        """Deterministic capability capture: '<Provider> используется для
+        <что даёт>' -> durable kind='capability' fact tying the provider
+        entity to what it is good for.  'Используем Riverpod для управления
+        состоянием' -> provider=riverpod, capability=управления состоянием."""
+        if not text or len(text) < 10 or "?" in text or "؟" in text:
+            return None
+        tl = text.lower()
+        best = None
+        for m in CAPABILITY_MARKERS:
+            i = tl.find(m)
+            while i != -1:
+                if i >= 5:
+                    before = text[max(0, i - 140):i]
+                    keys = extract_entities(before)
+                    if keys:
+                        for k in reversed(keys):
+                            pos = before.lower().rfind(k.lower())
+                            if pos != -1 and (len(before) - pos - len(k)) <= 48:
+                                best = (k, i, len(m))
+                                break
+                    if best:
+                        break
+                i = tl.find(m, i + 1)
+            if best:
+                break
+        if not best:
+            return None
+        provider, idx, mlen = best
+        after = text[idx + mlen: idx + mlen + 200]
+        cap = after.split("?")[0].split(".")[0].split("!")[0].split(";")[0]
+        cap = cap.strip(" ,;:—–-")
+        if len(cap) < 4:
+            return None
+        cap = cap[:160]
+        with self._lock:
+            dup = self._conn.execute(
+                "SELECT id FROM facts WHERE kind='capability' AND archived=0 "
+                "AND json_extract(meta,'$.provider')=? COLLATE NOCASE "
+                "AND json_extract(meta,'$.capability')=? COLLATE NOCASE LIMIT 1",
+                (provider, cap)).fetchone()
+            if dup:
+                return int(dup["id"])
+            fid = self.remember(
+                f"[capability] {provider}: {cap}", kind="capability",
+                source="capability", ts=now, importance=1.0,
+                meta={"provider": provider, "capability": cap, "source": "auto"},
+            )
+            return fid
+
+    def capabilities(self, provider: Optional[str] = None,
+                     limit: int = 25) -> list[dict]:
+        """What do we know <provider> is good for (durable capability facts)."""
+        with self._lock:
+            q = ("SELECT id, text, ts, meta FROM facts "
+                 "WHERE kind='capability' AND archived=0")
+            params: list = []
+            if provider:
+                q += " AND json_extract(meta,'$.provider')=? COLLATE NOCASE"
+                params.append(provider)
+            q += " ORDER BY ts DESC LIMIT ?"
+            params.append(limit)
+            rows = self._conn.execute(q, params).fetchall()
+            out = []
+            for r in rows:
+                m = json.loads(r["meta"] or "{}") or {}
+                out.append({
+                    "id": int(r["id"]),
+                    "provider": m.get("provider", ""),
+                    "capability": m.get("capability", ""),
+                    "source": m.get("source", "auto"),
+                    "ts": float(r["ts"]),
+                })
+            return out
+
+    def ingest_document(self, text: str, *, title: str = "", topic: str = "",
+                        source: str = "ingest", session_id: str = "") -> dict:
+        """Bulk knowledge preload: split a document into sentence-aligned
+        chunks and store each as a DURABLE kind='doc' fact.  No anchors
+        required — pure-Russian/technical docs are stored regardless (unlike
+        decaying episodic turns).  Use for reference material the AI should
+        always be able to recall ('как строим приложение', SEO rulebook…)."""
+        chunks = self._chunk_text(text)
+        stored = 0
+        for i, ch in enumerate(chunks):
+            fid = self.remember(
+                ch, kind="doc", source=source, session_id=session_id,
+                ts=None, importance=0.9,
+                meta={"title": title[:120], "topic": topic[:80],
+                      "chunk": i, "total": len(chunks)},
+            )
+            if fid:
+                stored += 1
+        return {"stored": stored, "chunks": len(chunks), "title": title}
+
+    @staticmethod
+    def _chunk_text(text: str, max_len: int = 900) -> list[str]:
+        paras = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
+        chunks: list[str] = []
+        for para in paras:
+            if len(para) <= max_len:
+                chunks.append(para)
+                continue
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            cur = ""
+            for s in sentences:
+                if cur and len(cur) + len(s) + 1 > max_len:
+                    chunks.append(cur)
+                    cur = ""
+                cur = f"{cur} {s}".strip() if cur else s
+            if cur:
+                chunks.append(cur)
+        return chunks or ([text] if text.strip() else [])
 
     # ------------------------------------------------ outcome marking (dead ends)
 
