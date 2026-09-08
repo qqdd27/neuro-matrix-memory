@@ -45,7 +45,7 @@ from .entities import (
 ALL_KINDS = (
     "episodic", "episode", "decision", "goal", "constraint",
     "lesson", "correction", "foresight", "artifact", "deadend",
-    "capability", "doc", "status", "resolved",
+    "capability", "doc", "status", "resolved", "rule",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -1876,10 +1876,28 @@ class NeuroMatrixStore:
                 "ORDER BY hits DESC, last_seen DESC LIMIT ?", (top_n,)).fetchall()
             cands = [(int(r["id"]), str(r["key"])) for r in rows]
             de_rows = self._conn.execute(
-                "SELECT DISTINCT json_extract(meta,'$.subject') s FROM facts "
+                "SELECT json_extract(meta,'$.subject') s, "
+                "json_extract(meta,'$.reason') r, ts FROM facts "
                 "WHERE kind='deadend' AND archived=0 "
-                "AND json_extract(meta,'$.subject') IS NOT NULL").fetchall()
-            de = {str(r["s"]).lower() for r in de_rows}
+                "AND json_extract(meta,'$.subject') IS NOT NULL "
+                "ORDER BY ts DESC LIMIT 60").fetchall()
+            de: set[str] = set()
+            de_reason: dict[str, str] = {}
+            for r_ in de_rows:
+                _s = str(r_["s"]).lower()
+                de.add(_s)
+                if _s not in de_reason:
+                    de_reason[_s] = str(r_["r"] or "")
+            # Purpose-aware dead-end exclusion: an entity whose KNOWN failure
+            # reason matches the goal's words is excluded FOR THIS GOAL (it
+            # stays combinable for other goals — a dead end is goal-specific:
+            # 'лошадь' for speed died, not for farm work).
+            gtok = {t for t in re.findall(r"[a-zа-яё0-9_]{4,}", goal.lower())}
+            purpose_exclude = {
+                s for s, reason in de_reason.items()
+                if (gtok and s in gtok)
+                or (reason and any(t in reason.lower() for t in gtok))
+            }
 
             def _neighbors(eid: int) -> dict[int, int]:
                 rs = self._conn.execute(
@@ -1890,7 +1908,26 @@ class NeuroMatrixStore:
             neigh = {cid: _neighbors(cid) for cid, _ in cands}
             rels = {cid: len(set(neigh[cid]) & gids) + (1 if cid in gids else 0)
                     for cid in neigh}
-            ordered = sorted(cands, key=lambda c: rels[c[0]], reverse=True)[:26]
+            # Capability boost: a component documented as 'used FOR <goal-ish
+            # phrase>' gets a relevance bump (typed-affordance seed).
+            cap_rows = self._conn.execute(
+                "SELECT json_extract(meta,'$.provider') p, "
+                "json_extract(meta,'$.capability') c FROM facts "
+                "WHERE kind='capability' AND archived=0 "
+                "AND json_extract(meta,'$.provider') IS NOT NULL "
+                "LIMIT 400").fetchall()
+            cap_boost: dict[str, int] = {}
+            for r_ in cap_rows:
+                _p = str(r_["p"]).lower()
+                _c = str(r_["c"] or "").lower()
+                if gtok and _c and any(t in _c for t in gtok):
+                    cap_boost[_p] = cap_boost.get(_p, 0) + 2
+            for _cid, _key in cands:
+                rels[_cid] = rels[_cid] + cap_boost.get(_key.lower(), 0)
+            ordered = [
+                c for c in sorted(cands, key=lambda c: rels[c[0]], reverse=True)
+                if c[1].lower() not in purpose_exclude
+            ][:26]
 
             out: list[dict[str, Any]] = []
             seen: set[tuple[int, int]] = set()
@@ -1924,6 +1961,79 @@ class NeuroMatrixStore:
                 if len(res) >= limit:
                     break
             return res
+
+    # ------------------------------------------------------------ distiller
+
+    def distill_docs(self, *, max_chunks: int = 4, max_llm_calls: int = 1) -> dict:
+        """Doc -> rules distiller: convert ingested doc chunks (kind='doc')
+        into crisp durable rules (kind='rule', pending_review=1) with one LLM
+        call per up-to-4-chunk batch.  Budget-gated and optional — without an
+        LLM or budget it degrades to a no-op, never blocks the write path.
+        Distilled chunks are flagged so they are not distilled twice."""
+        llm = self.llm
+        if llm is None or not getattr(llm, "available", lambda: False)() \
+                or self.llm_budget_remaining() <= 0:
+            return {"rules": 0, "skipped": "no-llm-or-budget"}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text, meta FROM facts WHERE kind='doc' AND archived=0 "
+                "AND (meta IS NULL OR meta NOT LIKE '%\"distilled\":true%') "
+                "ORDER BY ts DESC LIMIT ?", (max_chunks,)).fetchall()
+            if not rows:
+                return {"rules": 0, "skipped": "no-rows"}
+            rules_total = 0
+            made = 0
+            for start in range(0, len(rows), 4):
+                if self.llm_budget_remaining() <= 0 or made >= max_llm_calls:
+                    break
+                batch = rows[start:start + 4]
+                items = "\n".join(
+                    f"[{r['id']}] {str(r['text'])[:900]}" for r in batch)
+                resp = None
+                try:
+                    resp = llm.chat_json([
+                        {"role": "system",
+                         "content": (
+                             "You are a memory distiller for an agent. Turn "
+                             "reference/document chunks into crisp, durable, "
+                             "self-contained RULES the agent must follow in "
+                             "this project (one sentence each, imperative or "
+                             "factual). Keep the author's meaning exactly — do "
+                             "not add advice that is not in the text. "
+                             'Return JSON {"rules": [string, ...]}, at most 6.')},
+                        {"role": "user",
+                         "content": f"DOCS:\n{items}\n\nReturn the rules."}])
+                    self.llm_spend(1)
+                    made += 1
+                except Exception:
+                    resp = None
+                rules: list[str] = []
+                if isinstance(resp, dict):
+                    rules = [str(x).strip() for x in resp.get("rules", [])
+                             if isinstance(x, str) and len(str(x).strip()) >= 10]
+                for rid_row in batch:
+                    try:
+                        rm = json.loads(rid_row["meta"] or "{}") or {}
+                        rm["distilled"] = True
+                        self._conn.execute(
+                            "UPDATE facts SET meta = ? WHERE id = ?",
+                            (json.dumps(rm, ensure_ascii=False,
+                                        separators=(",", ":")),
+                             int(rid_row["id"])))
+                    except (sqlite3.Error, ValueError):
+                        pass
+                for rule in rules[:6]:
+                    rule = rule[:500]
+                    try:
+                        self.remember(
+                            rule, kind="rule", source="distill", importance=1.0,
+                            meta={"from_doc": int(batch[0]["id"]),
+                                  "pending_review": 1},
+                        )
+                        rules_total += 1
+                    except sqlite3.Error:
+                        pass
+            return {"rules": rules_total, "chunks": len(rows), "calls": made}
 
     # ------------------------------------------------ repeated-question cache
 

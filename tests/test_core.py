@@ -5,6 +5,7 @@ Run:  python tests/test_core.py
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -1141,6 +1142,66 @@ def test_resolved_invalidation_when_source_dies() -> None:
     dead = store._conn.execute(
         "SELECT archived FROM facts WHERE id = ?", (rid,)).fetchone()
     assert dead and bool(dead["archived"]), dead
+    store.close()
+
+
+def test_distill_docs_to_rules() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "dd.db")
+    store = _fresh(path)
+
+    class _FakeLLM:
+        calls = 0
+
+        @staticmethod
+        def available() -> bool:
+            return True
+
+        def chat_json(self, _messages):
+            type(self).calls += 1
+            return {"rules": [
+                "Always back up the database before every deploy.",
+                "Put canonical links on every public page."]}
+
+    store.ingest_document(
+        "Бэкап базы обязателен перед каждым деплоем.\n"
+        "Canonical ссылка ставится на каждой публичной странице.",
+        title="Правила деплоя",
+    )
+    store.llm = _FakeLLM()
+    res = store.distill_docs(max_chunks=5, max_llm_calls=1)
+    assert res["rules"] == 2 and res["calls"] == 1, res
+    rows = store._conn.execute(
+        "SELECT text, meta FROM facts WHERE kind='rule' AND archived=0").fetchall()
+    assert len(rows) == 2, rows
+    for r in rows:
+        assert json.loads(r["meta"])["pending_review"] == 1
+    docs = store._conn.execute(
+        "SELECT meta FROM facts WHERE kind='doc' AND archived=0").fetchall()
+    assert all(json.loads(d["meta"])["distilled"] for d in docs)
+    # second run: nothing left to distill, no LLM call
+    res2 = store.distill_docs(max_chunks=5, max_llm_calls=1)
+    assert res2["skipped"] == "no-rows" and _FakeLLM.calls == 1, res2
+    store.close()
+
+
+def test_invent_capability_boost_and_purpose_deadend() -> None:
+    path = os.path.join(tempfile.mkdtemp(), "ib.db")
+    store = _fresh(path)
+    store.add_turn("", "Engine is strong.", session_id="s1")
+    store.add_turn("", "Use Engine for torque output.", session_id="s1")
+    store.add_turn("", "Wheel rolls around.", session_id="s1")
+    store.add_turn("", "Wheel carries loads.", session_id="s1")
+    goal = "need torque output for movement"
+    rows = store.invent(goal, limit=5)
+    assert rows and rows[0]["score"] > 0, rows
+    first_pair = {rows[0]["a"].lower(), rows[0]["b"].lower()}
+    assert "engine" in first_pair, rows  # capability boost puts Engine first
+    # purpose-aware dead end: Engine failed FOR torque -> excluded for this goal
+    store.mark_deadend("Engine", "no torque on demand")
+    rows2 = store.invent(goal, limit=5)
+    for r in rows2:
+        pair = {r["a"].lower(), r["b"].lower()}
+        assert "engine" not in pair, rows2
     store.close()
 
 

@@ -153,7 +153,7 @@ NM_TOOL_SCHEMA = {
                          "deadend", "deadends",
                          "capabilities", "ingest",
                          "statuses", "resolve",
-                         "invent"],
+                         "invent", "distill"],
             },
             "query": {"type": "string", "description": "Search query (action=search)."},
             "content": {"type": "string", "description": "Fact statement (action=remember)."},
@@ -500,6 +500,17 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     swept = self._store.sweep_decisions()
                     if swept:
                         logger.info("neuromatrix sweep: captured %d decisions", swept)
+            # Doc -> rules distiller: once per UTC day, budget-gated.
+            if self._auto_consolidate:
+                dday = time.strftime("%Y%m%d", time.gmtime())
+                if self._store.get_meta("nm:distill_day") != dday:
+                    self._store.set_meta("nm:distill_day", dday)
+                    try:
+                        rep = self._store.distill_docs(max_chunks=3, max_llm_calls=1)
+                        if rep.get("rules"):
+                            logger.info("neuromatrix distill: %s", rep)
+                    except Exception as e:
+                        logger.debug("neuromatrix distill failed: %s", e)
             today = time.strftime("%Y%m%d")
             if self._store.get_meta("last_prune_day") != today:
                 n = self._store.prune(retention_days=self._retention_days)
@@ -885,6 +896,17 @@ def _tool_invent(prov: NeuromatrixMemoryProvider, a: dict) -> str:
                       ensure_ascii=False)
 
 
+def _tool_distill(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Doc -> rules distiller: convert ingested doc chunks into crisp durable
+    rules (pending review).  Budget-gated; no-op without an LLM/budget."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    res = store.distill_docs(max_chunks=int(a.get("limit") or 6),
+                             max_llm_calls=2)
+    return json.dumps({"ok": bool(res.get("rules")), **res}, ensure_ascii=False)
+
+
 def _tool_explain(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     """Render a claim with evidence citations; falls back to the shared pool."""
     if not prov._store:
@@ -1087,6 +1109,7 @@ _HANDLERS = {
     "statuses": _tool_statuses,
     "resolve": _tool_resolve,
     "invent": _tool_invent,
+    "distill": _tool_distill,
 }
 
 
