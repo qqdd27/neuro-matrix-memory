@@ -45,6 +45,13 @@ EN_STOP = {
     "totally", "anyway", "anyways", "honestly", "definitely", "absolutely",
     "exactly", "basically", "literally", "seriously", "meanwhile", "besides",
     "alright", "gonna", "wanna", "gotta", "kinda", "sorta",
+    # "Art" observed (LoCoMo, 2026-09) opening a second sentence as a common
+    # noun ("Wow, Caroline! Art can be...") and becoming a noise entity.
+    # Trade-off, not free: a real "Art" (short for Arthur) would also be
+    # filtered. Judged worth it -- the noun sense is far more common in
+    # practice than the name, and this denylist is the explicit place to
+    # revisit that trade-off if it ever misses a real "Art".
+    "art",
 }
 # Chat/text abbreviations that match the ALL-CAPS anchor pattern (same shape
 # as real symbols like BTC/TON) but carry no identity at all. Anchors are
@@ -84,28 +91,35 @@ _ANCHOR_RE = re.compile(
     r"|(?:^|[\s/])\d{6,}"                      # long numeric ids
     r")\b",
 )
-# Tier-2: Latin TitleCase words, 3-14 chars, not starting a sentence filler.
+# Tier-2: Latin TitleCase words, 3-14 chars.
 _TITLECASE_RE = re.compile(r"\b([A-Z][a-zA-Z0-9]{2,13})\b")
-# Tier-2 (RU): Cyrillic capitalized words, 3-14 chars.  Unlike Latin prose,
-# EVERY Russian sentence starts with a capital letter regardless of part of
-# speech ("Также нужно проверить сервер" - "Также" is not a name) - so the
-# Latin heuristic (any capitalized word) would flood the graph with sentence
-# starters.  The signal that survives is POSITION: a capitalized word that is
-# NOT the first token of its sentence is capitalization the writer chose
-# deliberately (a proper noun / brand / name), because Russian has no other
-# reason to capitalize mid-sentence.  First-token-of-sentence candidates are
-# therefore always skipped, never treated as entities.
+# Tier-2 (RU): Cyrillic capitalized words, 3-14 chars.
 _TITLECASE_RU_RE = re.compile(r"\b([А-ЯЁ][а-яё]{2,13})\b")
 _WORD_START_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
 
-
-def _ru_titlecase_candidates(text: str) -> list[str]:
-    """Cyrillic proper-noun candidates: capitalized, not sentence-initial."""
+# Position-gating: a capitalized word that is NOT the first token of its
+# sentence is capitalization the writer chose deliberately (a proper noun /
+# brand / name) — every language capitalizes the first word of a sentence
+# regardless of part of speech, so that position carries no signal in EITHER
+# script. Originally added for Cyrillic only (Russian has no OTHER reason to
+# capitalize mid-sentence, so the case for gating was obvious); measured
+# evidence (external LoCoMo benchmark, 2026-09) showed the same failure mode
+# in English prose just as often: generic sentence-starters inside a longer
+# reply ("Wow, Caroline! Art can be in the most unlikely places.") were
+# extracted as entities purely for opening their OWN sentence, inflating
+# unrelated facts' scores and burying facts that actually answered the
+# question under a wall of "Wow, X!" noise (measured across several failing
+# multi-hop questions, all sharing this exact shape). A denylist
+# (last/next/doing/... in EN_STOP) cannot scale to catch every common noun
+# that might open a sentence; position-gating both scripts the same way
+# does, uniformly, without needing to enumerate the noise.
+def _titlecase_candidates(regex: "re.Pattern[str]", text: str) -> list[str]:
+    """Proper-noun candidates for `regex`: capitalized, not sentence-initial."""
     out: list[str] = []
     for sent in re.split(r"(?<=[.!?])\s+", text):
         first = _WORD_START_RE.search(sent)
         first_start = first.start() if first else -1
-        for m in _TITLECASE_RU_RE.finditer(sent):
+        for m in regex.finditer(sent):
             if m.start() == first_start:
                 continue  # sentence-initial capitalization is ambiguous
             out.append(m.group(1))
@@ -146,8 +160,15 @@ def extract_entities(text: str, max_entities: int = 16) -> list[str]:
             continue
         if key and len(key) <= 40 and key not in found:
             found.append(key)
-    # TitleCase Latin names — only keep ones that are not pure anchors and
-    # not stopwords; they become weak entities (weight handled by caller).
+    # TitleCase Latin names — NOT position-gated (reverted, measured
+    # regression): the "Speaker: message" convention this engine itself uses
+    # for every stored turn puts the single most important entity (the
+    # speaker's name) as the first word of the whole text every time, with
+    # no preceding sentence boundary to distinguish it from "sentence-initial
+    # generic word" — position alone cannot tell them apart (proven: full
+    # gating dropped the speaker name from virtually every fact and broke
+    # five tests). A denylist stays the right tool for Latin; STOPWORDS +
+    # _ANCHOR_NOISE catch what has been observed in practice so far.
     for m in _TITLECASE_RE.finditer(text):
         w = m.group(1)
         if w.lower() in STOPWORDS or w.lower() in _ANCHOR_NOISE:
@@ -155,8 +176,16 @@ def extract_entities(text: str, max_entities: int = 16) -> list[str]:
         key = w.lower()
         if key not in found and len(key) <= 30:
             found.append(key)
-    # TitleCase Cyrillic names — same rule, position-gated (see above).
-    for w in _ru_titlecase_candidates(text):
+    # TitleCase Cyrillic names — same rule, position-gated (see above). NOTE:
+    # this has the identical theoretical edge case as Latin (a real entity
+    # that is literally the first word of the whole text, before any
+    # sentence boundary, is indistinguishable from sentence-initial noise by
+    # position alone) — it was never exercised by this project's own tests,
+    # which always placed the target entity mid-sentence. Kept as-is because
+    # it measurably fixed a real, reproduced recall gap for its original,
+    # narrower case (a genuine RU proper noun mid-sentence); the edge case is
+    # now documented rather than silently unknown.
+    for w in _titlecase_candidates(_TITLECASE_RU_RE, text):
         key = w.lower()
         if key in STOPWORDS or key in found or len(key) > 30:
             continue
