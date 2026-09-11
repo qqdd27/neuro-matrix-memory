@@ -61,7 +61,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from neuro_matrix.store import NeuroMatrixStore  # noqa: E402
-from neuro_matrix.llm import LLMClient, DEFAULT_BASE_URL, DEFAULT_MODEL  # noqa: E402
+from neuro_matrix.llm import (  # noqa: E402
+    DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient, build_llm_client,
+)
 
 _LOCOMO_URL = ("https://raw.githubusercontent.com/snap-research/locomo/"
                "main/data/locomo10.json")
@@ -146,10 +148,14 @@ def llm_answer(llm: LLMClient, question: str, context_texts: list[str]) -> str:
     context = "\n".join(f"- {t}" for t in context_texts[:12])
     content = llm.chat_json([
         {"role": "system",
-         "content": ("Answer the question using ONLY the facts below. Be "
-                     "concise (a few words, no full sentences). If the facts "
-                     "do not contain the answer, answer with your best "
-                     'guess anyway. Return JSON {"answer": "..."}.')},
+         "content": ("Answer the question using ONLY the facts below. Extract "
+                     "the SHORTEST possible answer span (2-5 words, a name, "
+                     "date, or short phrase) — reuse the facts' own wording "
+                     "verbatim wherever possible, never a full sentence, "
+                     "never restate the question, no filler words like "
+                     "'likely' or 'according to the facts'. If the facts do "
+                     "not contain the answer, still give your single best "
+                     'short guess. Return JSON {"answer": "..."}.')},
         {"role": "user", "content": f"FACTS:\n{context}\n\nQUESTION: {question}"},
     ])
     if isinstance(content, dict):
@@ -223,7 +229,14 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
         per_cat.setdefault(cat, []).append(found)
         if llm is not None and use_reader:
             pred = llm_answer(llm, qa["question"], [h.get("text", "") for h in hits])
-            per_cat_f1.setdefault(cat, []).append(f1_score(pred, qa.get("answer", "")))
+            # Category 5 (adversarial) stores its gold answer under a
+            # DIFFERENT key ('adversarial_answer', not 'answer') in the raw
+            # dataset -- missing this silently scored every adversarial
+            # question against an empty gold string (guaranteed F1=0).
+            gold = qa.get("answer")
+            if gold is None:
+                gold = qa.get("adversarial_answer", "")
+            per_cat_f1.setdefault(cat, []).append(f1_score(pred, gold))
     store.close()
     return {"sample_id": sample["sample_id"], "per_cat": per_cat,
             "per_cat_f1": per_cat_f1, "latency_ms": lat}
@@ -242,10 +255,15 @@ def main(argv=None) -> int:
                          "(F1 score) -- the number comparable to published "
                          "LoCoMo leaderboard entries. Costs real API calls.")
     ap.add_argument("--llm-api-key", default=(
-        os.environ.get("NEUROMATRIX_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
-        or os.environ.get("OPENAI_API_KEY") or ""))
-    ap.add_argument("--llm-base-url", default=DEFAULT_BASE_URL)
-    ap.add_argument("--llm-model", default=DEFAULT_MODEL)
+        os.environ.get("NEUROMATRIX_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""))
+    ap.add_argument("--llm-provider", default="",
+                    help="'anthropic' routes through the native Messages API "
+                         "(auto-detected from an 'sk-ant-' key prefix if "
+                         "left blank); anything else uses the OpenAI-"
+                         "compatible wire format (DeepSeek default).")
+    ap.add_argument("--llm-base-url", default="")
+    ap.add_argument("--llm-model", default="")
     ap.add_argument("--llm-sample", type=int, default=200,
                     help="randomly sample this many questions for the (paid) "
                          "--llm pass instead of all ~2000 (default 200)")
@@ -269,14 +287,17 @@ def main(argv=None) -> int:
     use_reader = args.llm
     use_rerank = args.rerank
     if use_reader or use_rerank:
-        llm = LLMClient(args.llm_api_key, base_url=args.llm_base_url,
-                        model=args.llm_model)
+        provider = args.llm_provider or (
+            "anthropic" if args.llm_api_key.startswith("sk-ant-") else "")
+        llm = build_llm_client(args.llm_api_key, provider=provider,
+                              base_url=args.llm_base_url, model=args.llm_model)
         if not llm.available():
             print("--llm/--rerank requested but no API key found "
-                  "(--llm-api-key / NEUROMATRIX_API_KEY / DEEPSEEK_API_KEY / "
-                  "OPENAI_API_KEY). Running evidence-hit@k only.")
+                  "(--llm-api-key / NEUROMATRIX_API_KEY / ANTHROPIC_API_KEY / "
+                  "DEEPSEEK_API_KEY / OPENAI_API_KEY). Running evidence-hit@k only.")
             llm, use_reader, use_rerank = None, False, False
         else:
+            print(f"LLM provider: {provider or 'openai-compatible'}, model: {llm.model}")
             all_qas = [(s["sample_id"], qa["question"]) for s in data
                       for qa in s["qa"] if qa.get("evidence")]
             rnd = random.Random(args.llm_seed)
@@ -351,8 +372,8 @@ def main(argv=None) -> int:
             print(f"[{name:11s}] n={len(v):4d}  avg F1 = {m:.1%}")
             lines_md.append(f"| {cat} {name} | {len(v)} | {m:.1%} |")
         print(f"\nOVERALL QA-accuracy (F1): {avg_f1:.1%} "
-              f"(sampled {total_f1_n}, model={args.llm_model})")
-        lines_md.append(f"\n**Overall F1: {avg_f1:.1%}** (model={args.llm_model})")
+              f"(sampled {total_f1_n}, model={llm.model if llm else args.llm_model})")
+        lines_md.append(f"\n**Overall F1: {avg_f1:.1%}** (model={llm.model if llm else args.llm_model})")
 
     if args.out:
         Path(args.out).write_text("\n".join(lines_md) + "\n", encoding="utf-8")

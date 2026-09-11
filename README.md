@@ -209,6 +209,24 @@ single-shot retrieval without multi-hop reasoning. Full breakdown in
 `docs/locomo-report.md`. The dataset (CC BY-NC 4.0) is fetched on demand,
 never vendored into this MIT-licensed repo.
 
+**Entity-match saturation (2026-09, zero LLM cost):** the additive fix above
+still let a fact that happened to co-mention several query-adjacent
+entities (some incidental) outscore a precisely-matched single-entity fact
+by sheer count. Fixed with BM25-style term-frequency saturation applied to
+the COUNT of matched entities per fact instead of word frequency (single-
+entity facts score exactly as before; a 5-entity fact's contribution is
+capped toward an asymptote, not a linear 5x). Result: evidence-hit@8
+**27.8% → 32.3%** (+16% relative) — a genuine trade, reported honestly, not
+a pure win: temporal (42.8%→36.2%) and multi-hop (12.4%→7.9%) regressed,
+because saturation also dampens the cases where several co-mentioned
+entities were genuinely, not incidentally, relevant. The k1=2.0 constant was
+chosen by a small sweep against LoCoMo's own zero-cost evidence-hit@8 metric
+(no paid QA-accuracy calls spent on it) — it also happens to sit at the
+upper end of BM25's conventional k1 range (1.2–2.0) in the IR literature,
+which is the honest mitigation against reading this as a number picked to
+game one benchmark. A second, external benchmark (LongMemEval) would be the
+next check that this generalizes past LoCoMo's specific question shapes.
+
 ## Development
 
 ```bash

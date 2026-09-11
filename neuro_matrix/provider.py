@@ -114,7 +114,10 @@ except Exception:  # pragma: no cover - standalone dev / unit tests w/o hermes t
 
 
 from .config_schema import LEGACY_CONFIG_SCHEMA as CONFIG_SCHEMA  # noqa: E402
-from .llm import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient, resolve_hermes_llm_config  # noqa: E402
+from .llm import (  # noqa: E402
+    DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient, build_llm_client,
+    resolve_hermes_llm_config,
+)
 from .store import NeuroMatrixStore  # noqa: E402
 
 NAME = "neuromatrix"
@@ -282,22 +285,25 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 # No dedicated key: reuse the LLM provider Hermes already uses.
                 hers = resolve_hermes_llm_config() or {}
                 if hers:
-                    client = LLMClient(
-                        api_key=hers["api_key"],
-                        base_url=hers["base_url"],
-                        model=hers["model"],
+                    client = build_llm_client(
+                        hers["api_key"], provider=hers.get("provider", ""),
+                        base_url=hers["base_url"], model=hers["model"],
                     )
                     logger.info("neuromatrix LLM: reusing Hermes provider %s (%s)",
                                 hers.get("provider") or "?", hers["model"])
             if api_key:
-                # Dedicated key: empty base/model fields follow Hermes' provider.
+                # Dedicated key: empty base/model/provider fields follow
+                # Hermes' provider (a provider mismatch here would silently
+                # send an Anthropic key to the OpenAI-compatible wire format
+                # and vice versa — both just 401/404 and degrade to
+                # extractive mode with no visible error, so this must route
+                # through the same provider-aware factory as above).
                 hers = hers or resolve_hermes_llm_config() or {}
-                client = LLMClient(
-                    api_key=api_key,
-                    base_url=str(self._config.get("llm_base_url") or hers.get("base_url")
-                                 or DEFAULT_BASE_URL),
-                    model=str(self._config.get("llm_model") or hers.get("model")
-                              or DEFAULT_MODEL),
+                client = build_llm_client(
+                    api_key,
+                    provider=str(self._config.get("llm_provider") or hers.get("provider") or ""),
+                    base_url=str(self._config.get("llm_base_url") or hers.get("base_url") or ""),
+                    model=str(self._config.get("llm_model") or hers.get("model") or ""),
                 )
             if client is not None and self._store is not None:
                 self._store.llm = client
@@ -308,11 +314,15 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 self._shared = NeuroMatrixStore(ws)
                 self._shared.llm_daily_budget = self._store.llm_daily_budget
                 if client is not None:
-                    self._shared.llm = LLMClient(
-                        api_key=client.api_key,
-                        base_url=client.base_url,
-                        model=client.model,
-                    )
+                    # Reuse the same client object (LLMClient or
+                    # AnthropicLLMClient, whichever build_llm_client picked
+                    # above) -- both are effectively stateless (budget
+                    # tracking lives on the store, not the client), so there
+                    # is no reason to reconstruct one and every reason not
+                    # to: a hardcoded LLMClient(...) here would silently
+                    # rebuild an Anthropic-configured client with the wrong
+                    # wire format.
+                    self._shared.llm = client
                 logger.info("neuromatrix shared workspace ready: %s", ws)
             except Exception as e:  # shared pool must never break the provider
                 logger.error("neuromatrix workspace %s failed: %s", ws, e)

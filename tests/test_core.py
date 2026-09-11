@@ -15,7 +15,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neuro_matrix.entities import extract_alias_pairs, extract_entities
-from neuro_matrix.store import NeuroMatrixStore, _ru_variants
+from neuro_matrix.store import NeuroMatrixStore, _ru_variants, _entity_match_saturation
 
 
 def _fresh(path: str) -> NeuroMatrixStore:
@@ -572,6 +572,24 @@ def test_contradictions_duplicate_scan():
     assert c["duplicate_count"] >= 1, c
     assert c["duplicates"][0]["b"]["text"] == "id_900 выпустил новую версию токена."
     store.close()
+
+
+def test_entity_match_saturation_formula():
+    """BM25-style saturation on the COUNT of distinct entities matched per
+    fact (measured fix, LoCoMo 2026-09, k1=2.0): n=1 must be a complete
+    no-op (zero behavior change for the overwhelmingly common single-entity
+    case), and higher n must grow toward the (k1+1) asymptote instead of
+    unboundedly -- monotonically increasing but strictly sub-linear."""
+    assert abs(_entity_match_saturation(1) - 1.0) < 1e-9
+    vals = [_entity_match_saturation(n) for n in (1, 2, 3, 5, 10, 100)]
+    # Monotonically increasing...
+    assert all(b > a for a, b in zip(vals, vals[1:])), vals
+    # ...but sub-linear: n=10 must score nowhere near 10x n=1.
+    assert vals[4] < 3.0, vals
+    # ...and bounded by the k1+1 asymptote (k1=2.0 -> ceiling 3.0) even at
+    # very large n.
+    assert vals[-1] < 3.0, vals
+    assert abs(_entity_match_saturation(100) - 3.0) < 0.1
 
 
 def test_content_relevance_bonus_beats_pure_recency_for_hub_entities():
