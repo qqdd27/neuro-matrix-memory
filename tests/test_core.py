@@ -394,6 +394,34 @@ def test_contradictions_duplicate_scan():
     store.close()
 
 
+def test_dossier_conflict_detection():
+    """Roadmap item: contradiction detection between dossiers and fresh facts.
+    Two mentions consolidate id_900 into a dossier; a later fact carrying a
+    negation marker about the same entity must be flagged as a conflict with
+    that consolidated summary — before any human/LLM re-review."""
+    path = os.path.join(tempfile.mkdtemp(), "m16b.db")
+    store = _fresh(path)
+    t0 = time.time() - 3600
+    store.remember("id_900 использует Firebase для синхронизации.",
+                    source="turn:assistant", ts=t0, kind="episodic")
+    store.remember("id_900 хранит данные офлайн через Firebase.",
+                    source="turn:assistant", ts=t0 + 1, kind="episodic")
+    rep = store.consolidate(force=True)
+    assert rep["dossiers_updated"] >= 1, rep
+    ent = store.entity("id_900")
+    assert ent and ent["dossier"], ent
+    # Fresh, later fact that contradicts the settled dossier.
+    t1 = time.time()
+    store.remember("Firebase для id_900 не подошло, переделали на Supabase.",
+                    source="turn:assistant", ts=t1, kind="episodic")
+    c = store.contradictions()
+    assert c["dossier_conflict_count"] >= 1, c
+    hit = c["dossier_conflicts"][0]
+    assert hit["entity_key"] == "id_900", hit
+    assert "supabase" in hit["fact_text"].lower() or "не подошло" in hit["fact_text"].lower()
+    store.close()
+
+
 def test_myelination_protects_from_downscaling():
     """SHY downscaling weakens unprotected edges; myelinated (stable) edges —
     habits — survive.  Counts are rounded down but never below 1."""

@@ -2139,7 +2139,9 @@ class NeuroMatrixStore:
     def contradictions(self) -> dict[str, Any]:
         """Contradiction scan: near-duplicate episodic claims per entity
         (potential conflicting statements) + entities with several active
-        durable intent facts. Deterministic review list (LLM resolution later)."""
+        durable intent facts + fresh facts that conflict with an entity's
+        already-consolidated dossier. Deterministic review list (LLM
+        resolution later)."""
         rows = self._conn.execute(
             "SELECT fe.entity_id, f.id, f.text, f.kind FROM fact_entities fe "
             "JOIN facts f ON f.id = fe.fact_id "
@@ -2171,7 +2173,46 @@ class NeuroMatrixStore:
             if len(duplicates) >= 20:
                 break
         return {"duplicates": duplicates[:20], "conflict_entities": conflict_ents[:10],
-                "duplicate_count": len(duplicates)}
+                "duplicate_count": len(duplicates),
+                "dossier_conflicts": (dc := self._dossier_conflicts())[:10],
+                "dossier_conflict_count": len(dc)}
+
+    def _dossier_conflicts(self) -> list[dict[str, Any]]:
+        """Conflict-monitoring pass (prediction-error / ACC signal, mirrors the
+        write-path ``_detect_and_apply_correction`` but against consolidated
+        long-term memory instead of the last few turns): for every entity that
+        already has a dossier, find facts about that SAME entity, recorded
+        AFTER the dossier was last consolidated, that carry a negation /
+        reversal marker (NEG_MARKERS) — i.e. the entity's settled long-term
+        summary and its most recent mention plausibly disagree.  Deterministic,
+        no LLM; a human (or a future LLM pass) resolves the flagged pairs by
+        re-consolidating."""
+        out: list[dict[str, Any]] = []
+        dossiers = self._conn.execute(
+            "SELECT d.entity_id, d.summary, d.updated_at, e.key FROM dossiers d "
+            "JOIN entities e ON e.id = d.entity_id").fetchall()
+        for d in dossiers:
+            rows = self._conn.execute(
+                "SELECT f.id, f.text, f.ts FROM fact_entities fe "
+                "JOIN facts f ON f.id = fe.fact_id "
+                "WHERE fe.entity_id = ? AND f.archived = 0 AND f.ts > ? "
+                "AND f.kind IN ('episodic','decision','goal','constraint','capability') "
+                "AND (f.meta IS NULL OR f.meta NOT LIKE '%\"negated\": true%') "
+                "ORDER BY f.ts DESC LIMIT 20",
+                (int(d["entity_id"]), float(d["updated_at"]))).fetchall()
+            for r in rows:
+                tl = str(r["text"]).lower()
+                if any(m in tl for m in NEG_MARKERS):
+                    out.append({
+                        "entity_id": int(d["entity_id"]), "entity_key": d["key"],
+                        "dossier_summary": str(d["summary"])[:300],
+                        "dossier_updated_at": d["updated_at"],
+                        "fact_id": int(r["id"]), "fact_text": r["text"][:300],
+                        "fact_ts": r["ts"],
+                    })
+                    if len(out) >= 40:
+                        return out
+        return out
 
     @staticmethod
     def _jaccard(a: str, b: str) -> float:

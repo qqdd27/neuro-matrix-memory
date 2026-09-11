@@ -191,8 +191,11 @@ pip install -e .                   # dev install of the provider package
 - [x] Core engine (graph + FTS5 + decay + prune + extractive consolidation)
 - [x] Hermes `MemoryProvider` plugin (prefetch / sync_turn / session-end sleep / tools)
 - [x] Optional batched LLM consolidation (OpenAI-compatible)
-- [ ] `hermes neuromatrix` CLI (`status`, `search`, `consolidate`)
-- [ ] Contradiction detection between dossiers and fresh facts
+- [x] `hermes neuromatrix` CLI (`status`, `search`, `consolidate`)
+- [x] Contradiction detection between dossiers and fresh facts (`contradict`
+      action → `dossier_conflicts`: any post-consolidation fact carrying a
+      negation/reversal marker about an entity that already has a settled
+      dossier is flagged for review before it silently drifts)
 - [ ] Optional reranking when a local embedding model is available
 - [ ] Hermes Skills auto-registration on activation
 
