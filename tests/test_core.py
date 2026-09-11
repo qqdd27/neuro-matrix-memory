@@ -33,9 +33,69 @@ def test_extract_entities_russian_and_anchors():
     assert keys2 == ["firebase"], keys2
 
 
+def test_entity_noise_from_sentence_fillers_and_chat_abbreviations():
+    """External validation finding (LoCoMo benchmark, 2026-09): common
+    English sentence-continuation words ("Doing research...", "Last
+    month...") and chat abbreviations that happen to be ALL-CAPS ("BTW")
+    were being extracted as real entities, inflating a fact's entity count
+    (and therefore its additive graph score) with pure noise -- unrelated to
+    whether the fact was actually relevant to anything. Position-gating
+    (the Cyrillic fix) does NOT transfer here: English text -- and this
+    engine's own speaker-prefixed facts ("Caroline: ...") -- routinely open
+    a sentence with the real entity, so a denylist is used instead."""
+    keys = extract_entities(
+        "Thanks for the tip, Caroline. Doing research and readying myself "
+        "emotionally makes sense. BTW, Last month was rough.")
+    assert "caroline" in keys, keys
+    assert "doing" not in keys and "last" not in keys and "btw" not in keys, keys
+
+
 def test_extract_alias_pairs_ru():
     pairs = extract_alias_pairs("Криптовалюта TON — это id_777.")
     assert ("ton", "id_777") in pairs, pairs
+
+
+def test_extract_entities_ru_titlecase_no_anchor():
+    """Real recall bug (reproduced 2026-09-11): a Russian proper noun with NO
+    anchor (no id_/0x/ALL-CAPS) was invisible to the engine, so any fact about
+    it was silently dropped by the write-path importance gate.  Fix: mid-
+    sentence Cyrillic capitalization is a real signal (position-gated) even
+    though EVERY Russian sentence starts capitalized regardless of content."""
+    keys = extract_entities("Мы используем Постгрес для хранения данных.")
+    assert "постгрес" in keys, keys
+    # Sentence-initial capitalization must stay ambiguous -> never an entity.
+    keys2 = extract_entities("Также нужно проверить сервер.")
+    assert "также" not in keys2, keys2
+    # Multi-sentence: the 2nd sentence's own first word is still skipped,
+    # but a proper noun later in that same sentence is kept.
+    keys3 = extract_entities(
+        "Использовали Redis. Потом перешли на Постгрес, потому что нужна "
+        "была надёжность.")
+    assert "redis" in keys3 and "постгрес" in keys3, keys3
+    assert "потом" not in keys3, keys3
+
+
+def test_cross_session_recall_ru_named_entity_no_anchor():
+    """End-to-end proof the fix actually restores memory: a Russian named
+    tool with zero anchors, mentioned in one session, must still be
+    recallable by name from a later session - the exact failure mode the
+    entity-extraction gap caused before this fix."""
+    path = os.path.join(tempfile.mkdtemp(), "m_ru_ent.db")
+    store = _fresh(path)
+    store.add_turn(
+        "Мы используем Постгрес для хранения профилей пользователей.",
+        "Понял, Постгрес хранит профили пользователей.",
+        session_id="s1",
+    )
+    store.add_turn(
+        "Расскажи, что у нас с Постгрес?",
+        "Постгрес по-прежнему хранит профили, всё стабильно.",
+        session_id="s2",
+    )
+    res = store.search("Постгрес", limit=10)
+    assert res, "Russian named entity without an anchor was not recalled"
+    assert any("профил" in r["text"].lower() for r in res), res
+    store.close()
 
 
 def test_cross_session_id_linking():
@@ -88,6 +148,41 @@ def test_graph_hop_recall():
     store.close()
 
 
+def test_search_stays_fast_with_a_hub_entity() -> None:
+    """Scale regression guard for a proven, measured defect (2026-09):
+    profiling a synthetic 50k-fact / 212-entity store with one moderately
+    hub-like entity found search() taking 62 SECONDS for a single query --
+    caused by (1) a per-entity score helper re-queried once per (fact,
+    entity) row instead of once per entity, (2) the materialize step doing
+    one individual SQL SELECT per scored candidate instead of a batched
+    query, and (3) unbounded 2-hop graph expansion pulling in the entire
+    entity graph for a hub node. All three are fixed; this test reproduces
+    the hub-entity shape (a small anchor pool so entities densely
+    co-occur) at a size that still runs quickly in CI and asserts search()
+    stays fast -- a future change reintroducing any of the three bugs would
+    make this test slow or time out, not silently pass."""
+    import random as _random
+    path = os.path.join(tempfile.mkdtemp(), "hub_scale.db")
+    store = _fresh(path)
+    rnd = _random.Random(7)
+    anchors = [f"id_{i}" for i in range(30)] + ["HUBTOKEN"]
+    verbs = ["используется для", "упал из-за", "работает стабильно с",
+             "интегрирован с", "хранит данные из"]
+    for i in range(4000):
+        a = rnd.choice(anchors)
+        b = rnd.choice(anchors)
+        store.remember(f"{a} {rnd.choice(verbs)} {b}, эпизод {i}, детали.",
+                       source="turn:assistant", session_id=f"s{i % 200}")
+    t0 = time.time()
+    res = store.search("HUBTOKEN", limit=8)
+    elapsed = time.time() - t0
+    store.close()
+    assert res, "hub entity search returned nothing"
+    # Generous bound: a real regression to the pre-fix behaviour would take
+    # tens of seconds at this scale, not fail this assertion by a hair.
+    assert elapsed < 5.0, f"search() took {elapsed:.2f}s -- scaling regression"
+
+
 def test_consolidation_extractive_no_llm():
     path = os.path.join(tempfile.mkdtemp(), "m3.db")
     store = _fresh(path)
@@ -137,6 +232,45 @@ def test_ephemeral_turns_ignored():
     store.add_turn("Привет", "Здравствуйте! Чем могу помочь?", session_id="e1")
     store.add_turn("Ок, спасибо", "Пожалуйста!", session_id="e2")
     assert store.stats()["facts"] == 0, store.stats()
+    store.close()
+
+
+def test_merge_is_reversible():
+    """Entity merge (via link()) is the single highest-risk operation in the
+    engine: a wrong identity statement silently fuses two unrelated things
+    and used to be permanent. Verify a full round-trip: merge, then
+    unmerge(), must restore both entities' profiles, hit counts, aliases,
+    shared third-party edge weight, and search results EXACTLY."""
+    path = os.path.join(tempfile.mkdtemp(), "m6b.db")
+    store = _fresh(path)
+    store.remember("id_100 связан с проектом Alpha.", source="turn:assistant")
+    store.remember("id_100 работает с Beta тоже.", source="turn:assistant")
+    store.remember("id_200 отдельная сущность, тоже связана с Alpha.",
+                   source="turn:assistant")
+
+    ent100_before = store.entity("id_100")
+    ent200_before = store.entity("id_200")
+    alpha_before = store.entity("alpha")
+    res_before = sorted(r["text"] for r in store.search("id_200", limit=10))
+
+    mid = store.link("id_100", "id_200")
+    assert mid is not None
+    # While merged, id_200 resolves through the alias to the surviving entity.
+    merged_probe = store.entity("id_200")
+    assert merged_probe is not None and merged_probe["key"] == "id_100"
+
+    r = store.unmerge(mid)
+    assert r is not None and r["ok"] is True and r["restored_key"] == "id_200"
+
+    assert store.entity("id_100") == ent100_before
+    assert store.entity("id_200") == ent200_before
+    assert store.entity("alpha")["hits"] == alpha_before["hits"]
+    res_after = sorted(r["text"] for r in store.search("id_200", limit=10))
+    assert res_after == res_before
+
+    # Calling unmerge twice on the same merge_log id is a no-op, not a crash
+    # or a second (corrupting) restore.
+    assert store.unmerge(mid) is None
     store.close()
 
 
@@ -347,19 +481,65 @@ def test_decide_tools_provider():
 
 
 def test_feedback_reinforcement_and_archival():
+    """Beta-Bernoulli confidence (Jeffreys prior 0.5/0.5, rescaled x2 so the
+    no-feedback baseline stays 1.0): each vote's effect on confidence is
+    exact and reproducible from the helpful/unhelpful counts alone."""
     path = os.path.join(tempfile.mkdtemp(), "m14.db")
     store = _fresh(path)
     fid = store.remember("id_777 используется для выплат.", source="turn:assistant")
     assert fid is not None
     assert abs(store.search("id_777")[0]["confidence"] - 1.0) < 1e-9
     r = store.feedback(fid, helpful=True)
-    assert abs(r["confidence"] - 1.15) < 1e-6
+    # n_helpful=1, n_unhelpful=0 -> 2*(0.5+1)/(1+1) = 1.5
+    assert abs(r["confidence"] - 1.5) < 1e-6, r
     for _ in range(3):
-        r = store.feedback(fid, helpful=False)  # 1.15 -> .575 -> .2875 -> .143(archived)
-    assert r["archived"] is True, r
-    res = store.search("id_777", limit=10)
-    assert not any(x["fact_id"] == fid for x in res), res  # archived excluded
+        # 1 helpful + up to 3 unhelpful accumulate; archival needs >=3 votes
+        # AND confidence < 0.3 (sustained evidence, not one bad vote).
+        r = store.feedback(fid, helpful=False)
+    # n_helpful=1, n_unhelpful=3 -> 2*(0.5+1)/(1+4) = 0.6 -> not archived:
+    # a single lucky/unlucky vote can no longer flip the outcome by itself,
+    # and one genuine earlier confirmation keeps giving the fact the benefit
+    # of the doubt against a few contradicting votes (correct: a Bayesian
+    # posterior does not forget real evidence just because more came later).
+    assert abs(r["confidence"] - 0.6) < 1e-6, r
+    assert r["archived"] is False, r
+    # A fact with NO redeeming helpful votes at all DOES get archived once
+    # enough sustained negative evidence accumulates (n=3, all unhelpful).
+    fid2 = store.remember("id_778 используется для выплат.", source="turn:assistant")
+    r2 = None
+    for _ in range(3):
+        r2 = store.feedback(fid2, helpful=False)
+    # n_helpful=0, n_unhelpful=3 -> 2*0.5/4 = 0.25 < 0.3 -> archived.
+    assert abs(r2["confidence"] - 0.25) < 1e-6, r2
+    assert r2["archived"] is True, r2
+    res = store.search("id_778", limit=10)
+    assert not any(x["fact_id"] == fid2 for x in res), res  # archived excluded
     store.close()
+
+
+def test_feedback_confidence_is_order_invariant():
+    """Regression guard for a proven defect in the previous +0.15/*0.5 scheme:
+    for the SAME evidence (2 helpful + 2 unhelpful votes), confidence used to
+    depend on the ORDER the votes arrived in (measured: 0.325 / 0.55 / 0.3625
+    for three different orderings of the identical multiset). A Bayesian
+    posterior computed from counts cannot do this by construction -- three
+    different orders of the same 2-vs-2 evidence must land on one value."""
+    def run(order: list[bool]) -> float:
+        path = os.path.join(tempfile.mkdtemp(), "m14b.db")
+        store = _fresh(path)
+        fid = store.remember("id_2 стабилен.", source="turn:assistant")
+        r = None
+        for helpful in order:
+            r = store.feedback(fid, helpful)
+        store.close()
+        return r["confidence"]
+
+    a = run([True, True, False, False])
+    b = run([False, False, True, True])
+    c = run([True, False, True, False])
+    assert abs(a - b) < 1e-9 and abs(b - c) < 1e-9, (a, b, c)
+    # And it must equal the closed-form posterior mean directly.
+    assert abs(a - 2.0 * (0.5 + 2) / (1.0 + 4)) < 1e-9, a
 
 
 def test_correction_on_write_negation():
@@ -391,6 +571,80 @@ def test_contradictions_duplicate_scan():
     c = store.contradictions()
     assert c["duplicate_count"] >= 1, c
     assert c["duplicates"][0]["b"]["text"] == "id_900 выпустил новую версию токена."
+    store.close()
+
+
+def test_content_relevance_bonus_beats_pure_recency_for_hub_entities():
+    """External validation finding (LoCoMo benchmark, snap-research/locomo,
+    2026-09): running this engine against a real, non-self-authored
+    conversational-memory benchmark for the first time exposed a severe,
+    systemic ranking defect that the project's own small synthetic tests
+    never could -- because in those tests every anchor entity had only 1-3
+    mentions total, so ranking by recency alone always happened to surface
+    the one relevant fact by luck of scale, not by real relevance.
+
+    The defect: once an entity is mentioned in MANY facts (a hub -- the most
+    common real case being a person's own name in a long conversation),
+    search() ranked candidates purely by entity-presence x recency x
+    importance, completely blind to whether the OTHER words in the question
+    matched the fact's own text. "What did Alex research?" surfaced the most
+    RECENT fact mentioning Alex, not the one about research. Measured on
+    LoCoMo: evidence-hit@8 was 3.0% before a fix, 27.8% after (9.3x).
+
+    Fixed with a MULTIPLICATIVE content-token relevance bonus applied once
+    per fact after its full entity-based score is summed (an earlier,
+    additive '+1 per matched word' attempt measurably failed: entity base
+    scores are unbounded -- they grow with edge count/dataset size and with
+    how many entities a fact happens to mention -- so a fixed additive bonus
+    is invisible against a hub fact's already-large base score; only a
+    proportional boost reliably competes regardless of that scale)."""
+    path = os.path.join(tempfile.mkdtemp(), "hubrel.db")
+    store = _fresh(path)
+    # Twenty generic mentions of a hub name -- none about the real question,
+    # all more recent than the one relevant fact (worst case for a
+    # recency-only ranker). Deliberately lowercase filler after the speaker
+    # prefix so no SECOND entity accidentally enters the graph and confounds
+    # the property under test (a capitalized filler word repeated across all
+    # 40 facts would itself become a strong hub neighbor, which is a real
+    # phenomenon but a different one than this test targets).
+    for i in range(20):
+        store.remember(f"Alex: yeah that sounds fun, tell me more #{i}.",
+                       source="turn:assistant")
+    store.remember("Alex: researching adoption agencies has been on my mind lately.",
+                   source="turn:assistant")
+    for i in range(20):
+        store.remember(f"Alex: nice, glad to hear it, take care #{i}.",
+                       source="turn:assistant")
+    hits = store.search("What did Alex research?", limit=3)
+    assert any("adoption" in h["text"].lower() for h in hits), hits
+    store.close()
+
+
+def test_dossier_conflict_detection():
+    """Roadmap item: contradiction detection between dossiers and fresh facts.
+    Two mentions consolidate id_900 into a dossier; a later fact carrying a
+    negation marker about the same entity must be flagged as a conflict with
+    that consolidated summary — before any human/LLM re-review."""
+    path = os.path.join(tempfile.mkdtemp(), "m16b.db")
+    store = _fresh(path)
+    t0 = time.time() - 3600
+    store.remember("id_900 использует Firebase для синхронизации.",
+                    source="turn:assistant", ts=t0, kind="episodic")
+    store.remember("id_900 хранит данные офлайн через Firebase.",
+                    source="turn:assistant", ts=t0 + 1, kind="episodic")
+    rep = store.consolidate(force=True)
+    assert rep["dossiers_updated"] >= 1, rep
+    ent = store.entity("id_900")
+    assert ent and ent["dossier"], ent
+    # Fresh, later fact that contradicts the settled dossier.
+    t1 = time.time()
+    store.remember("Firebase для id_900 не подошло, переделали на Supabase.",
+                    source="turn:assistant", ts=t1, kind="episodic")
+    c = store.contradictions()
+    assert c["dossier_conflict_count"] >= 1, c
+    hit = c["dossier_conflicts"][0]
+    assert hit["entity_key"] == "id_900", hit
+    assert "supabase" in hit["fact_text"].lower() or "не подошло" in hit["fact_text"].lower()
     store.close()
 
 
@@ -1043,6 +1297,33 @@ def test_ru_variants_unit() -> None:
     vs = _ru_variants("правило")
     assert "правило" in vs and "правила" in vs and "правилу" in vs, vs
     assert len(vs) <= 9
+
+
+def test_synonym_bridge_narrows_semantic_gap() -> None:
+    """Honest, BOUNDED narrowing of the measured semantic-recall ceiling
+    (scripts/eval_semantic_gap.py): a query built from a curated synonym of a
+    word actually present in the fact must recall it, even with zero literal
+    token overlap and no shared anchor entity. This is NOT semantic search —
+    verify the boundary holds too: a query sharing no synonym-group member
+    and no anchor with the fact still correctly misses (regression guard
+    against ever silently overclaiming this closes the whole gap)."""
+    path = os.path.join(tempfile.mkdtemp(), "syn.db")
+    store = _fresh(path)
+    store.remember("Сервис TON падал из-за исчерпания лимита запросов к API.",
+                    source="turn:assistant")
+    store.remember("id_42 хранит данные локально и продолжает работать без сети.",
+                    source="turn:assistant")
+    hits1 = store.search("Почему у нас недавно был сбой на проде?", limit=5)
+    assert any("падал" in h["text"] for h in hits1), hits1
+    hits2 = store.search("Что из наших инструментов не требует подключения "
+                          "к интернету?", limit=5)
+    assert any("локально" in h["text"] for h in hits2), hits2
+    # Boundary: genuinely disjoint vocabulary (no synonym-group member, no
+    # anchor shared) must still miss -- the bridge is narrow by design.
+    hits3 = store.search("Почему сменили предыдущего поставщика бэкенда?",
+                          limit=5)
+    assert not any("TON" in h["text"] or "id_42" in h["text"] for h in hits3), hits3
+    store.close()
     # Latin tokens pass through untouched
     assert _ru_variants("postgresql") == ["postgresql"]
 

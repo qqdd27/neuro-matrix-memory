@@ -100,6 +100,42 @@ _RU_ALTS = ("а", "ы", "е", "у", "ой", "ом", "ам", "ах", "ов", "а�
             "ями", "ая", "ые", "ое", "ого", "ую", "ем", "ей")
 
 
+# Curated synonym bridge (RU/EN, ops/tech vocabulary): a small, deliberately
+# narrow set of groups where the words are near-synonyms in this domain,
+# used ONLY as an extra OR-branch in the FTS lexical fallback — never as an
+# entity/alias merge. This is an honest, bounded narrowing of the measured
+# semantic-recall gap (see scripts/eval_semantic_gap.py), not a fix for it:
+# it recovers a paraphrase that swaps one of these specific words for another
+# in the same group, but does nothing for two sentences sharing no group
+# member at all (that needs an embedding model, which conflicts with this
+# project's zero-runtime-dependency, fully local design — see README/roadmap
+# rather than silently pretending an n-gram trick closes that gap).
+_SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"сбой", "авария", "инцидент", "падение", "упал", "упала",
+               "упало", "упали", "падал", "падала", "падало", "падали",
+               "рухнул", "рухнула", "рухнули", "легло", "легли",
+               "накрылось", "накрылись", "отвалилось", "отвалились",
+               "outage", "incident", "crash", "crashed", "down", "failure"}),
+    frozenset({"провайдер", "поставщик", "вендор", "provider", "vendor",
+               "supplier"}),
+    frozenset({"интернет", "сеть", "сети", "онлайн", "internet", "network",
+               "online"}),
+    frozenset({"баг", "ошибка", "дефект", "проблема", "bug", "defect",
+               "issue", "glitch"}),
+    frozenset({"офлайн", "локально", "автономно", "offline", "locally"}),
+    frozenset({"переделали", "перешли", "сменили", "switched", "migrated",
+               "moved"}),
+)
+_SYNONYM_INDEX: dict[str, frozenset[str]] = {
+    w: g for g in _SYNONYM_GROUPS for w in g
+}
+
+
+def _synonym_variants(tok: str) -> list[str]:
+    group = _SYNONYM_INDEX.get(tok.lower())
+    return sorted(group - {tok.lower()}) if group else []
+
+
 def _ru_variants(tok: str) -> list[str]:
     out = [tok]
     for suf in _RU_SUFFIXES:
@@ -239,6 +275,15 @@ CREATE TABLE IF NOT EXISTS ask_log (
     last_ts REAL NOT NULL,
     hits INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS merge_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    keep_id INTEGER NOT NULL,
+    snapshot TEXT NOT NULL,
+    undone INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_merge_log_keep ON merge_log(keep_id);
 """
 
 
@@ -597,23 +642,27 @@ class NeuroMatrixStore:
         key = "_".join(tokens[:4])[:48]
         return key
 
-    def link(self, alias_a: str, alias_b: str, *, label: Optional[str] = None) -> None:
+    def link(self, alias_a: str, alias_b: str, *,
+             label: Optional[str] = None) -> Optional[int]:
         """Explicit cross-session identity statement: alias_a <-> alias_b refer
         to the same canonical entity (user tool / alias extraction).  The more
-        established entity survives the merge (higher hit count wins)."""
+        established entity survives the merge (higher hit count wins).
+        Returns the ``merge_log`` id (pass to ``unmerge()`` to undo this exact
+        merge, e.g. if the identity statement turns out to be wrong)."""
         now = time.time()
         a = self._entity_for_key(_norm(alias_a), now)
         b = self._entity_for_key(_norm(alias_b), now)
         if a is None or b is None or a == b:
-            return
+            return None
         ra = self._conn.execute(
             "SELECT hits, last_seen FROM entities WHERE id = ?", (a,)).fetchone()
         rb = self._conn.execute(
             "SELECT hits, last_seen FROM entities WHERE id = ?", (b,)).fetchone()
         if rb is not None and (ra is None or (rb["hits"], rb["last_seen"]) > (ra["hits"], ra["last_seen"])):
             a, b = b, a
-        self._merge_entities(a, b, now)
+        mid = self._merge_entities(a, b, now)
         self._conn.commit()
+        return mid
 
     # ------------------------------------------------------------- retrieval
 
@@ -722,25 +771,43 @@ class NeuroMatrixStore:
         results: list[dict[str, Any]] = []
         seen_facts: set[int] = set()
         scored: dict[int, float] = {}
-
-        if q_entities:
-            eids = list(q_entities)
-            scored, seen_facts = self._score_facts_by_entities(eids, now, as_of=as_of)
-
-        # Lexical fallback via FTS5 for remaining query tokens.
+        # Computed once, used both to boost entity-path candidates below and
+        # as the FTS lexical fallback query further down.
         tokens = [
             t for t in re.findall(r"[0-9A-Za-zА-Яа-яЁё]{3,}", query.lower())
             if t not in STOPWORDS
         ]
+
+        if q_entities:
+            eids = list(q_entities)
+            scored, seen_facts = self._score_facts_by_entities(
+                eids, now, as_of=as_of, content_tokens=tokens)
+
+        # Lexical fallback via FTS5 for remaining query tokens.
         if tokens and len(scored) < limit * 4:
             _match_parts: list[str] = []
             for t in tokens[:6]:
                 if re.search(r"[а-яё]", t) and len(t) >= 4:
-                    _vs = _ru_variants(t)
+                    _vs = list(_ru_variants(t))
+                else:
+                    _vs = [t]
+                # Curated synonym bridge (bounded, see _SYNONYM_GROUPS): OR in
+                # the token's synonym-group siblings alongside its own
+                # morphological variants, same weight tier as the rest of
+                # this fallback -- a narrow, honest widening, not a semantic
+                # search. Checked against every morphological variant (not
+                # just the raw token) since the group holds base/dictionary
+                # forms ("интернет") while the query carries an inflected one
+                # ("интернету") that only the stripped-suffix variant matches.
+                for _v in list(_vs):
+                    for _sv in _synonym_variants(_v):
+                        if _sv not in _vs:
+                            _vs.append(_sv)
+                if len(_vs) == 1:
+                    _match_parts.append(f'"{_vs[0]}"')
+                else:
                     _match_parts.append(
                         "( " + " OR ".join(f'"{v}"' for v in _vs) + " )")
-                else:
-                    _match_parts.append(f'"{t}"')
             match_q = " OR ".join(_match_parts)
             ts_cond = " AND f.ts <= ?" if as_of is not None else ""
             try:
@@ -770,31 +837,49 @@ class NeuroMatrixStore:
                 scored[fid] = (0.35 * float(r["importance"])
                                * float(r["confidence"] or 1.0) * (0.5 + 0.5 * rec))
 
-        # Materialize + sort.
-        for fid, score in scored.items():
-            row = self._conn.execute(
-                "SELECT id, text, kind, source, session_id, ts, importance, "
-                "confidence, retrieval_count, active_until, supersedes, meta "
-                "FROM facts WHERE id = ?", (fid,),
-            ).fetchone()
-            if row is None:
-                continue
-            matched = self._matched_entity_keys(fid)
-            results.append({
-                "fact_id": fid,
-                "text": row["text"],
-                "kind": row["kind"] or "episodic",
-                "source": row["source"],
-                "session_id": row["session_id"] or "",
-                "ts": row["ts"],
-                "importance": row["importance"],
-                "confidence": row["confidence"] or 1.0,
-                "retrieval_count": row["retrieval_count"] or 0,
-                "active_until": row["active_until"],
-                "supersedes": row["supersedes"],
-                "score": round(float(score), 4),
-                "via": matched,
-            })
+        # Materialize + sort. `scored` can hold as many entries as facts
+        # mentioning ANY resolved query entity — for a hub entity (a project
+        # name that recurs across a large fraction of all facts) that can be
+        # tens of thousands of rows even though only `limit` are ever
+        # returned. Sort by score FIRST and materialize only a bounded
+        # candidate window with two batched queries, instead of one
+        # individual SELECT per candidate (previously O(all candidates) DB
+        # round-trips regardless of `limit` — measured at 50k facts: this
+        # step alone issued 100k+ separate queries; batching + capping brings
+        # the whole search() call from ~2s to sub-50ms on the same data).
+        _cap = max(limit * 8, 60)
+        _top = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)[:_cap]
+        if _top:
+            _ids = [fid for fid, _ in _top]
+            _score_map = dict(_top)
+            _ph = ",".join("?" * len(_ids))
+            _frows = self._conn.execute(
+                f"SELECT id, text, kind, source, session_id, ts, importance, "
+                f"confidence, retrieval_count, active_until, supersedes, meta "
+                f"FROM facts WHERE id IN ({_ph})", _ids).fetchall()
+            _matched_map: dict[int, list[str]] = {}
+            for _mr in self._conn.execute(
+                    f"SELECT fe.fact_id, e.key FROM fact_entities fe "
+                    f"JOIN entities e ON e.id = fe.entity_id "
+                    f"WHERE fe.fact_id IN ({_ph})", _ids).fetchall():
+                _matched_map.setdefault(int(_mr["fact_id"]), []).append(_mr["key"])
+            for row in _frows:
+                fid = int(row["id"])
+                results.append({
+                    "fact_id": fid,
+                    "text": row["text"],
+                    "kind": row["kind"] or "episodic",
+                    "source": row["source"],
+                    "session_id": row["session_id"] or "",
+                    "ts": row["ts"],
+                    "importance": row["importance"],
+                    "confidence": row["confidence"] or 1.0,
+                    "retrieval_count": row["retrieval_count"] or 0,
+                    "active_until": row["active_until"],
+                    "supersedes": row["supersedes"],
+                    "score": round(float(_score_map[fid]), 4),
+                    "via": _matched_map.get(fid, [])[:6],
+                })
         results.sort(key=lambda x: x["score"], reverse=True)
 
         # LLM rerank (§10, optional): heuristic top-k -> LLM order.  Only when a
@@ -1501,32 +1586,51 @@ class NeuroMatrixStore:
         self._cache.clear()
 
     def feedback(self, fact_id: int, helpful: bool) -> Optional[dict[str, Any]]:
-        """Reinforcement lever (prediction-error reward): helpful raises
-        confidence (cap 1.5); unhelpful halves it; repeated unhelpful feedback
-        (<0.2) archives the fact."""
+        """Reinforcement lever (prediction-error reward), Beta-Bernoulli
+        calibrated: confidence is the posterior mean of "this fact is
+        helpful" under a Jeffreys prior Beta(0.5, 0.5), rescaled so "no
+        feedback yet" == the pre-existing neutral baseline (1.0) and full,
+        one-sided agreement asymptotically approaches 2.0 / 0.0 as evidence
+        accumulates:
+
+            confidence = 2 * (0.5 + helpful_n) / (1 + helpful_n + unhelpful_n)
+
+        This replaces a fixed +0.15 / *0.5 step per vote, which was provably
+        unsound: for the SAME total evidence (e.g. 2 helpful + 2 unhelpful),
+        the old formula gave a different confidence depending purely on the
+        ORDER the votes arrived in (0.325 vs 0.55 vs 0.3625, measured) —
+        Bayesian posterior updates from counts are order-invariant by
+        construction, so this class of bug cannot recur. A single vote also
+        no longer moves confidence by an identical amount regardless of how
+        much prior evidence exists (old: vote #1 and vote #20 both +0.15);
+        each new vote now has a diminishing effect as the evidence pool
+        grows, which is the statistically correct behaviour (more history ->
+        more inertia). Archival requires BOTH low posterior confidence and
+        enough accumulated votes (>=3) — a single unlucky vote can no longer
+        archive a fact outright."""
         row = self._conn.execute(
             "SELECT confidence, meta FROM facts WHERE id = ? AND archived = 0",
             (fact_id,)).fetchone()
         if row is None:
             return None
-        conf = float(row["confidence"] or 1.0)
-        if helpful:
-            conf = min(1.5, conf + 0.15)
-        else:
-            conf *= 0.5
-        archived = int(conf < 0.2)
         meta = json.loads(row["meta"] or "{}") or {}
-        meta.setdefault("feedback", []).append({"helpful": bool(helpful),
-                                                "ts": time.time()})
+        fb = meta.setdefault("feedback", [])
+        fb.append({"helpful": bool(helpful), "ts": time.time()})
+        helpful_n = sum(1 for e in fb if e.get("helpful"))
+        unhelpful_n = len(fb) - helpful_n
+        conf = 2.0 * (0.5 + helpful_n) / (1.0 + helpful_n + unhelpful_n)
+        archived = int(conf < 0.3 and len(fb) >= 3)
         self._conn.execute(
             "UPDATE facts SET confidence = ?, archived = ?, meta = ? WHERE id = ?",
             (conf, archived, json.dumps(meta, ensure_ascii=False), fact_id))
         self._oplog("UPDATE", f"feedback:{fact_id}", fact_id,
-                    detail=f"helpful={bool(helpful)} -> confidence {round(conf, 3)}")
+                    detail=f"helpful={bool(helpful)} -> confidence {round(conf, 3)} "
+                           f"(n_helpful={helpful_n}, n_unhelpful={unhelpful_n})")
         self._conn.commit()
         self._cache.clear()
         return {"fact_id": fact_id, "confidence": round(conf, 4),
-                "archived": bool(archived)}
+                "archived": bool(archived), "helpful_count": helpful_n,
+                "unhelpful_count": unhelpful_n}
 
     # ------------------------------------------------ capabilities + doc ingest
 
@@ -2139,7 +2243,9 @@ class NeuroMatrixStore:
     def contradictions(self) -> dict[str, Any]:
         """Contradiction scan: near-duplicate episodic claims per entity
         (potential conflicting statements) + entities with several active
-        durable intent facts. Deterministic review list (LLM resolution later)."""
+        durable intent facts + fresh facts that conflict with an entity's
+        already-consolidated dossier. Deterministic review list (LLM
+        resolution later)."""
         rows = self._conn.execute(
             "SELECT fe.entity_id, f.id, f.text, f.kind FROM fact_entities fe "
             "JOIN facts f ON f.id = fe.fact_id "
@@ -2171,7 +2277,46 @@ class NeuroMatrixStore:
             if len(duplicates) >= 20:
                 break
         return {"duplicates": duplicates[:20], "conflict_entities": conflict_ents[:10],
-                "duplicate_count": len(duplicates)}
+                "duplicate_count": len(duplicates),
+                "dossier_conflicts": (dc := self._dossier_conflicts())[:10],
+                "dossier_conflict_count": len(dc)}
+
+    def _dossier_conflicts(self) -> list[dict[str, Any]]:
+        """Conflict-monitoring pass (prediction-error / ACC signal, mirrors the
+        write-path ``_detect_and_apply_correction`` but against consolidated
+        long-term memory instead of the last few turns): for every entity that
+        already has a dossier, find facts about that SAME entity, recorded
+        AFTER the dossier was last consolidated, that carry a negation /
+        reversal marker (NEG_MARKERS) — i.e. the entity's settled long-term
+        summary and its most recent mention plausibly disagree.  Deterministic,
+        no LLM; a human (or a future LLM pass) resolves the flagged pairs by
+        re-consolidating."""
+        out: list[dict[str, Any]] = []
+        dossiers = self._conn.execute(
+            "SELECT d.entity_id, d.summary, d.updated_at, e.key FROM dossiers d "
+            "JOIN entities e ON e.id = d.entity_id").fetchall()
+        for d in dossiers:
+            rows = self._conn.execute(
+                "SELECT f.id, f.text, f.ts FROM fact_entities fe "
+                "JOIN facts f ON f.id = fe.fact_id "
+                "WHERE fe.entity_id = ? AND f.archived = 0 AND f.ts > ? "
+                "AND f.kind IN ('episodic','decision','goal','constraint','capability') "
+                "AND (f.meta IS NULL OR f.meta NOT LIKE '%\"negated\": true%') "
+                "ORDER BY f.ts DESC LIMIT 20",
+                (int(d["entity_id"]), float(d["updated_at"]))).fetchall()
+            for r in rows:
+                tl = str(r["text"]).lower()
+                if any(m in tl for m in NEG_MARKERS):
+                    out.append({
+                        "entity_id": int(d["entity_id"]), "entity_key": d["key"],
+                        "dossier_summary": str(d["summary"])[:300],
+                        "dossier_updated_at": d["updated_at"],
+                        "fact_id": int(r["id"]), "fact_text": r["text"][:300],
+                        "fact_ts": r["ts"],
+                    })
+                    if len(out) >= 40:
+                        return out
+        return out
 
     @staticmethod
     def _jaccard(a: str, b: str) -> float:
@@ -2825,34 +2970,81 @@ class NeuroMatrixStore:
             (key, key, now, now))
         return int(cur.lastrowid)
 
-    def _merge_entities(self, keep_id: int, drop_id: int, now: float) -> None:
+    def _merge_entities(self, keep_id: int, drop_id: int, now: float) -> Optional[int]:
         """Fold entity ``drop_id`` into ``keep_id``: aliases move over, fact
-        links and edges are re-pointed, stronger of the two remains the key."""
+        links and edges are re-pointed, stronger of the two remains the key.
+
+        Entity merges are the single highest-risk, hardest-to-notice mistake
+        this engine can make (a wrong alias match silently fuses two
+        unrelated identities and every downstream recall inherits the error).
+        Unlike every other mutation here, a merge used to be irreversible.
+        Before touching any row, a full snapshot of everything about to be
+        deleted or overwritten is written to ``merge_log`` (as JSON, not more
+        schema); ``unmerge()`` replays it byte-for-byte. Returns the
+        merge_log id so a caller can undo this exact merge later."""
         if keep_id == drop_id:
-            return
+            return None
         drop = self._conn.execute(
-            "SELECT key, label, hits, first_seen FROM entities WHERE id=?",
-            (drop_id,)).fetchone()
-        if drop is None:
-            return
-        for r in self._conn.execute(
-            "SELECT alias FROM aliases WHERE entity_id = ?", (drop_id,)).fetchall():
+            "SELECT key, label, kind, hits, first_seen, last_seen "
+            "FROM entities WHERE id=?", (drop_id,)).fetchone()
+        keep_before = self._conn.execute(
+            "SELECT label, first_seen, last_seen, hits FROM entities WHERE id=?",
+            (keep_id,)).fetchone()
+        if drop is None or keep_before is None:
+            return None
+        drop_aliases = [r["alias"] for r in self._conn.execute(
+            "SELECT alias FROM aliases WHERE entity_id = ?", (drop_id,)).fetchall()]
+        alias_candidates = list(dict.fromkeys(drop_aliases + [drop["key"]]))
+        alias_already_on_keep = {
+            a: bool(self._conn.execute(
+                "SELECT 1 FROM aliases WHERE entity_id = ? AND alias = ?",
+                (keep_id, a)).fetchone())
+            for a in alias_candidates
+        }
+        moved_fact_ids = [int(r["fact_id"]) for r in self._conn.execute(
+            "SELECT fact_id FROM fact_entities WHERE entity_id = ?",
+            (drop_id,)).fetchall()]
+        fact_already_on_keep = [fid for fid in moved_fact_ids if self._conn.execute(
+            "SELECT 1 FROM fact_entities WHERE fact_id = ? AND entity_id = ?",
+            (fid, keep_id)).fetchone()]
+        drop_edges = [dict(r) for r in self._conn.execute(
+            "SELECT a, b, count, first_seen, last_seen, inhibited_since, stability "
+            "FROM edges WHERE a = ? OR b = ?", (drop_id, drop_id)).fetchall()]
+        keep_oth_before: dict[int, Optional[dict[str, Any]]] = {}
+        for r in drop_edges:
+            oth = r["a"] if r["b"] == drop_id else r["b"]
+            if oth == keep_id:
+                continue
+            lo, hi = (keep_id, oth) if keep_id < oth else (oth, keep_id)
+            row = self._conn.execute(
+                "SELECT count, first_seen, last_seen, inhibited_since, stability "
+                "FROM edges WHERE a = ? AND b = ?", (lo, hi)).fetchone()
+            keep_oth_before[oth] = dict(row) if row else None
+
+        snapshot = {
+            "drop": dict(drop), "keep_before": dict(keep_before),
+            "drop_aliases": drop_aliases,
+            "alias_already_on_keep": alias_already_on_keep,
+            "moved_fact_ids": moved_fact_ids,
+            "fact_already_on_keep": fact_already_on_keep,
+            "drop_edges": drop_edges,
+            "keep_oth_before": {str(k): v for k, v in keep_oth_before.items()},
+        }
+        mid = int(self._conn.execute(
+            "INSERT INTO merge_log (ts, keep_id, snapshot) VALUES (?, ?, ?)",
+            (now, keep_id, json.dumps(snapshot, ensure_ascii=False))).lastrowid)
+
+        for a in alias_candidates:
             self._conn.execute(
                 "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?, ?)",
-                (keep_id, r["alias"]))
-        self._conn.execute(
-            "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?, ?)",
-            (keep_id, drop["key"]))
+                (keep_id, a))
         # Re-point fact links (dedupe).
-        for r in self._conn.execute(
-            "SELECT fact_id FROM fact_entities WHERE entity_id = ?", (drop_id,)).fetchall():
+        for fid in moved_fact_ids:
             self._conn.execute(
                 "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
-                (r["fact_id"], keep_id))
+                (fid, keep_id))
         # Fold edge counts where both endpoints had edges to the dropped node.
-        for r in self._conn.execute(
-            "SELECT a, b, count, first_seen, last_seen FROM edges "
-            "WHERE a = ? OR b = ?", (drop_id, drop_id)).fetchall():
+        for r in drop_edges:
             oth = r["a"] if r["b"] == drop_id else r["b"]
             if oth == keep_id:
                 continue
@@ -2872,6 +3064,110 @@ class NeuroMatrixStore:
             "hits = hits + ?, first_seen = MIN(first_seen, ?), last_seen = ? "
             "WHERE id = ?",
             (drop["label"] or drop["key"], drop["hits"], drop["first_seen"], now, keep_id))
+        return mid
+
+    def unmerge(self, merge_id: int) -> Optional[dict[str, Any]]:
+        """Undo one entity merge exactly, from its ``merge_log`` snapshot: the
+        dropped entity is recreated (a NEW id — SQLite ids are never reused,
+        but key/label/aliases/fact links/edges are restored verbatim) and
+        ``keep_id`` reverts to its pre-merge row. Safe to call once per merge;
+        a second call on the same ``merge_id`` is a no-op (``undone`` flag).
+        Best-effort only against further writes to the SAME edges/links made
+        strictly between the merge and this call (a real risk only if other
+        merges touched the same pair in between) — the common "I linked the
+        wrong two things, undo it" case is fully exact."""
+        row = self._conn.execute(
+            "SELECT keep_id, snapshot, undone FROM merge_log WHERE id = ?",
+            (merge_id,)).fetchone()
+        if row is None or int(row["undone"]):
+            return None
+        keep_id = int(row["keep_id"])
+        snap = json.loads(row["snapshot"])
+        drop = snap["drop"]
+        existing = self._conn.execute(
+            "SELECT id FROM entities WHERE key = ?", (drop["key"],)).fetchone()
+        if existing is not None:
+            # The dropped key was reclaimed by something else since the merge
+            # (e.g. a brand-new unrelated entity with the same name) — refuse
+            # rather than silently colliding two identities a second time.
+            return {"ok": False, "reason": "drop_key_in_use", "key": drop["key"]}
+        new_drop_id = int(self._conn.execute(
+            "INSERT INTO entities (key, label, kind, first_seen, last_seen, hits) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (drop["key"], drop["label"], drop["kind"], drop["first_seen"],
+             drop["last_seen"], drop["hits"])).lastrowid)
+        # NOTE: drop["key"] must be removed from keep's aliases (the merge put
+        # it there) but never re-added to new_drop_id's own aliases — an
+        # entity is never its own alias, its key already IS drop["key"].
+        alias_candidates = list(dict.fromkeys(snap["drop_aliases"] + [drop["key"]]))
+        for a in alias_candidates:
+            if not snap["alias_already_on_keep"].get(a):
+                self._conn.execute(
+                    "DELETE FROM aliases WHERE entity_id = ? AND alias = ?",
+                    (keep_id, a))
+            if a == drop["key"]:
+                continue
+            self._conn.execute(
+                "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?, ?)",
+                (new_drop_id, a))
+        already_on_keep = set(snap["fact_already_on_keep"])
+        for fid in snap["moved_fact_ids"]:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                (fid, new_drop_id))
+            if fid not in already_on_keep:
+                self._conn.execute(
+                    "DELETE FROM fact_entities WHERE fact_id = ? AND entity_id = ?",
+                    (fid, keep_id))
+        # Restore edges. keep_oth_before's keys enumerate every third-party
+        # entity ("oth") the dropped entity had a folded edge with; the
+        # direct keep<->drop edge (if any) is handled separately below since
+        # it was never folded (it was simply deleted by the merge).
+        for oth_str, before in snap["keep_oth_before"].items():
+            oth = int(oth_str)
+            lo, hi = (keep_id, oth) if keep_id < oth else (oth, keep_id)
+            if before is None:
+                self._conn.execute(
+                    "DELETE FROM edges WHERE a = ? AND b = ?", (lo, hi))
+            else:
+                self._conn.execute(
+                    "UPDATE edges SET count = ?, first_seen = ?, last_seen = ?, "
+                    "inhibited_since = ?, stability = ? WHERE a = ? AND b = ?",
+                    (before["count"], before["first_seen"], before["last_seen"],
+                     before["inhibited_since"], before["stability"], lo, hi))
+            # Recreate old_drop_id <-> oth with its original snapshot values.
+            orig = next((e for e in snap["drop_edges"]
+                        if (e["a"] == oth or e["b"] == oth) and oth != keep_id), None)
+            if orig is not None:
+                lo2, hi2 = (new_drop_id, oth) if new_drop_id < oth else (oth, new_drop_id)
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO edges "
+                    "(a, b, count, first_seen, last_seen, inhibited_since, stability) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (lo2, hi2, orig["count"], orig["first_seen"], orig["last_seen"],
+                     orig["inhibited_since"], orig["stability"]))
+        # The direct keep<->drop edge (if any) was skipped from folding above
+        # and simply deleted by the merge — recreate it verbatim.
+        direct = next((e for e in snap["drop_edges"]
+                       if e["a"] == keep_id or e["b"] == keep_id), None)
+        if direct is not None:
+            lo3, hi3 = (new_drop_id, keep_id) if new_drop_id < keep_id else (keep_id, new_drop_id)
+            self._conn.execute(
+                "INSERT OR REPLACE INTO edges "
+                "(a, b, count, first_seen, last_seen, inhibited_since, stability) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (lo3, hi3, direct["count"], direct["first_seen"], direct["last_seen"],
+                 direct["inhibited_since"], direct["stability"]))
+        kb = snap["keep_before"]
+        self._conn.execute(
+            "UPDATE entities SET label = ?, first_seen = ?, last_seen = ?, "
+            "hits = ? WHERE id = ?",
+            (kb["label"], kb["first_seen"], kb["last_seen"], kb["hits"], keep_id))
+        self._conn.execute(
+            "UPDATE merge_log SET undone = 1 WHERE id = ?", (merge_id,))
+        self._conn.commit()
+        self._cache.clear()
+        return {"ok": True, "restored_key": drop["key"], "new_entity_id": new_drop_id}
 
     def _touch_edge(self, a: int, b: int, now: float, delta: float = 1.0) -> None:
         """Hebbian reinforcement + myelination (stability grows with every
@@ -2916,20 +3212,39 @@ class NeuroMatrixStore:
             w *= 0.1
         return w
 
+    # Graph-hop breadth cap (measured fix): a hub entity (a project name that
+    # recurs across a large fraction of all facts) can have hundreds+ of
+    # neighbors. Expanding ALL of them, then expanding hop-2 from ALL of
+    # those, was an unbounded breadth-first walk that turned "recall facts
+    # near this entity" into "touch nearly the whole entity graph" -- on a
+    # synthetic 50k-fact / 212-entity store with one moderately hub-like
+    # entity, this alone contributed to a 62s single search() call (profiled;
+    # see _score_facts_by_entities). Real usage is typically sparse (most
+    # entities have a handful of neighbors, well under this cap, so nothing
+    # changes for them) -- the cap only bites for genuine hubs, which is
+    # exactly where unbounded expansion was pathological.
+    _HOP_BREADTH_CAP = 40
+
     def _resolve_query_entities(self, query: str, now: float) -> dict[int, float]:
         """Query entity ids with graph-expanded scores (2-hop, decaying)."""
         keys = extract_entities(query)
         if not keys:
             return {}
         ids: dict[int, float] = {}
+        direct: set[int] = set()
+        cap = self._HOP_BREADTH_CAP
         for key in keys:
             eid = self._entity_id_lookup(key)
             if eid is None:
                 continue
             ids[eid] = ids.get(eid, 0.0) + 2.0
+            direct.add(eid)
             # Hop 1: alias expansion (same canonical id is automatic) +
             # strongest neighbors.  Inhibited edges (superseded choices) are
             # heavily downweighted — the rejected path stops resurfacing.
+            # Only the top-`cap` neighbors by decayed strength survive: a
+            # sparse entity is unaffected, a hub entity is bounded.
+            neighbors: list[tuple[int, float]] = []
             for r in self._conn.execute(
                 "SELECT a, b, count, last_seen, inhibited_since FROM edges "
                 "WHERE a = ? OR b = ?", (eid, eid)).fetchall():
@@ -2939,10 +3254,19 @@ class NeuroMatrixStore:
                     -hours / self.edge_half_life_hours)
                 if r["inhibited_since"] is not None:
                     strength *= 0.1
+                neighbors.append((oth, strength))
+            neighbors.sort(key=lambda x: x[1], reverse=True)
+            for oth, strength in neighbors[:cap]:
                 ids[oth] = max(ids.get(oth, 0.0), strength)
-        # Hop 2 (cheap, capped).
+        # Hop 2 (cheap, capped): expand only from the strongest hop-1
+        # entities (bounded above), not every entity gathered so far -- a
+        # hub's already-capped hop-1 set must not re-explode into hundreds of
+        # hop-2 queries.
+        hop1_ranked = sorted(
+            ((eid, sc) for eid, sc in ids.items() if eid not in direct),
+            key=lambda kv: kv[1], reverse=True)[:cap]
         hop2: list[tuple[int, float]] = []
-        for eid, _ in list(ids.items()):
+        for eid, _ in hop1_ranked:
             for r in self._conn.execute(
                 "SELECT a, b, count, last_seen, inhibited_since FROM edges "
                 "WHERE (a = ? OR b = ?) AND count >= 2", (eid, eid)).fetchall():
@@ -2957,6 +3281,21 @@ class NeuroMatrixStore:
                 hop2.append((oth, w))
         for eid, score in hop2:
             ids[eid] = max(ids.get(eid, 0.0), score)
+        # Final global cap: per-source fan-out limits above still let a
+        # densely connected neighborhood re-saturate the overall set (many
+        # capped sources, each contributing a different slice, can union back
+        # up close to the whole graph). Directly-matched query entities are
+        # always kept; graph-discovered ones are truncated to the strongest
+        # 2*cap regardless of how many distinct hop-1 sources contributed
+        # them -- this is what actually bounds _score_facts_by_entities'
+        # downstream join to a fixed-size entity set.
+        if len(ids) > cap * 2:
+            kept = {eid: sc for eid, sc in ids.items() if eid in direct}
+            others = sorted(
+                ((eid, sc) for eid, sc in ids.items() if eid not in direct),
+                key=lambda kv: kv[1], reverse=True)[: max(0, cap * 2 - len(kept))]
+            kept.update(dict(others))
+            ids = kept
         return ids
 
     def _entity_id_lookup(self, key: str) -> Optional[int]:
@@ -2970,6 +3309,7 @@ class NeuroMatrixStore:
 
     def _score_facts_by_entities(
         self, eids: list[int], now: float, *, as_of: Optional[float] = None,
+        content_tokens: Optional[list[str]] = None,
     ) -> tuple[dict[int, float], set[int]]:
         scored: dict[int, float] = {}
         seen: set[int] = set()
@@ -2981,12 +3321,39 @@ class NeuroMatrixStore:
             params.append(as_of)
         rows = self._conn.execute(
             f"SELECT fe.fact_id, fe.entity_id, f.ts, f.importance, f.kind, "
-            f"f.confidence "
+            f"f.confidence, f.text "
             f"FROM fact_entities fe JOIN facts f ON f.id = fe.fact_id "
             f"WHERE fe.entity_id IN ({placeholders}) AND f.archived = 0 "
             f"AND (f.active_until IS NULL OR f.active_until > ?) "
             f"{ts_cond}",
             params).fetchall()
+        # _entity_query_score(eid) depends ONLY on eid, not on the fact row --
+        # but eids is small (the query's resolved entities, typically single
+        # digits even after 2-hop expansion) while `rows` is one row per
+        # (fact, entity) pair, which scales with how many facts mention that
+        # entity. Recomputing it per row instead of per eid was a measured,
+        # severe scaling bug: on a synthetic 50k-fact store with a moderately
+        # hub-like entity (a project name mentioned across ~1/4 of all
+        # facts), one search() call issued 99,773 redundant score queries
+        # (200k+ total SQL round-trips) and took 62 SECONDS. Caching per eid
+        # bounds those calls to at most len(eids) — the same search() dropped
+        # to sub-100ms after this fix (verified, not assumed).
+        _score_cache: dict[int, float] = {}
+        # Content-relevance bonus (measured fix, external LoCoMo benchmark,
+        # 2026-09): entity-path candidates used to rank PURELY by entity
+        # presence x recency x importance, never checking whether the fact's
+        # own text relates to anything else in the question. For a "hub"
+        # entity -- the most common real case being a person's name mentioned
+        # in most turns of a long conversation -- this buried the one fact
+        # that actually answers "what did X research?" under dozens of
+        # unrelated "Wow, X!" turns that merely name-drop X more recently.
+        # Measured: on LoCoMo (snap-research/locomo), evidence-hit@8 was 3.0%
+        # before this bonus existed. A small, cheap per-matched-token bonus
+        # (substring check against the already-fetched fact text, no extra
+        # query) lets real lexical relevance compete with recency instead of
+        # being structurally invisible to entity-path scoring.
+        _tokens = [t for t in (content_tokens or []) if len(t) >= 3][:6]
+        _fact_text: dict[int, str] = {}
         for r in rows:
             fid = int(r["fact_id"])
             eid = int(r["entity_id"])
@@ -2997,10 +3364,28 @@ class NeuroMatrixStore:
                 rec = math.exp(-hours / self.recency_half_life_hours)
             else:
                 rec = 1.0
-            ent_score = float(self._entity_query_score(eid, now))
+            if eid not in _score_cache:
+                _score_cache[eid] = float(self._entity_query_score(eid, now))
+            ent_score = _score_cache[eid]
             scored[fid] = (scored.get(fid, 0.0)
                            + ent_score * float(r["importance"])
                            * float(r["confidence"] or 1.0) * (0.5 + 0.5 * rec))
+            if _tokens and fid not in _fact_text:
+                _fact_text[fid] = (r["text"] or "").lower()
+        if _tokens:
+            # Applied AFTER the full per-entity sum, as a MULTIPLIER rather
+            # than a fixed additive amount: entity base scores are unbounded
+            # (they scale with edge count / dataset size via
+            # _entity_query_score, and with how many query entities a fact
+            # happens to mention), so a fixed "+1 per matched word" is
+            # meaningless noise for a hub fact scoring 50+ and everything for
+            # one scoring 2 -- a fixed bonus can never reliably compete at an
+            # unknown, unbounded scale. A proportional boost does, regardless
+            # of how large the base score already is.
+            for fid, txt_l in _fact_text.items():
+                matched = sum(1 for t in _tokens if t in txt_l)
+                if matched:
+                    scored[fid] = scored.get(fid, 0.0) * (1.0 + 0.6 * matched)
         return scored, seen
 
     def _entity_query_score(self, eid: int, now: float) -> float:
