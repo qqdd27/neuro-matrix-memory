@@ -1501,32 +1501,51 @@ class NeuroMatrixStore:
         self._cache.clear()
 
     def feedback(self, fact_id: int, helpful: bool) -> Optional[dict[str, Any]]:
-        """Reinforcement lever (prediction-error reward): helpful raises
-        confidence (cap 1.5); unhelpful halves it; repeated unhelpful feedback
-        (<0.2) archives the fact."""
+        """Reinforcement lever (prediction-error reward), Beta-Bernoulli
+        calibrated: confidence is the posterior mean of "this fact is
+        helpful" under a Jeffreys prior Beta(0.5, 0.5), rescaled so "no
+        feedback yet" == the pre-existing neutral baseline (1.0) and full,
+        one-sided agreement asymptotically approaches 2.0 / 0.0 as evidence
+        accumulates:
+
+            confidence = 2 * (0.5 + helpful_n) / (1 + helpful_n + unhelpful_n)
+
+        This replaces a fixed +0.15 / *0.5 step per vote, which was provably
+        unsound: for the SAME total evidence (e.g. 2 helpful + 2 unhelpful),
+        the old formula gave a different confidence depending purely on the
+        ORDER the votes arrived in (0.325 vs 0.55 vs 0.3625, measured) —
+        Bayesian posterior updates from counts are order-invariant by
+        construction, so this class of bug cannot recur. A single vote also
+        no longer moves confidence by an identical amount regardless of how
+        much prior evidence exists (old: vote #1 and vote #20 both +0.15);
+        each new vote now has a diminishing effect as the evidence pool
+        grows, which is the statistically correct behaviour (more history ->
+        more inertia). Archival requires BOTH low posterior confidence and
+        enough accumulated votes (>=3) — a single unlucky vote can no longer
+        archive a fact outright."""
         row = self._conn.execute(
             "SELECT confidence, meta FROM facts WHERE id = ? AND archived = 0",
             (fact_id,)).fetchone()
         if row is None:
             return None
-        conf = float(row["confidence"] or 1.0)
-        if helpful:
-            conf = min(1.5, conf + 0.15)
-        else:
-            conf *= 0.5
-        archived = int(conf < 0.2)
         meta = json.loads(row["meta"] or "{}") or {}
-        meta.setdefault("feedback", []).append({"helpful": bool(helpful),
-                                                "ts": time.time()})
+        fb = meta.setdefault("feedback", [])
+        fb.append({"helpful": bool(helpful), "ts": time.time()})
+        helpful_n = sum(1 for e in fb if e.get("helpful"))
+        unhelpful_n = len(fb) - helpful_n
+        conf = 2.0 * (0.5 + helpful_n) / (1.0 + helpful_n + unhelpful_n)
+        archived = int(conf < 0.3 and len(fb) >= 3)
         self._conn.execute(
             "UPDATE facts SET confidence = ?, archived = ?, meta = ? WHERE id = ?",
             (conf, archived, json.dumps(meta, ensure_ascii=False), fact_id))
         self._oplog("UPDATE", f"feedback:{fact_id}", fact_id,
-                    detail=f"helpful={bool(helpful)} -> confidence {round(conf, 3)}")
+                    detail=f"helpful={bool(helpful)} -> confidence {round(conf, 3)} "
+                           f"(n_helpful={helpful_n}, n_unhelpful={unhelpful_n})")
         self._conn.commit()
         self._cache.clear()
         return {"fact_id": fact_id, "confidence": round(conf, 4),
-                "archived": bool(archived)}
+                "archived": bool(archived), "helpful_count": helpful_n,
+                "unhelpful_count": unhelpful_n}
 
     # ------------------------------------------------ capabilities + doc ingest
 

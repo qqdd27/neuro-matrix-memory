@@ -38,6 +38,49 @@ def test_extract_alias_pairs_ru():
     assert ("ton", "id_777") in pairs, pairs
 
 
+def test_extract_entities_ru_titlecase_no_anchor():
+    """Real recall bug (reproduced 2026-09-11): a Russian proper noun with NO
+    anchor (no id_/0x/ALL-CAPS) was invisible to the engine, so any fact about
+    it was silently dropped by the write-path importance gate.  Fix: mid-
+    sentence Cyrillic capitalization is a real signal (position-gated) even
+    though EVERY Russian sentence starts capitalized regardless of content."""
+    keys = extract_entities("Мы используем Постгрес для хранения данных.")
+    assert "постгрес" in keys, keys
+    # Sentence-initial capitalization must stay ambiguous -> never an entity.
+    keys2 = extract_entities("Также нужно проверить сервер.")
+    assert "также" not in keys2, keys2
+    # Multi-sentence: the 2nd sentence's own first word is still skipped,
+    # but a proper noun later in that same sentence is kept.
+    keys3 = extract_entities(
+        "Использовали Redis. Потом перешли на Постгрес, потому что нужна "
+        "была надёжность.")
+    assert "redis" in keys3 and "постгрес" in keys3, keys3
+    assert "потом" not in keys3, keys3
+
+
+def test_cross_session_recall_ru_named_entity_no_anchor():
+    """End-to-end proof the fix actually restores memory: a Russian named
+    tool with zero anchors, mentioned in one session, must still be
+    recallable by name from a later session - the exact failure mode the
+    entity-extraction gap caused before this fix."""
+    path = os.path.join(tempfile.mkdtemp(), "m_ru_ent.db")
+    store = _fresh(path)
+    store.add_turn(
+        "Мы используем Постгрес для хранения профилей пользователей.",
+        "Понял, Постгрес хранит профили пользователей.",
+        session_id="s1",
+    )
+    store.add_turn(
+        "Расскажи, что у нас с Постгрес?",
+        "Постгрес по-прежнему хранит профили, всё стабильно.",
+        session_id="s2",
+    )
+    res = store.search("Постгрес", limit=10)
+    assert res, "Russian named entity without an anchor was not recalled"
+    assert any("профил" in r["text"].lower() for r in res), res
+    store.close()
+
+
 def test_cross_session_id_linking():
     """Dialog 1 (Russian) declares TON == id_777. Dialog 2 asks ONLY id_777
     and must still recall the TON facts."""
@@ -347,19 +390,65 @@ def test_decide_tools_provider():
 
 
 def test_feedback_reinforcement_and_archival():
+    """Beta-Bernoulli confidence (Jeffreys prior 0.5/0.5, rescaled x2 so the
+    no-feedback baseline stays 1.0): each vote's effect on confidence is
+    exact and reproducible from the helpful/unhelpful counts alone."""
     path = os.path.join(tempfile.mkdtemp(), "m14.db")
     store = _fresh(path)
     fid = store.remember("id_777 используется для выплат.", source="turn:assistant")
     assert fid is not None
     assert abs(store.search("id_777")[0]["confidence"] - 1.0) < 1e-9
     r = store.feedback(fid, helpful=True)
-    assert abs(r["confidence"] - 1.15) < 1e-6
+    # n_helpful=1, n_unhelpful=0 -> 2*(0.5+1)/(1+1) = 1.5
+    assert abs(r["confidence"] - 1.5) < 1e-6, r
     for _ in range(3):
-        r = store.feedback(fid, helpful=False)  # 1.15 -> .575 -> .2875 -> .143(archived)
-    assert r["archived"] is True, r
-    res = store.search("id_777", limit=10)
-    assert not any(x["fact_id"] == fid for x in res), res  # archived excluded
+        # 1 helpful + up to 3 unhelpful accumulate; archival needs >=3 votes
+        # AND confidence < 0.3 (sustained evidence, not one bad vote).
+        r = store.feedback(fid, helpful=False)
+    # n_helpful=1, n_unhelpful=3 -> 2*(0.5+1)/(1+4) = 0.6 -> not archived:
+    # a single lucky/unlucky vote can no longer flip the outcome by itself,
+    # and one genuine earlier confirmation keeps giving the fact the benefit
+    # of the doubt against a few contradicting votes (correct: a Bayesian
+    # posterior does not forget real evidence just because more came later).
+    assert abs(r["confidence"] - 0.6) < 1e-6, r
+    assert r["archived"] is False, r
+    # A fact with NO redeeming helpful votes at all DOES get archived once
+    # enough sustained negative evidence accumulates (n=3, all unhelpful).
+    fid2 = store.remember("id_778 используется для выплат.", source="turn:assistant")
+    r2 = None
+    for _ in range(3):
+        r2 = store.feedback(fid2, helpful=False)
+    # n_helpful=0, n_unhelpful=3 -> 2*0.5/4 = 0.25 < 0.3 -> archived.
+    assert abs(r2["confidence"] - 0.25) < 1e-6, r2
+    assert r2["archived"] is True, r2
+    res = store.search("id_778", limit=10)
+    assert not any(x["fact_id"] == fid2 for x in res), res  # archived excluded
     store.close()
+
+
+def test_feedback_confidence_is_order_invariant():
+    """Regression guard for a proven defect in the previous +0.15/*0.5 scheme:
+    for the SAME evidence (2 helpful + 2 unhelpful votes), confidence used to
+    depend on the ORDER the votes arrived in (measured: 0.325 / 0.55 / 0.3625
+    for three different orderings of the identical multiset). A Bayesian
+    posterior computed from counts cannot do this by construction -- three
+    different orders of the same 2-vs-2 evidence must land on one value."""
+    def run(order: list[bool]) -> float:
+        path = os.path.join(tempfile.mkdtemp(), "m14b.db")
+        store = _fresh(path)
+        fid = store.remember("id_2 стабилен.", source="turn:assistant")
+        r = None
+        for helpful in order:
+            r = store.feedback(fid, helpful)
+        store.close()
+        return r["confidence"]
+
+    a = run([True, True, False, False])
+    b = run([False, False, True, True])
+    c = run([True, False, True, False])
+    assert abs(a - b) < 1e-9 and abs(b - c) < 1e-9, (a, b, c)
+    # And it must equal the closed-form posterior mean directly.
+    assert abs(a - 2.0 * (0.5 + 2) / (1.0 + 4)) < 1e-9, a
 
 
 def test_correction_on_write_negation():
