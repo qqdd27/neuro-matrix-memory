@@ -1146,6 +1146,36 @@ def test_sweep_decisions_llm_dynamic():
     store.close()
 
 
+def test_traits_do_not_crowd_out_raw_evidence() -> None:
+    """Measured regression, real-key paid LoCoMo run (2026-09): sweep_traits
+    facts used to be created with a fresh timestamp (undecayed recency) and
+    importance >=1.0, with no cap on how many can appear in results (unlike
+    dossiers' explicit 2-slot cap) -- so a handful of distilled traits about
+    a hub entity systematically outscored and displaced the actual episodic
+    evidence turn from top-k. Confirmed on an identical 150-question LoCoMo
+    sample: evidence-hit@8 was 31.8% with sweep_traits() never invoked,
+    11.0% in the real paid run where it was -- traits were net HARMFUL to
+    literal recall despite being designed to help inferential recall. Fixed
+    by lowering trait importance (0.5, below the >=1.0 used elsewhere for
+    durable kinds); this reproduces the exact failure shape at small scale
+    and asserts the real evidence turn stays on top."""
+    path = os.path.join(tempfile.mkdtemp(), "traitcrowd.db")
+    store = _fresh(path)
+    old_ts = time.time() - 400 * 86400  # old, decayed -- like a real turn
+    store.remember(
+        "Caroline: Researching adoption agencies has been on my mind lately.",
+        source="turn", ts=old_ts, importance=1.0)
+    for t in ("loves painting and art", "enjoys hiking outdoors",
+              "values LGBTQ community support", "is close with Melanie",
+              "appreciates classic literature"):
+        store.remember(f"Caroline: {t}", source="trait", kind="trait",
+                       ts=time.time(), importance=0.5, confidence=1.0,
+                       meta={"type": "trait"})
+    hits = store.search("What did Caroline research?", limit=8)
+    assert hits and "adoption" in hits[0]["text"].lower(), hits
+    store.close()
+
+
 def test_sweep_traits_llm_dynamic_and_answers_inference() -> None:
     """Write-time trait distillation (LLM-optional): scattered episodic
     mentions about a named person become one durable kind='trait' fact,

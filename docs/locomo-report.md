@@ -1,6 +1,6 @@
 # LoCoMo evidence-hit@8 report
 
-- date: 2026-09-11 13:53
+- date: 2026-09-11 14:09
 - conversations: 10, questions scored: 1977
 - overall evidence-hit@8: **638/1977 (32.3%)**
 

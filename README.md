@@ -227,6 +227,23 @@ which is the honest mitigation against reading this as a number picked to
 game one benchmark. A second, external benchmark (LongMemEval) would be the
 next check that this generalizes past LoCoMo's specific question shapes.
 
+**First real QA-accuracy run (2026-09, limited/paid, `--llm`):** 150 sampled
+questions, Claude Haiku as the reader, scored with token-F1 — the number
+actually comparable to published leaderboard entries. Result: **9.4% F1**,
+evidence-hit@8 on that same sample **11.0%** — but reproducing the identical
+150-question sample for free with `sweep_traits()` never invoked scored
+**31.8%**, matching the full-population rate. The gap was a real, measured
+regression the paid run itself surfaced: trait facts (write-time distillation,
+v0.7.4) were created with an undecayed timestamp and importance ≥1.0, no cap
+on how many can appear in results (unlike dossiers' explicit 2-slot cap) —
+so a handful of distilled traits about a hub entity systematically
+outscored and displaced the actual evidence turn from top-k. Fixed by
+lowering trait importance to 0.5. Net honest lesson: the one paid run that
+actually mattered was not the QA-accuracy number itself but the side effect
+it exposed in a feature that had only ever been checked with a mocked LLM —
+confirming, again, that a mechanism "working" in a unit test and a
+mechanism helping in practice are different claims.
+
 ## Development
 
 ```bash

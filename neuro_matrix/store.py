@@ -740,9 +740,28 @@ class NeuroMatrixStore:
                 if len(subject) < 2 or len(trait) < 3:
                     continue
                 text = f"{subject}: {trait}"[:300]
+                # importance=0.5 (NOT the >=1.0 used elsewhere for durable
+                # kinds): measured regression, real-key paid LoCoMo run,
+                # 2026-09 -- trait facts are created with ts=now and kind
+                # 'trait' is not in DECAYING_KINDS, so they get a full,
+                # undecayed recency multiplier while the ORIGINAL episodic
+                # evidence they were distilled from (real timestamps,
+                # already old) is heavily decayed. Combined with an
+                # importance >=1.0 and NO cap on how many trait facts can
+                # appear in results (dossiers get an explicit 2-slot cap for
+                # exactly this reason; traits had none), a handful of traits
+                # about a hub entity systematically outscored and displaced
+                # the real evidence turn from top-k. Confirmed: evidence-hit
+                # @8 on an identical 150-question LoCoMo sample was 31.8%
+                # with sweep_traits() never invoked, 11.0% in the real paid
+                # run where it was -- traits were net HARMFUL to literal
+                # recall despite being designed to help inferential recall.
+                # A low importance keeps a trait findable when it is the
+                # ONLY relevant signal (nothing else competes) while no
+                # longer letting it systematically outrank real evidence.
                 fid = self.remember(
                     text, source="trait", kind="trait", ts=now,
-                    importance=1.1, confidence=1.0,
+                    importance=0.5, confidence=1.0,
                     meta={"type": "trait", "subject": subject.lower()})
                 if fid is not None:
                     self._attach_entity(fid, subject, now)
