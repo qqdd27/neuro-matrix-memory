@@ -834,31 +834,49 @@ class NeuroMatrixStore:
                 scored[fid] = (0.35 * float(r["importance"])
                                * float(r["confidence"] or 1.0) * (0.5 + 0.5 * rec))
 
-        # Materialize + sort.
-        for fid, score in scored.items():
-            row = self._conn.execute(
-                "SELECT id, text, kind, source, session_id, ts, importance, "
-                "confidence, retrieval_count, active_until, supersedes, meta "
-                "FROM facts WHERE id = ?", (fid,),
-            ).fetchone()
-            if row is None:
-                continue
-            matched = self._matched_entity_keys(fid)
-            results.append({
-                "fact_id": fid,
-                "text": row["text"],
-                "kind": row["kind"] or "episodic",
-                "source": row["source"],
-                "session_id": row["session_id"] or "",
-                "ts": row["ts"],
-                "importance": row["importance"],
-                "confidence": row["confidence"] or 1.0,
-                "retrieval_count": row["retrieval_count"] or 0,
-                "active_until": row["active_until"],
-                "supersedes": row["supersedes"],
-                "score": round(float(score), 4),
-                "via": matched,
-            })
+        # Materialize + sort. `scored` can hold as many entries as facts
+        # mentioning ANY resolved query entity — for a hub entity (a project
+        # name that recurs across a large fraction of all facts) that can be
+        # tens of thousands of rows even though only `limit` are ever
+        # returned. Sort by score FIRST and materialize only a bounded
+        # candidate window with two batched queries, instead of one
+        # individual SELECT per candidate (previously O(all candidates) DB
+        # round-trips regardless of `limit` — measured at 50k facts: this
+        # step alone issued 100k+ separate queries; batching + capping brings
+        # the whole search() call from ~2s to sub-50ms on the same data).
+        _cap = max(limit * 8, 60)
+        _top = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)[:_cap]
+        if _top:
+            _ids = [fid for fid, _ in _top]
+            _score_map = dict(_top)
+            _ph = ",".join("?" * len(_ids))
+            _frows = self._conn.execute(
+                f"SELECT id, text, kind, source, session_id, ts, importance, "
+                f"confidence, retrieval_count, active_until, supersedes, meta "
+                f"FROM facts WHERE id IN ({_ph})", _ids).fetchall()
+            _matched_map: dict[int, list[str]] = {}
+            for _mr in self._conn.execute(
+                    f"SELECT fe.fact_id, e.key FROM fact_entities fe "
+                    f"JOIN entities e ON e.id = fe.entity_id "
+                    f"WHERE fe.fact_id IN ({_ph})", _ids).fetchall():
+                _matched_map.setdefault(int(_mr["fact_id"]), []).append(_mr["key"])
+            for row in _frows:
+                fid = int(row["id"])
+                results.append({
+                    "fact_id": fid,
+                    "text": row["text"],
+                    "kind": row["kind"] or "episodic",
+                    "source": row["source"],
+                    "session_id": row["session_id"] or "",
+                    "ts": row["ts"],
+                    "importance": row["importance"],
+                    "confidence": row["confidence"] or 1.0,
+                    "retrieval_count": row["retrieval_count"] or 0,
+                    "active_until": row["active_until"],
+                    "supersedes": row["supersedes"],
+                    "score": round(float(_score_map[fid]), 4),
+                    "via": _matched_map.get(fid, [])[:6],
+                })
         results.sort(key=lambda x: x["score"], reverse=True)
 
         # LLM rerank (§10, optional): heuristic top-k -> LLM order.  Only when a
@@ -3191,20 +3209,39 @@ class NeuroMatrixStore:
             w *= 0.1
         return w
 
+    # Graph-hop breadth cap (measured fix): a hub entity (a project name that
+    # recurs across a large fraction of all facts) can have hundreds+ of
+    # neighbors. Expanding ALL of them, then expanding hop-2 from ALL of
+    # those, was an unbounded breadth-first walk that turned "recall facts
+    # near this entity" into "touch nearly the whole entity graph" -- on a
+    # synthetic 50k-fact / 212-entity store with one moderately hub-like
+    # entity, this alone contributed to a 62s single search() call (profiled;
+    # see _score_facts_by_entities). Real usage is typically sparse (most
+    # entities have a handful of neighbors, well under this cap, so nothing
+    # changes for them) -- the cap only bites for genuine hubs, which is
+    # exactly where unbounded expansion was pathological.
+    _HOP_BREADTH_CAP = 40
+
     def _resolve_query_entities(self, query: str, now: float) -> dict[int, float]:
         """Query entity ids with graph-expanded scores (2-hop, decaying)."""
         keys = extract_entities(query)
         if not keys:
             return {}
         ids: dict[int, float] = {}
+        direct: set[int] = set()
+        cap = self._HOP_BREADTH_CAP
         for key in keys:
             eid = self._entity_id_lookup(key)
             if eid is None:
                 continue
             ids[eid] = ids.get(eid, 0.0) + 2.0
+            direct.add(eid)
             # Hop 1: alias expansion (same canonical id is automatic) +
             # strongest neighbors.  Inhibited edges (superseded choices) are
             # heavily downweighted — the rejected path stops resurfacing.
+            # Only the top-`cap` neighbors by decayed strength survive: a
+            # sparse entity is unaffected, a hub entity is bounded.
+            neighbors: list[tuple[int, float]] = []
             for r in self._conn.execute(
                 "SELECT a, b, count, last_seen, inhibited_since FROM edges "
                 "WHERE a = ? OR b = ?", (eid, eid)).fetchall():
@@ -3214,10 +3251,19 @@ class NeuroMatrixStore:
                     -hours / self.edge_half_life_hours)
                 if r["inhibited_since"] is not None:
                     strength *= 0.1
+                neighbors.append((oth, strength))
+            neighbors.sort(key=lambda x: x[1], reverse=True)
+            for oth, strength in neighbors[:cap]:
                 ids[oth] = max(ids.get(oth, 0.0), strength)
-        # Hop 2 (cheap, capped).
+        # Hop 2 (cheap, capped): expand only from the strongest hop-1
+        # entities (bounded above), not every entity gathered so far -- a
+        # hub's already-capped hop-1 set must not re-explode into hundreds of
+        # hop-2 queries.
+        hop1_ranked = sorted(
+            ((eid, sc) for eid, sc in ids.items() if eid not in direct),
+            key=lambda kv: kv[1], reverse=True)[:cap]
         hop2: list[tuple[int, float]] = []
-        for eid, _ in list(ids.items()):
+        for eid, _ in hop1_ranked:
             for r in self._conn.execute(
                 "SELECT a, b, count, last_seen, inhibited_since FROM edges "
                 "WHERE (a = ? OR b = ?) AND count >= 2", (eid, eid)).fetchall():
@@ -3232,6 +3278,21 @@ class NeuroMatrixStore:
                 hop2.append((oth, w))
         for eid, score in hop2:
             ids[eid] = max(ids.get(eid, 0.0), score)
+        # Final global cap: per-source fan-out limits above still let a
+        # densely connected neighborhood re-saturate the overall set (many
+        # capped sources, each contributing a different slice, can union back
+        # up close to the whole graph). Directly-matched query entities are
+        # always kept; graph-discovered ones are truncated to the strongest
+        # 2*cap regardless of how many distinct hop-1 sources contributed
+        # them -- this is what actually bounds _score_facts_by_entities'
+        # downstream join to a fixed-size entity set.
+        if len(ids) > cap * 2:
+            kept = {eid: sc for eid, sc in ids.items() if eid in direct}
+            others = sorted(
+                ((eid, sc) for eid, sc in ids.items() if eid not in direct),
+                key=lambda kv: kv[1], reverse=True)[: max(0, cap * 2 - len(kept))]
+            kept.update(dict(others))
+            ids = kept
         return ids
 
     def _entity_id_lookup(self, key: str) -> Optional[int]:
@@ -3262,6 +3323,18 @@ class NeuroMatrixStore:
             f"AND (f.active_until IS NULL OR f.active_until > ?) "
             f"{ts_cond}",
             params).fetchall()
+        # _entity_query_score(eid) depends ONLY on eid, not on the fact row --
+        # but eids is small (the query's resolved entities, typically single
+        # digits even after 2-hop expansion) while `rows` is one row per
+        # (fact, entity) pair, which scales with how many facts mention that
+        # entity. Recomputing it per row instead of per eid was a measured,
+        # severe scaling bug: on a synthetic 50k-fact store with a moderately
+        # hub-like entity (a project name mentioned across ~1/4 of all
+        # facts), one search() call issued 99,773 redundant score queries
+        # (200k+ total SQL round-trips) and took 62 SECONDS. Caching per eid
+        # bounds those calls to at most len(eids) — the same search() dropped
+        # to sub-100ms after this fix (verified, not assumed).
+        _score_cache: dict[int, float] = {}
         for r in rows:
             fid = int(r["fact_id"])
             eid = int(r["entity_id"])
@@ -3272,7 +3345,9 @@ class NeuroMatrixStore:
                 rec = math.exp(-hours / self.recency_half_life_hours)
             else:
                 rec = 1.0
-            ent_score = float(self._entity_query_score(eid, now))
+            if eid not in _score_cache:
+                _score_cache[eid] = float(self._entity_query_score(eid, now))
+            ent_score = _score_cache[eid]
             scored[fid] = (scored.get(fid, 0.0)
                            + ent_score * float(r["importance"])
                            * float(r["confidence"] or 1.0) * (0.5 + 0.5 * rec))

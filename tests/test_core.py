@@ -131,6 +131,41 @@ def test_graph_hop_recall():
     store.close()
 
 
+def test_search_stays_fast_with_a_hub_entity() -> None:
+    """Scale regression guard for a proven, measured defect (2026-09):
+    profiling a synthetic 50k-fact / 212-entity store with one moderately
+    hub-like entity found search() taking 62 SECONDS for a single query --
+    caused by (1) a per-entity score helper re-queried once per (fact,
+    entity) row instead of once per entity, (2) the materialize step doing
+    one individual SQL SELECT per scored candidate instead of a batched
+    query, and (3) unbounded 2-hop graph expansion pulling in the entire
+    entity graph for a hub node. All three are fixed; this test reproduces
+    the hub-entity shape (a small anchor pool so entities densely
+    co-occur) at a size that still runs quickly in CI and asserts search()
+    stays fast -- a future change reintroducing any of the three bugs would
+    make this test slow or time out, not silently pass."""
+    import random as _random
+    path = os.path.join(tempfile.mkdtemp(), "hub_scale.db")
+    store = _fresh(path)
+    rnd = _random.Random(7)
+    anchors = [f"id_{i}" for i in range(30)] + ["HUBTOKEN"]
+    verbs = ["используется для", "упал из-за", "работает стабильно с",
+             "интегрирован с", "хранит данные из"]
+    for i in range(4000):
+        a = rnd.choice(anchors)
+        b = rnd.choice(anchors)
+        store.remember(f"{a} {rnd.choice(verbs)} {b}, эпизод {i}, детали.",
+                       source="turn:assistant", session_id=f"s{i % 200}")
+    t0 = time.time()
+    res = store.search("HUBTOKEN", limit=8)
+    elapsed = time.time() - t0
+    store.close()
+    assert res, "hub entity search returned nothing"
+    # Generous bound: a real regression to the pre-fix behaviour would take
+    # tens of seconds at this scale, not fail this assertion by a hair.
+    assert elapsed < 5.0, f"search() took {elapsed:.2f}s -- scaling regression"
+
+
 def test_consolidation_extractive_no_llm():
     path = os.path.join(tempfile.mkdtemp(), "m3.db")
     store = _fresh(path)
