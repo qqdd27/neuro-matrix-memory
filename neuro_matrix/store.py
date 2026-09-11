@@ -239,6 +239,15 @@ CREATE TABLE IF NOT EXISTS ask_log (
     last_ts REAL NOT NULL,
     hits INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS merge_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    keep_id INTEGER NOT NULL,
+    snapshot TEXT NOT NULL,
+    undone INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_merge_log_keep ON merge_log(keep_id);
 """
 
 
@@ -597,23 +606,27 @@ class NeuroMatrixStore:
         key = "_".join(tokens[:4])[:48]
         return key
 
-    def link(self, alias_a: str, alias_b: str, *, label: Optional[str] = None) -> None:
+    def link(self, alias_a: str, alias_b: str, *,
+             label: Optional[str] = None) -> Optional[int]:
         """Explicit cross-session identity statement: alias_a <-> alias_b refer
         to the same canonical entity (user tool / alias extraction).  The more
-        established entity survives the merge (higher hit count wins)."""
+        established entity survives the merge (higher hit count wins).
+        Returns the ``merge_log`` id (pass to ``unmerge()`` to undo this exact
+        merge, e.g. if the identity statement turns out to be wrong)."""
         now = time.time()
         a = self._entity_for_key(_norm(alias_a), now)
         b = self._entity_for_key(_norm(alias_b), now)
         if a is None or b is None or a == b:
-            return
+            return None
         ra = self._conn.execute(
             "SELECT hits, last_seen FROM entities WHERE id = ?", (a,)).fetchone()
         rb = self._conn.execute(
             "SELECT hits, last_seen FROM entities WHERE id = ?", (b,)).fetchone()
         if rb is not None and (ra is None or (rb["hits"], rb["last_seen"]) > (ra["hits"], ra["last_seen"])):
             a, b = b, a
-        self._merge_entities(a, b, now)
+        mid = self._merge_entities(a, b, now)
         self._conn.commit()
+        return mid
 
     # ------------------------------------------------------------- retrieval
 
@@ -2885,34 +2898,81 @@ class NeuroMatrixStore:
             (key, key, now, now))
         return int(cur.lastrowid)
 
-    def _merge_entities(self, keep_id: int, drop_id: int, now: float) -> None:
+    def _merge_entities(self, keep_id: int, drop_id: int, now: float) -> Optional[int]:
         """Fold entity ``drop_id`` into ``keep_id``: aliases move over, fact
-        links and edges are re-pointed, stronger of the two remains the key."""
+        links and edges are re-pointed, stronger of the two remains the key.
+
+        Entity merges are the single highest-risk, hardest-to-notice mistake
+        this engine can make (a wrong alias match silently fuses two
+        unrelated identities and every downstream recall inherits the error).
+        Unlike every other mutation here, a merge used to be irreversible.
+        Before touching any row, a full snapshot of everything about to be
+        deleted or overwritten is written to ``merge_log`` (as JSON, not more
+        schema); ``unmerge()`` replays it byte-for-byte. Returns the
+        merge_log id so a caller can undo this exact merge later."""
         if keep_id == drop_id:
-            return
+            return None
         drop = self._conn.execute(
-            "SELECT key, label, hits, first_seen FROM entities WHERE id=?",
-            (drop_id,)).fetchone()
-        if drop is None:
-            return
-        for r in self._conn.execute(
-            "SELECT alias FROM aliases WHERE entity_id = ?", (drop_id,)).fetchall():
+            "SELECT key, label, kind, hits, first_seen, last_seen "
+            "FROM entities WHERE id=?", (drop_id,)).fetchone()
+        keep_before = self._conn.execute(
+            "SELECT label, first_seen, last_seen, hits FROM entities WHERE id=?",
+            (keep_id,)).fetchone()
+        if drop is None or keep_before is None:
+            return None
+        drop_aliases = [r["alias"] for r in self._conn.execute(
+            "SELECT alias FROM aliases WHERE entity_id = ?", (drop_id,)).fetchall()]
+        alias_candidates = list(dict.fromkeys(drop_aliases + [drop["key"]]))
+        alias_already_on_keep = {
+            a: bool(self._conn.execute(
+                "SELECT 1 FROM aliases WHERE entity_id = ? AND alias = ?",
+                (keep_id, a)).fetchone())
+            for a in alias_candidates
+        }
+        moved_fact_ids = [int(r["fact_id"]) for r in self._conn.execute(
+            "SELECT fact_id FROM fact_entities WHERE entity_id = ?",
+            (drop_id,)).fetchall()]
+        fact_already_on_keep = [fid for fid in moved_fact_ids if self._conn.execute(
+            "SELECT 1 FROM fact_entities WHERE fact_id = ? AND entity_id = ?",
+            (fid, keep_id)).fetchone()]
+        drop_edges = [dict(r) for r in self._conn.execute(
+            "SELECT a, b, count, first_seen, last_seen, inhibited_since, stability "
+            "FROM edges WHERE a = ? OR b = ?", (drop_id, drop_id)).fetchall()]
+        keep_oth_before: dict[int, Optional[dict[str, Any]]] = {}
+        for r in drop_edges:
+            oth = r["a"] if r["b"] == drop_id else r["b"]
+            if oth == keep_id:
+                continue
+            lo, hi = (keep_id, oth) if keep_id < oth else (oth, keep_id)
+            row = self._conn.execute(
+                "SELECT count, first_seen, last_seen, inhibited_since, stability "
+                "FROM edges WHERE a = ? AND b = ?", (lo, hi)).fetchone()
+            keep_oth_before[oth] = dict(row) if row else None
+
+        snapshot = {
+            "drop": dict(drop), "keep_before": dict(keep_before),
+            "drop_aliases": drop_aliases,
+            "alias_already_on_keep": alias_already_on_keep,
+            "moved_fact_ids": moved_fact_ids,
+            "fact_already_on_keep": fact_already_on_keep,
+            "drop_edges": drop_edges,
+            "keep_oth_before": {str(k): v for k, v in keep_oth_before.items()},
+        }
+        mid = int(self._conn.execute(
+            "INSERT INTO merge_log (ts, keep_id, snapshot) VALUES (?, ?, ?)",
+            (now, keep_id, json.dumps(snapshot, ensure_ascii=False))).lastrowid)
+
+        for a in alias_candidates:
             self._conn.execute(
                 "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?, ?)",
-                (keep_id, r["alias"]))
-        self._conn.execute(
-            "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?, ?)",
-            (keep_id, drop["key"]))
+                (keep_id, a))
         # Re-point fact links (dedupe).
-        for r in self._conn.execute(
-            "SELECT fact_id FROM fact_entities WHERE entity_id = ?", (drop_id,)).fetchall():
+        for fid in moved_fact_ids:
             self._conn.execute(
                 "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
-                (r["fact_id"], keep_id))
+                (fid, keep_id))
         # Fold edge counts where both endpoints had edges to the dropped node.
-        for r in self._conn.execute(
-            "SELECT a, b, count, first_seen, last_seen FROM edges "
-            "WHERE a = ? OR b = ?", (drop_id, drop_id)).fetchall():
+        for r in drop_edges:
             oth = r["a"] if r["b"] == drop_id else r["b"]
             if oth == keep_id:
                 continue
@@ -2932,6 +2992,110 @@ class NeuroMatrixStore:
             "hits = hits + ?, first_seen = MIN(first_seen, ?), last_seen = ? "
             "WHERE id = ?",
             (drop["label"] or drop["key"], drop["hits"], drop["first_seen"], now, keep_id))
+        return mid
+
+    def unmerge(self, merge_id: int) -> Optional[dict[str, Any]]:
+        """Undo one entity merge exactly, from its ``merge_log`` snapshot: the
+        dropped entity is recreated (a NEW id — SQLite ids are never reused,
+        but key/label/aliases/fact links/edges are restored verbatim) and
+        ``keep_id`` reverts to its pre-merge row. Safe to call once per merge;
+        a second call on the same ``merge_id`` is a no-op (``undone`` flag).
+        Best-effort only against further writes to the SAME edges/links made
+        strictly between the merge and this call (a real risk only if other
+        merges touched the same pair in between) — the common "I linked the
+        wrong two things, undo it" case is fully exact."""
+        row = self._conn.execute(
+            "SELECT keep_id, snapshot, undone FROM merge_log WHERE id = ?",
+            (merge_id,)).fetchone()
+        if row is None or int(row["undone"]):
+            return None
+        keep_id = int(row["keep_id"])
+        snap = json.loads(row["snapshot"])
+        drop = snap["drop"]
+        existing = self._conn.execute(
+            "SELECT id FROM entities WHERE key = ?", (drop["key"],)).fetchone()
+        if existing is not None:
+            # The dropped key was reclaimed by something else since the merge
+            # (e.g. a brand-new unrelated entity with the same name) — refuse
+            # rather than silently colliding two identities a second time.
+            return {"ok": False, "reason": "drop_key_in_use", "key": drop["key"]}
+        new_drop_id = int(self._conn.execute(
+            "INSERT INTO entities (key, label, kind, first_seen, last_seen, hits) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (drop["key"], drop["label"], drop["kind"], drop["first_seen"],
+             drop["last_seen"], drop["hits"])).lastrowid)
+        # NOTE: drop["key"] must be removed from keep's aliases (the merge put
+        # it there) but never re-added to new_drop_id's own aliases — an
+        # entity is never its own alias, its key already IS drop["key"].
+        alias_candidates = list(dict.fromkeys(snap["drop_aliases"] + [drop["key"]]))
+        for a in alias_candidates:
+            if not snap["alias_already_on_keep"].get(a):
+                self._conn.execute(
+                    "DELETE FROM aliases WHERE entity_id = ? AND alias = ?",
+                    (keep_id, a))
+            if a == drop["key"]:
+                continue
+            self._conn.execute(
+                "INSERT OR IGNORE INTO aliases (entity_id, alias) VALUES (?, ?)",
+                (new_drop_id, a))
+        already_on_keep = set(snap["fact_already_on_keep"])
+        for fid in snap["moved_fact_ids"]:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                (fid, new_drop_id))
+            if fid not in already_on_keep:
+                self._conn.execute(
+                    "DELETE FROM fact_entities WHERE fact_id = ? AND entity_id = ?",
+                    (fid, keep_id))
+        # Restore edges. keep_oth_before's keys enumerate every third-party
+        # entity ("oth") the dropped entity had a folded edge with; the
+        # direct keep<->drop edge (if any) is handled separately below since
+        # it was never folded (it was simply deleted by the merge).
+        for oth_str, before in snap["keep_oth_before"].items():
+            oth = int(oth_str)
+            lo, hi = (keep_id, oth) if keep_id < oth else (oth, keep_id)
+            if before is None:
+                self._conn.execute(
+                    "DELETE FROM edges WHERE a = ? AND b = ?", (lo, hi))
+            else:
+                self._conn.execute(
+                    "UPDATE edges SET count = ?, first_seen = ?, last_seen = ?, "
+                    "inhibited_since = ?, stability = ? WHERE a = ? AND b = ?",
+                    (before["count"], before["first_seen"], before["last_seen"],
+                     before["inhibited_since"], before["stability"], lo, hi))
+            # Recreate old_drop_id <-> oth with its original snapshot values.
+            orig = next((e for e in snap["drop_edges"]
+                        if (e["a"] == oth or e["b"] == oth) and oth != keep_id), None)
+            if orig is not None:
+                lo2, hi2 = (new_drop_id, oth) if new_drop_id < oth else (oth, new_drop_id)
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO edges "
+                    "(a, b, count, first_seen, last_seen, inhibited_since, stability) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (lo2, hi2, orig["count"], orig["first_seen"], orig["last_seen"],
+                     orig["inhibited_since"], orig["stability"]))
+        # The direct keep<->drop edge (if any) was skipped from folding above
+        # and simply deleted by the merge — recreate it verbatim.
+        direct = next((e for e in snap["drop_edges"]
+                       if e["a"] == keep_id or e["b"] == keep_id), None)
+        if direct is not None:
+            lo3, hi3 = (new_drop_id, keep_id) if new_drop_id < keep_id else (keep_id, new_drop_id)
+            self._conn.execute(
+                "INSERT OR REPLACE INTO edges "
+                "(a, b, count, first_seen, last_seen, inhibited_since, stability) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (lo3, hi3, direct["count"], direct["first_seen"], direct["last_seen"],
+                 direct["inhibited_since"], direct["stability"]))
+        kb = snap["keep_before"]
+        self._conn.execute(
+            "UPDATE entities SET label = ?, first_seen = ?, last_seen = ?, "
+            "hits = ? WHERE id = ?",
+            (kb["label"], kb["first_seen"], kb["last_seen"], kb["hits"], keep_id))
+        self._conn.execute(
+            "UPDATE merge_log SET undone = 1 WHERE id = ?", (merge_id,))
+        self._conn.commit()
+        self._cache.clear()
+        return {"ok": True, "restored_key": drop["key"], "new_entity_id": new_drop_id}
 
     def _touch_edge(self, a: int, b: int, now: float, delta: float = 1.0) -> None:
         """Hebbian reinforcement + myelination (stability grows with every

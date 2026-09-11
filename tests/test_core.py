@@ -183,6 +183,45 @@ def test_ephemeral_turns_ignored():
     store.close()
 
 
+def test_merge_is_reversible():
+    """Entity merge (via link()) is the single highest-risk operation in the
+    engine: a wrong identity statement silently fuses two unrelated things
+    and used to be permanent. Verify a full round-trip: merge, then
+    unmerge(), must restore both entities' profiles, hit counts, aliases,
+    shared third-party edge weight, and search results EXACTLY."""
+    path = os.path.join(tempfile.mkdtemp(), "m6b.db")
+    store = _fresh(path)
+    store.remember("id_100 связан с проектом Alpha.", source="turn:assistant")
+    store.remember("id_100 работает с Beta тоже.", source="turn:assistant")
+    store.remember("id_200 отдельная сущность, тоже связана с Alpha.",
+                   source="turn:assistant")
+
+    ent100_before = store.entity("id_100")
+    ent200_before = store.entity("id_200")
+    alpha_before = store.entity("alpha")
+    res_before = sorted(r["text"] for r in store.search("id_200", limit=10))
+
+    mid = store.link("id_100", "id_200")
+    assert mid is not None
+    # While merged, id_200 resolves through the alias to the surviving entity.
+    merged_probe = store.entity("id_200")
+    assert merged_probe is not None and merged_probe["key"] == "id_100"
+
+    r = store.unmerge(mid)
+    assert r is not None and r["ok"] is True and r["restored_key"] == "id_200"
+
+    assert store.entity("id_100") == ent100_before
+    assert store.entity("id_200") == ent200_before
+    assert store.entity("alpha")["hits"] == alpha_before["hits"]
+    res_after = sorted(r["text"] for r in store.search("id_200", limit=10))
+    assert res_after == res_before
+
+    # Calling unmerge twice on the same merge_log id is a no-op, not a crash
+    # or a second (corrupting) restore.
+    assert store.unmerge(mid) is None
+    store.close()
+
+
 def test_stats_smoke():
     path = os.path.join(tempfile.mkdtemp(), "m6.db")
     store = _fresh(path)
