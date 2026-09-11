@@ -166,6 +166,18 @@ python scripts/eval_recall.py --db "path/to/neuromatrix.db" \
 Baseline on the live profile db (2026-09-08): **recall@5 = 100% / 100%**
 (see `docs/recall-report-2026-09-08.md`). Product thesis: `docs/VISION.md`.
 
+**Honest boundary, measured, not assumed:** that 100% holds whenever a query
+repeats an anchor (an id, a name, a token) — which is most real usage, and is
+exactly what both suites above test. `python scripts/eval_semantic_gap.py`
+measures the one case they cannot see: a pure conceptual paraphrase that
+shares **neither** an anchor entity **nor** a content word with the stored
+fact ("Почему сменили предыдущего поставщика бэкенда?" for a fact about
+switching to Supabase). Measured result: **0/3** recalled, vs **1/1** for the
+same fact asked with its anchor ("Что там с Supabase?"). This is not a bug —
+hybrid graph+FTS5 retrieval has no semantic layer by design (see README
+top) — but it is a real, quantified ceiling and every recall claim in this
+document should be read with that scope attached.
+
 ## Development
 
 ```bash
