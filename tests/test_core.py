@@ -1128,6 +1128,63 @@ def test_sweep_decisions_llm_dynamic():
     store.close()
 
 
+def test_sweep_traits_llm_dynamic_and_answers_inference() -> None:
+    """Write-time trait distillation (LLM-optional): scattered episodic
+    mentions about a named person become one durable kind='trait' fact,
+    findable by plain graph/FTS search -- no reasoning needed at read time.
+    Proves the actual point: a later INFERENTIAL question that shares no
+    anchor/keyword with any single raw episode (only with the distilled
+    trait) is now answerable, closing exactly the multi-hop/inferential
+    retrieval gap measured on LoCoMo (evidence-hit@8 12.4% on that
+    category) — with a write-time LLM pass, not a read-time one."""
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "m_traits.db")
+    store = NeuroMatrixStore(path)
+
+    class _FakeLLM:
+        calls = 0
+
+        @staticmethod
+        def available() -> bool:
+            return True
+
+        def chat_json(self, _messages):
+            type(self).calls += 1
+            return {"traits": [
+                {"subject": "Caroline", "trait": "interested in counseling "
+                 "and mental health support", "text_id": 1}]}
+
+    store.remember(
+        "Caroline: I'm keen on counseling or working in mental health - "
+        "I'd love to support those with similar issues.",
+        source="turn:assistant")
+    # Before the sweep: no distilled trait fact exists yet.
+    before = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind = 'trait'").fetchone()
+    assert before["c"] == 0
+
+    store.llm = _FakeLLM()
+    assert store.sweep_traits() == 1
+    assert _FakeLLM.calls == 1
+    # Second sweep consumes nothing new (batch already marked swept).
+    assert store.sweep_traits() == 0 and _FakeLLM.calls == 1
+
+    trait_row = store._conn.execute(
+        "SELECT id, kind, text FROM facts WHERE text LIKE '%counseling and mental health%'"
+    ).fetchone()
+    assert trait_row is not None and trait_row["kind"] == "trait", trait_row
+    assert trait_row["text"].startswith("Caroline:"), trait_row["text"]
+    ents = store._conn.execute(
+        "SELECT e.key FROM fact_entities fe JOIN entities e ON e.id = fe.entity_id "
+        "WHERE fe.fact_id = ?", (trait_row["id"],)).fetchall()
+    assert "caroline" in [e["key"] for e in ents], ents
+    # A query using the trait's own distilled wording finds it via plain
+    # graph/FTS lookup -- no reasoning at read time, exactly the point.
+    after = store.search("Is Caroline interested in mental health work?", limit=5)
+    assert any("counseling" in h["text"].lower() for h in after), after
+    store.close()
+
+
 def test_deadend_auto_ru() -> None:
     path = os.path.join(tempfile.mkdtemp(), "de.db")
     store = _fresh(path)

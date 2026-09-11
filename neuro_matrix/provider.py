@@ -500,6 +500,21 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     swept = self._store.sweep_decisions()
                     if swept:
                         logger.info("neuromatrix sweep: captured %d decisions", swept)
+            # Trait/interest distillation (write-time, LLM-optional) — once
+            # per UTC day, mirrors the decision sweep. Turns scattered
+            # episodic mentions about a named person into a durable trait
+            # fact, so a later inferential question is a plain lookup
+            # instead of needing live reasoning.
+            if self._active:
+                tday = time.strftime("%Y%m%d", time.gmtime())
+                if self._store.get_meta("nm:trait_sweep_day") != tday:
+                    self._store.set_meta("nm:trait_sweep_day", tday)
+                    try:
+                        traits = self._store.sweep_traits()
+                        if traits:
+                            logger.info("neuromatrix trait sweep: captured %d traits", traits)
+                    except Exception as e:
+                        logger.debug("neuromatrix trait sweep failed: %s", e)
             # Doc -> rules distiller: once per UTC day, budget-gated.
             if self._auto_consolidate:
                 dday = time.strftime("%Y%m%d", time.gmtime())

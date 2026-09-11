@@ -193,6 +193,16 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             store.remember(f"{turn['speaker']}: {turn['text']}", source="turn",
                            session_id=sid, ts=ts, importance=1.0)
 
+    if llm is not None:
+        # Write-time trait distillation (v0.7.4): targets exactly the
+        # inferential/multi-hop questions this benchmark scores worst on
+        # ("what field would X pursue?"), which single-shot retrieval
+        # structurally cannot answer. Bounded to a handful of batches so one
+        # long conversation's cost stays predictable.
+        for _ in range(15):
+            if store.sweep_traits(batch=12) == 0:
+                break
+
     dmap = _dia_map(conv)
     per_cat: dict[int, list[bool]] = {}
     per_cat_f1: dict[int, list[float]] = {}

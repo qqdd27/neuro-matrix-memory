@@ -45,7 +45,7 @@ from .entities import (
 ALL_KINDS = (
     "episodic", "episode", "decision", "goal", "constraint",
     "lesson", "correction", "foresight", "artifact", "deadend",
-    "capability", "doc", "status", "resolved", "rule",
+    "capability", "doc", "status", "resolved", "rule", "trait",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -625,6 +625,97 @@ class NeuroMatrixStore:
         for r in rows:
             meta = json.loads(r["meta"] or "{}") or {}
             meta["swept"] = 1
+            self._conn.execute(
+                "UPDATE facts SET meta = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=False), r["id"]))
+        self._conn.commit()
+        self._cache.clear()
+        return applied
+
+    def sweep_traits(self, *, batch: int = 12, max_items: int = 8) -> int:
+        """Write-time trait/interest/preference distillation (LLM-optional,
+        budget-gated — same shape as ``sweep_decisions``, applied to a
+        different question).
+
+        Biological grounding: Complementary Learning Systems theory
+        (McClelland, McNaughton & O'Reilly 1995; schema-dependent
+        consolidation, Tse et al. 2007) — scattered hippocampal episodic
+        traces ("went camping", "saw a meteor shower", "roasted
+        marshmallows") are consolidated during sleep into one general
+        neocortical semantic schema ("loves the outdoors"). This is a
+        DIFFERENT, complementary mechanism from the SHY/synaptic-homeostasis
+        downscaling this engine already implements elsewhere (``_downscale_
+        edges``): that one weakens noise, this one abstracts signal.
+        Mathematically: each episodic mention is one noisy observation of an
+        unobserved latent trait; the distilled trait is a posterior estimate
+        from several observations — the same Bayesian lineage as the
+        Beta-Bernoulli ``feedback()`` confidence model, just with a
+        text-valued instead of scalar latent, which needs an LLM rather than
+        a closed-form update.
+
+        Why this exists: single-shot lexical/graph retrieval structurally
+        cannot answer an INFERENTIAL question ("what field would X pursue?"
+        from scattered interest mentions) at read time — there is no
+        entity/keyword bridge between "counseling" mentions and "education
+        fields" to traverse. Doing the inference ONCE, at write/consolidation
+        time, and storing its result as an ordinary durable fact means the
+        read path stays pure graph/FTS lookup (fast, cheap, local, no
+        per-query LLM call) — this is the "prospective indexing" pattern
+        (write-time LLM enrichment, read-time pure retrieval) rather than a
+        read-time reasoning loop. Roadmapped in docs/FRONTIER-RESEARCH.md
+        §7 as `kind=profile` / PersonaMem-v2-style distillation; implemented
+        here as `kind='trait'`.
+        """
+        llm = self.llm
+        if llm is None or not getattr(llm, "available", lambda: False)() \
+                or self.llm_budget_remaining() <= 0:
+            return 0
+        rows = self._conn.execute(
+            "SELECT id, text, meta FROM facts WHERE kind = 'episodic' "
+            "AND archived = 0 AND consolidated = 0 "
+            "AND (meta IS NULL OR meta NOT LIKE '%\"trait_swept\"%') "
+            "ORDER BY ts DESC LIMIT ?", (batch,)).fetchall()
+        if not rows:
+            return 0
+        texts = "\n".join(f"[{r['id']}] {r['text'][:700]}" for r in rows)
+        content = llm.chat_json([
+            {"role": "system",
+             "content": (
+                 "You read conversation turns from an agent's memory. Extract "
+                 "durable statements about a NAMED person's interests, traits, "
+                 "values, or preferences that could help answer a LATER "
+                 "inferential question about them (e.g. 'likes hiking and the "
+                 "outdoors' from a camping story; 'interested in counseling "
+                 "and mental health' from career talk). "
+                 'Return JSON {"traits": [{"subject": "Name", "trait": "...", '
+                 '"text_id": <id>}]} with at most 8 items, subject = the '
+                 "person's name as it appears in the text. Skip vague small "
+                 "talk — do not invent traits the text does not support.")},
+            {"role": "user", "content": texts}])
+        self.llm_spend(1)
+        applied = 0
+        if isinstance(content, dict):
+            now = time.time()
+            for t in (content.get("traits") or [])[:max_items]:
+                if not isinstance(t, dict):
+                    continue
+                subject = str(t.get("subject") or "").strip()
+                trait = str(t.get("trait") or "").strip()
+                if len(subject) < 2 or len(trait) < 3:
+                    continue
+                text = f"{subject}: {trait}"[:300]
+                fid = self.remember(
+                    text, source="trait", kind="trait", ts=now,
+                    importance=1.1, confidence=1.0,
+                    meta={"type": "trait", "subject": subject.lower()})
+                if fid is not None:
+                    self._attach_entity(fid, subject, now)
+                    applied += 1
+        # Mark the whole batch swept regardless of outcome (do not re-ask
+        # the same turns forever — mirrors sweep_decisions).
+        for r in rows:
+            meta = json.loads(r["meta"] or "{}") or {}
+            meta["trait_swept"] = 1
             self._conn.execute(
                 "UPDATE facts SET meta = ? WHERE id = ?",
                 (json.dumps(meta, ensure_ascii=False), r["id"]))
