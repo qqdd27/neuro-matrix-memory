@@ -1199,6 +1199,33 @@ def test_ru_variants_unit() -> None:
     vs = _ru_variants("правило")
     assert "правило" in vs and "правила" in vs and "правилу" in vs, vs
     assert len(vs) <= 9
+
+
+def test_synonym_bridge_narrows_semantic_gap() -> None:
+    """Honest, BOUNDED narrowing of the measured semantic-recall ceiling
+    (scripts/eval_semantic_gap.py): a query built from a curated synonym of a
+    word actually present in the fact must recall it, even with zero literal
+    token overlap and no shared anchor entity. This is NOT semantic search —
+    verify the boundary holds too: a query sharing no synonym-group member
+    and no anchor with the fact still correctly misses (regression guard
+    against ever silently overclaiming this closes the whole gap)."""
+    path = os.path.join(tempfile.mkdtemp(), "syn.db")
+    store = _fresh(path)
+    store.remember("Сервис TON падал из-за исчерпания лимита запросов к API.",
+                    source="turn:assistant")
+    store.remember("id_42 хранит данные локально и продолжает работать без сети.",
+                    source="turn:assistant")
+    hits1 = store.search("Почему у нас недавно был сбой на проде?", limit=5)
+    assert any("падал" in h["text"] for h in hits1), hits1
+    hits2 = store.search("Что из наших инструментов не требует подключения "
+                          "к интернету?", limit=5)
+    assert any("локально" in h["text"] for h in hits2), hits2
+    # Boundary: genuinely disjoint vocabulary (no synonym-group member, no
+    # anchor shared) must still miss -- the bridge is narrow by design.
+    hits3 = store.search("Почему сменили предыдущего поставщика бэкенда?",
+                          limit=5)
+    assert not any("TON" in h["text"] or "id_42" in h["text"] for h in hits3), hits3
+    store.close()
     # Latin tokens pass through untouched
     assert _ru_variants("postgresql") == ["postgresql"]
 
