@@ -33,6 +33,23 @@ def test_extract_entities_russian_and_anchors():
     assert keys2 == ["firebase"], keys2
 
 
+def test_entity_noise_from_sentence_fillers_and_chat_abbreviations():
+    """External validation finding (LoCoMo benchmark, 2026-09): common
+    English sentence-continuation words ("Doing research...", "Last
+    month...") and chat abbreviations that happen to be ALL-CAPS ("BTW")
+    were being extracted as real entities, inflating a fact's entity count
+    (and therefore its additive graph score) with pure noise -- unrelated to
+    whether the fact was actually relevant to anything. Position-gating
+    (the Cyrillic fix) does NOT transfer here: English text -- and this
+    engine's own speaker-prefixed facts ("Caroline: ...") -- routinely open
+    a sentence with the real entity, so a denylist is used instead."""
+    keys = extract_entities(
+        "Thanks for the tip, Caroline. Doing research and readying myself "
+        "emotionally makes sense. BTW, Last month was rough.")
+    assert "caroline" in keys, keys
+    assert "doing" not in keys and "last" not in keys and "btw" not in keys, keys
+
+
 def test_extract_alias_pairs_ru():
     pairs = extract_alias_pairs("Криптовалюта TON — это id_777.")
     assert ("ton", "id_777") in pairs, pairs
@@ -554,6 +571,52 @@ def test_contradictions_duplicate_scan():
     c = store.contradictions()
     assert c["duplicate_count"] >= 1, c
     assert c["duplicates"][0]["b"]["text"] == "id_900 выпустил новую версию токена."
+    store.close()
+
+
+def test_content_relevance_bonus_beats_pure_recency_for_hub_entities():
+    """External validation finding (LoCoMo benchmark, snap-research/locomo,
+    2026-09): running this engine against a real, non-self-authored
+    conversational-memory benchmark for the first time exposed a severe,
+    systemic ranking defect that the project's own small synthetic tests
+    never could -- because in those tests every anchor entity had only 1-3
+    mentions total, so ranking by recency alone always happened to surface
+    the one relevant fact by luck of scale, not by real relevance.
+
+    The defect: once an entity is mentioned in MANY facts (a hub -- the most
+    common real case being a person's own name in a long conversation),
+    search() ranked candidates purely by entity-presence x recency x
+    importance, completely blind to whether the OTHER words in the question
+    matched the fact's own text. "What did Alex research?" surfaced the most
+    RECENT fact mentioning Alex, not the one about research. Measured on
+    LoCoMo: evidence-hit@8 was 3.0% before a fix, 27.8% after (9.3x).
+
+    Fixed with a MULTIPLICATIVE content-token relevance bonus applied once
+    per fact after its full entity-based score is summed (an earlier,
+    additive '+1 per matched word' attempt measurably failed: entity base
+    scores are unbounded -- they grow with edge count/dataset size and with
+    how many entities a fact happens to mention -- so a fixed additive bonus
+    is invisible against a hub fact's already-large base score; only a
+    proportional boost reliably competes regardless of that scale)."""
+    path = os.path.join(tempfile.mkdtemp(), "hubrel.db")
+    store = _fresh(path)
+    # Twenty generic mentions of a hub name -- none about the real question,
+    # all more recent than the one relevant fact (worst case for a
+    # recency-only ranker). Deliberately lowercase filler after the speaker
+    # prefix so no SECOND entity accidentally enters the graph and confounds
+    # the property under test (a capitalized filler word repeated across all
+    # 40 facts would itself become a strong hub neighbor, which is a real
+    # phenomenon but a different one than this test targets).
+    for i in range(20):
+        store.remember(f"Alex: yeah that sounds fun, tell me more #{i}.",
+                       source="turn:assistant")
+    store.remember("Alex: researching adoption agencies has been on my mind lately.",
+                   source="turn:assistant")
+    for i in range(20):
+        store.remember(f"Alex: nice, glad to hear it, take care #{i}.",
+                       source="turn:assistant")
+    hits = store.search("What did Alex research?", limit=3)
+    assert any("adoption" in h["text"].lower() for h in hits), hits
     store.close()
 
 

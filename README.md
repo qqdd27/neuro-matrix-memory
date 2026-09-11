@@ -182,6 +182,33 @@ close, which conflicts with this project's zero-runtime-dependency, fully
 local design. Every recall claim in this document should be read with that
 scope attached: anchor- or synonym-reachable, not fully semantic.
 
+**External, non-self-authored benchmark (2026-09):** every number above is
+measured on scenarios this project wrote and tuned its own code against —
+useful, but not an honest outside check. `python scripts/eval_locomo.py`
+runs against [LoCoMo](https://github.com/snap-research/locomo) (arXiv
+2402.17753), a public long-term conversational-memory benchmark this engine
+had never seen: 10 real multi-session dialogues (19-32 sessions each),
+~2000 QA pairs with gold evidence turns. It measures **evidence-hit@8** —
+does the original turn the answer depends on show up in top-8 `search()`
+results — the retrieval ceiling, not LoCoMo's published QA-accuracy number
+(which also requires an LLM reader; not run here by design, zero extra
+dependency/cost). First run: **3.0%**. It exposed a real, systemic defect no
+internal test ever could: once an entity is mentioned across many facts (a
+hub — a person's own name in a long conversation, the single most common
+real case), `search()` ranked purely by entity-presence × recency ×
+importance, blind to whether the rest of the question's words matched the
+fact's own text — so "what did X research?" surfaced X's most *recent*
+mention, not the one about research. Fixed with a multiplicative
+content-token relevance bonus (an additive one measurably failed — entity
+base scores are unbounded, so a fixed bonus is invisible against a hub's
+already-large score) plus two entity-noise fixes (English sentence-filler
+words and chat abbreviations like "BTW" were inflating fact scores as fake
+entities). Result: **27.8%** (×9.3), still far from solved — multi-hop
+questions (12.4%) remain the hardest, an honest, expected limit for
+single-shot retrieval without multi-hop reasoning. Full breakdown in
+`docs/locomo-report.md`. The dataset (CC BY-NC 4.0) is fetched on demand,
+never vendored into this MIT-licensed repo.
+
 ## Development
 
 ```bash

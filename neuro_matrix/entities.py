@@ -31,6 +31,30 @@ EN_STOP = {
     # ("none -> profile", "unknown -> url" were real corruptions in the wild).
     "none", "null", "undefined", "unknown", "surface", "self", "default",
     "value", "false", "true", "object", "string", "boolean", "callback",
+    # Sentence-continuation fillers (measured, LoCoMo benchmark 2026-09):
+    # unlike Russian -- where EVERY sentence capitalizes its first word
+    # regardless of content, making POSITION a clean noise signal -- English
+    # capitalizes for the same reason AND real proper nouns routinely open a
+    # sentence too (every speaker-prefixed fact here literally starts with
+    # the person's name), so position-gating Latin TitleCase the way Cyrillic
+    # is gated would remove the very entities most needed. These specific
+    # words were observed inflating a fact's entity count (and therefore its
+    # additive score) purely by starting a sentence, with zero relevance:
+    # "Doing research...", "Last month...", "Wow, Caroline!".
+    "last", "next", "doing", "going", "coming", "sure", "yeah", "wow",
+    "totally", "anyway", "anyways", "honestly", "definitely", "absolutely",
+    "exactly", "basically", "literally", "seriously", "meanwhile", "besides",
+    "alright", "gonna", "wanna", "gotta", "kinda", "sorta",
+}
+# Chat/text abbreviations that match the ALL-CAPS anchor pattern (same shape
+# as real symbols like BTC/TON) but carry no identity at all. Anchors are
+# NOT filtered through STOPWORDS (that would also strip real 2-4 letter
+# tickers), so this is a separate, narrow denylist checked only for anchor
+# tokens that look like a common chat abbreviation.
+_ANCHOR_NOISE = {
+    "btw", "lol", "omg", "imo", "imho", "asap", "fyi", "tbh", "idk", "brb",
+    "np", "nvm", "wtf", "smh", "lmao", "rofl", "diy", "faq", "aka", "eta",
+    "ttyl", "bff", "rn", "irl",
 }
 RU_STOP = {
     "это", "что", "как", "так", "для", "при", "без", "или", "если", "когда",
@@ -118,13 +142,15 @@ def extract_entities(text: str, max_entities: int = 16) -> list[str]:
         if tok.startswith("/"):
             tok = tok[1:]
         key = tok.lower()
+        if key in _ANCHOR_NOISE:
+            continue
         if key and len(key) <= 40 and key not in found:
             found.append(key)
     # TitleCase Latin names — only keep ones that are not pure anchors and
     # not stopwords; they become weak entities (weight handled by caller).
     for m in _TITLECASE_RE.finditer(text):
         w = m.group(1)
-        if w.lower() in STOPWORDS:
+        if w.lower() in STOPWORDS or w.lower() in _ANCHOR_NOISE:
             continue
         key = w.lower()
         if key not in found and len(key) <= 30:

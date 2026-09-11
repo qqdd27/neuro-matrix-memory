@@ -9,3 +9,7 @@ venv/
 *.db-wal
 *.db-shm
 .pytest_cache/
+# Third-party benchmark data (CC BY-NC 4.0, snap-research/locomo) -- never
+# vendored into this MIT-licensed repo; scripts/eval_locomo.py fetches it
+# locally on demand for reproducing the evaluation.
+scripts/bench_data/

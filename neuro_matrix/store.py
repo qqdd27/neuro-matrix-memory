@@ -771,16 +771,19 @@ class NeuroMatrixStore:
         results: list[dict[str, Any]] = []
         seen_facts: set[int] = set()
         scored: dict[int, float] = {}
-
-        if q_entities:
-            eids = list(q_entities)
-            scored, seen_facts = self._score_facts_by_entities(eids, now, as_of=as_of)
-
-        # Lexical fallback via FTS5 for remaining query tokens.
+        # Computed once, used both to boost entity-path candidates below and
+        # as the FTS lexical fallback query further down.
         tokens = [
             t for t in re.findall(r"[0-9A-Za-zА-Яа-яЁё]{3,}", query.lower())
             if t not in STOPWORDS
         ]
+
+        if q_entities:
+            eids = list(q_entities)
+            scored, seen_facts = self._score_facts_by_entities(
+                eids, now, as_of=as_of, content_tokens=tokens)
+
+        # Lexical fallback via FTS5 for remaining query tokens.
         if tokens and len(scored) < limit * 4:
             _match_parts: list[str] = []
             for t in tokens[:6]:
@@ -3306,6 +3309,7 @@ class NeuroMatrixStore:
 
     def _score_facts_by_entities(
         self, eids: list[int], now: float, *, as_of: Optional[float] = None,
+        content_tokens: Optional[list[str]] = None,
     ) -> tuple[dict[int, float], set[int]]:
         scored: dict[int, float] = {}
         seen: set[int] = set()
@@ -3317,7 +3321,7 @@ class NeuroMatrixStore:
             params.append(as_of)
         rows = self._conn.execute(
             f"SELECT fe.fact_id, fe.entity_id, f.ts, f.importance, f.kind, "
-            f"f.confidence "
+            f"f.confidence, f.text "
             f"FROM fact_entities fe JOIN facts f ON f.id = fe.fact_id "
             f"WHERE fe.entity_id IN ({placeholders}) AND f.archived = 0 "
             f"AND (f.active_until IS NULL OR f.active_until > ?) "
@@ -3335,6 +3339,21 @@ class NeuroMatrixStore:
         # bounds those calls to at most len(eids) — the same search() dropped
         # to sub-100ms after this fix (verified, not assumed).
         _score_cache: dict[int, float] = {}
+        # Content-relevance bonus (measured fix, external LoCoMo benchmark,
+        # 2026-09): entity-path candidates used to rank PURELY by entity
+        # presence x recency x importance, never checking whether the fact's
+        # own text relates to anything else in the question. For a "hub"
+        # entity -- the most common real case being a person's name mentioned
+        # in most turns of a long conversation -- this buried the one fact
+        # that actually answers "what did X research?" under dozens of
+        # unrelated "Wow, X!" turns that merely name-drop X more recently.
+        # Measured: on LoCoMo (snap-research/locomo), evidence-hit@8 was 3.0%
+        # before this bonus existed. A small, cheap per-matched-token bonus
+        # (substring check against the already-fetched fact text, no extra
+        # query) lets real lexical relevance compete with recency instead of
+        # being structurally invisible to entity-path scoring.
+        _tokens = [t for t in (content_tokens or []) if len(t) >= 3][:6]
+        _fact_text: dict[int, str] = {}
         for r in rows:
             fid = int(r["fact_id"])
             eid = int(r["entity_id"])
@@ -3351,6 +3370,22 @@ class NeuroMatrixStore:
             scored[fid] = (scored.get(fid, 0.0)
                            + ent_score * float(r["importance"])
                            * float(r["confidence"] or 1.0) * (0.5 + 0.5 * rec))
+            if _tokens and fid not in _fact_text:
+                _fact_text[fid] = (r["text"] or "").lower()
+        if _tokens:
+            # Applied AFTER the full per-entity sum, as a MULTIPLIER rather
+            # than a fixed additive amount: entity base scores are unbounded
+            # (they scale with edge count / dataset size via
+            # _entity_query_score, and with how many query entities a fact
+            # happens to mention), so a fixed "+1 per matched word" is
+            # meaningless noise for a hub fact scoring 50+ and everything for
+            # one scoring 2 -- a fixed bonus can never reliably compete at an
+            # unknown, unbounded scale. A proportional boost does, regardless
+            # of how large the base score already is.
+            for fid, txt_l in _fact_text.items():
+                matched = sum(1 for t in _tokens if t in txt_l)
+                if matched:
+                    scored[fid] = scored.get(fid, 0.0) * (1.0 + 0.6 * matched)
         return scored, seen
 
     def _entity_query_score(self, eid: int, now: float) -> float:
