@@ -27,9 +27,21 @@ vendored into this (MIT-licensed) repository — only the aggregate NUMBERS
 this script prints/writes are ours to keep, not the dataset's copyrighted
 dialogue text.
 
+Optional QA-accuracy mode (``--llm``): published LoCoMo leaderboard numbers
+(Mem0, ZeroMemory, ByteRover, ...) are QA accuracy AFTER an LLM reads
+retrieved context and answers — a composite of exact/F1/LLM-judge scoring,
+not retrieval alone. ``--llm`` adds that second half using the SAME optional
+LLMClient this project already supports (DeepSeek/OpenAI-compatible; reads
+NEUROMATRIX_API_KEY or --llm-api-key) — no new dependency, but real API
+calls/cost, so it defaults to a random --llm-sample of questions rather than
+all ~2000. Scored with token-level F1 (SQuAD-style, no LLM judge needed for
+scoring itself) against the gold answer. This is the number to compare
+against other systems' published scores — evidence-hit@k above is not.
+
 Run:
     python scripts/eval_locomo.py
     python scripts/eval_locomo.py --k 8 --out docs/locomo-report.md
+    python scripts/eval_locomo.py --llm --llm-sample 200   # QA-accuracy (F1)
 """
 
 from __future__ import annotations
@@ -37,7 +49,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
+import string
 import sys
 import tempfile
 import time
@@ -47,6 +61,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from neuro_matrix.store import NeuroMatrixStore  # noqa: E402
+from neuro_matrix.llm import LLMClient, DEFAULT_BASE_URL, DEFAULT_MODEL  # noqa: E402
 
 _LOCOMO_URL = ("https://raw.githubusercontent.com/snap-research/locomo/"
                "main/data/locomo10.json")
@@ -92,6 +107,56 @@ def _parse_dt(s: str, fallback: float) -> float:
         return fallback
 
 
+_ARTICLES = {"a", "an", "the"}
+
+
+def _normalize_answer_tokens(s: str) -> list[str]:
+    """SQuAD-style normalization: lowercase, strip punctuation, drop
+    articles, collapse whitespace, split into tokens."""
+    s = str(s).lower()
+    s = "".join(ch for ch in s if ch not in string.punctuation)
+    return [t for t in s.split() if t not in _ARTICLES]
+
+
+def f1_score(pred: str, gold: str) -> float:
+    """Token-level F1 between a predicted and gold answer (the standard,
+    LLM-judge-free QA metric — SQuAD/LoCoMo-style). 1.0 for an exact token
+    multiset match, 0.0 for no shared tokens; partial credit otherwise."""
+    pred_toks = _normalize_answer_tokens(pred)
+    gold_toks = _normalize_answer_tokens(gold)
+    if not pred_toks and not gold_toks:
+        return 1.0
+    if not pred_toks or not gold_toks:
+        return 0.0
+    from collections import Counter
+    common = Counter(pred_toks) & Counter(gold_toks)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_toks)
+    recall = num_same / len(gold_toks)
+    return 2 * precision * recall / (precision + recall)
+
+
+def llm_answer(llm: LLMClient, question: str, context_texts: list[str]) -> str:
+    """Ask the configured LLM to answer `question` using ONLY the retrieved
+    facts as context — the standard retrieve-then-read QA step. Returns ''
+    on any failure (network, no key, bad JSON) so callers just score it as
+    wrong rather than crash the whole run."""
+    context = "\n".join(f"- {t}" for t in context_texts[:12])
+    content = llm.chat_json([
+        {"role": "system",
+         "content": ("Answer the question using ONLY the facts below. Be "
+                     "concise (a few words, no full sentences). If the facts "
+                     "do not contain the answer, answer with your best "
+                     'guess anyway. Return JSON {"answer": "..."}.')},
+        {"role": "user", "content": f"FACTS:\n{context}\n\nQUESTION: {question}"},
+    ])
+    if isinstance(content, dict):
+        return str(content.get("answer") or "")
+    return ""
+
+
 def _dia_map(conv: dict) -> dict[str, str]:
     """dia_id ('D3:7') -> original turn text (speaker-prefixed, matching what
     was actually stored) for evidence lookup."""
@@ -105,13 +170,20 @@ def _dia_map(conv: dict) -> dict[str, str]:
     return out
 
 
-def run_sample(sample: dict, k: int) -> dict:
+def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
+              qa_filter: "set[tuple[str, str]] | None" = None,
+              rerank: bool = False, use_reader: bool = True) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
         key=lambda key: int(key.split("_")[1]))
     path = os.path.join(tempfile.mkdtemp(), f"{sample['sample_id']}.db")
-    store = NeuroMatrixStore(path)
+    # llm_daily_budget raised well above the default (20): this is an
+    # explicit, opt-in benchmark run, not a live session, and each
+    # conversation gets its own fresh store/budget -- the default would
+    # silently start no-op'ing rerank/reader calls partway through a single
+    # long conversation's questions.
+    store = NeuroMatrixStore(path, llm=llm, llm_daily_budget=100_000)
     base_ts = time.time() - 400 * 86400
     for i, sk in enumerate(session_keys):
         dt_str = conv.get(f"{sk}_date_time", "")
@@ -123,6 +195,7 @@ def run_sample(sample: dict, k: int) -> dict:
 
     dmap = _dia_map(conv)
     per_cat: dict[int, list[bool]] = {}
+    per_cat_f1: dict[int, list[float]] = {}
     lat = []
     for qa in sample["qa"]:
         cat = int(qa.get("category") or 0)
@@ -130,14 +203,20 @@ def run_sample(sample: dict, k: int) -> dict:
         ev_texts = [dmap[e] for e in ev_ids if e in dmap]
         if not ev_texts:
             continue  # no gold evidence to check against (rare, skip)
+        if qa_filter is not None and (sample["sample_id"], qa["question"]) not in qa_filter:
+            continue
         t0 = time.time()
-        hits = store.search(qa["question"], limit=k)
+        hits = store.search(qa["question"], limit=k, rerank=rerank and llm is not None)
         lat.append((time.time() - t0) * 1000)
         hit_blob = "\n".join(h.get("text", "") for h in hits)
         found = any(ev in hit_blob for ev in ev_texts)
         per_cat.setdefault(cat, []).append(found)
+        if llm is not None and use_reader:
+            pred = llm_answer(llm, qa["question"], [h.get("text", "") for h in hits])
+            per_cat_f1.setdefault(cat, []).append(f1_score(pred, qa.get("answer", "")))
     store.close()
-    return {"sample_id": sample["sample_id"], "per_cat": per_cat, "latency_ms": lat}
+    return {"sample_id": sample["sample_id"], "per_cat": per_cat,
+            "per_cat_f1": per_cat_f1, "latency_ms": lat}
 
 
 def main(argv=None) -> int:
@@ -148,6 +227,25 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None)
     ap.add_argument("--limit-samples", type=int, default=0,
                     help="debug: only run the first N conversations")
+    ap.add_argument("--llm", action="store_true",
+                    help="also run the retrieve-then-read QA pipeline "
+                         "(F1 score) -- the number comparable to published "
+                         "LoCoMo leaderboard entries. Costs real API calls.")
+    ap.add_argument("--llm-api-key", default=(
+        os.environ.get("NEUROMATRIX_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("OPENAI_API_KEY") or ""))
+    ap.add_argument("--llm-base-url", default=DEFAULT_BASE_URL)
+    ap.add_argument("--llm-model", default=DEFAULT_MODEL)
+    ap.add_argument("--llm-sample", type=int, default=200,
+                    help="randomly sample this many questions for the (paid) "
+                         "--llm pass instead of all ~2000 (default 200)")
+    ap.add_argument("--llm-seed", type=int, default=42)
+    ap.add_argument("--rerank", action="store_true",
+                    help="use search(rerank=True) -- an LLM reorders the "
+                         "heuristic top candidates before reading/scoring. "
+                         "Only active together with --llm (needs the same "
+                         "key); an extra LLM call per question, on top of "
+                         "the reader call.")
     args = ap.parse_args(argv)
 
     data_path = Path(args.data)
@@ -156,14 +254,40 @@ def main(argv=None) -> int:
     if args.limit_samples:
         data = data[: args.limit_samples]
 
+    llm = None
+    qa_filter = None
+    use_reader = args.llm
+    use_rerank = args.rerank
+    if use_reader or use_rerank:
+        llm = LLMClient(args.llm_api_key, base_url=args.llm_base_url,
+                        model=args.llm_model)
+        if not llm.available():
+            print("--llm/--rerank requested but no API key found "
+                  "(--llm-api-key / NEUROMATRIX_API_KEY / DEEPSEEK_API_KEY / "
+                  "OPENAI_API_KEY). Running evidence-hit@k only.")
+            llm, use_reader, use_rerank = None, False, False
+        else:
+            all_qas = [(s["sample_id"], qa["question"]) for s in data
+                      for qa in s["qa"] if qa.get("evidence")]
+            rnd = random.Random(args.llm_seed)
+            n_sample = min(args.llm_sample, len(all_qas))
+            qa_filter = set(rnd.sample(all_qas, n_sample))
+            print(f"LLM enabled (reader={use_reader}, rerank={use_rerank}): "
+                  f"sampling {n_sample}/{len(all_qas)} questions "
+                  f"(seed={args.llm_seed}). This costs real API calls.")
+
     t0 = time.time()
     all_per_cat: dict[int, list[bool]] = {}
+    all_per_cat_f1: dict[int, list[float]] = {}
     all_lat: list[float] = []
     per_sample_summary = []
     for sample in data:
-        r = run_sample(sample, args.k)
+        r = run_sample(sample, args.k, llm=llm, qa_filter=qa_filter,
+                       rerank=use_rerank, use_reader=use_reader)
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
+        for cat, results in r.get("per_cat_f1", {}).items():
+            all_per_cat_f1.setdefault(cat, []).extend(results)
         all_lat.extend(r["latency_ms"])
         n = sum(len(v) for v in r["per_cat"].values())
         hits = sum(sum(v) for v in r["per_cat"].values())
@@ -201,6 +325,24 @@ def main(argv=None) -> int:
     print("\nPer-conversation:")
     for sid, hits, n in per_sample_summary:
         print(f"  {sid:10s} {hits:3d}/{n:<3d} = {hits/n:.1%}" if n else f"  {sid} (no scored q)")
+
+    if all_per_cat_f1:
+        total_f1_n = sum(len(v) for v in all_per_cat_f1.values())
+        total_f1 = sum(sum(v) for v in all_per_cat_f1.values())
+        avg_f1 = total_f1 / total_f1_n if total_f1_n else 0.0
+        print(f"\n=== QA-accuracy (F1), comparable to published leaderboard "
+              f"numbers, n={total_f1_n} sampled questions ===")
+        lines_md += ["", f"## QA-accuracy (F1), n={total_f1_n} sampled",
+                     "", "| Category | n | avg F1 |", "|---|---|---|"]
+        for cat in sorted(all_per_cat_f1):
+            v = all_per_cat_f1[cat]
+            m = sum(v) / len(v) if v else 0.0
+            name = CATEGORY_NAMES.get(cat, str(cat))
+            print(f"[{name:11s}] n={len(v):4d}  avg F1 = {m:.1%}")
+            lines_md.append(f"| {cat} {name} | {len(v)} | {m:.1%} |")
+        print(f"\nOVERALL QA-accuracy (F1): {avg_f1:.1%} "
+              f"(sampled {total_f1_n}, model={args.llm_model})")
+        lines_md.append(f"\n**Overall F1: {avg_f1:.1%}** (model={args.llm_model})")
 
     if args.out:
         Path(args.out).write_text("\n".join(lines_md) + "\n", encoding="utf-8")
