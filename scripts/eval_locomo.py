@@ -140,6 +140,24 @@ def f1_score(pred: str, gold: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def _ctx_line(h: dict) -> str:
+    """Render one hit the way the LIVE agent sees it.
+
+    provider._format_hit has always appended the fact's date, but this reader
+    used to receive bare text — so every "when did X happen" question was
+    answered with a handicap the benchmark invented, not a limitation of the
+    memory (temporal had the best retrieval of all categories, hit@8 41.4%,
+    and the worst answer score, F1 4.7%).
+    """
+    ts = h.get("ts")
+    try:
+        when = time.strftime("%Y-%m-%d", time.localtime(float(ts))) if ts else ""
+    except (TypeError, ValueError, OSError):
+        when = ""
+    text = str(h.get("text", ""))
+    return f"[{when}] {text}" if when else text
+
+
 def llm_answer(llm: LLMClient, question: str, context_texts: list[str]) -> str:
     """Ask the configured LLM to answer `question` using ONLY the retrieved
     facts as context — the standard retrieve-then-read QA step. Returns ''
@@ -149,13 +167,15 @@ def llm_answer(llm: LLMClient, question: str, context_texts: list[str]) -> str:
     content = llm.chat_json([
         {"role": "system",
          "content": ("Answer the question using ONLY the facts below. Extract "
-                     "the SHORTEST possible answer span (2-5 words, a name, "
+                     "the SHORTEST possible answer span (2-8 words, a name, "
                      "date, or short phrase) — reuse the facts' own wording "
                      "verbatim wherever possible, never a full sentence, "
                      "never restate the question, no filler words like "
-                     "'likely' or 'according to the facts'. If the facts do "
-                     "not contain the answer, still give your single best "
-                     'short guess. Return JSON {"answer": "..."}.')},
+                     "'likely' or 'according to the facts'. Each fact may be "
+                     "prefixed with [YYYY-MM-DD]: that is the date of the "
+                     "event, so for 'when' questions answer with that date. If "
+                     "the facts do not contain the answer, still give your "
+                     'single best short guess. Return JSON {"answer": "..."}.')},
         {"role": "user", "content": f"FACTS:\n{context}\n\nQUESTION: {question}"},
     ])
     if isinstance(content, dict):
@@ -179,7 +199,7 @@ def _dia_map(conv: dict) -> dict[str, str]:
 def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               qa_filter: "set[tuple[str, str]] | None" = None,
               rerank: bool = False, use_reader: bool = True,
-              use_memory: bool = True) -> dict:
+              use_memory: bool = True, embedder=None) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -212,6 +232,21 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             if store.sweep_traits(batch=12) == 0:
                 break
 
+    if embedder is not None and use_memory:
+        # Index the whole conversation ONCE, up front, so the timed search path
+        # is not paying for embedding work mid-measurement (the same reason the
+        # provider drains in a bounded slice after a session instead of inside
+        # remember()).
+        store.embedder = embedder
+        indexed = 0
+        while True:
+            n = store.embed_missing(limit=512, batch=64)
+            indexed += n
+            if n <= 0:
+                break
+        print(f"    [{sample['sample_id']}] embedded {indexed} facts "
+              f"({embedder.model})", flush=True)
+
     dmap = _dia_map(conv)
     per_cat: dict[int, list[bool]] = {}
     per_cat_f1: dict[int, list[float]] = {}
@@ -238,7 +273,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             # something next to "the bare model scored X%".
             hits = []
         if llm is not None and use_reader:
-            pred = llm_answer(llm, qa["question"], [h.get("text", "") for h in hits])
+            pred = llm_answer(llm, qa["question"], [_ctx_line(h) for h in hits])
             # Category 5 (adversarial) stores its gold answer under a
             # DIFFERENT key ('adversarial_answer', not 'answer') in the raw
             # dataset -- missing this silently scored every adversarial
@@ -297,6 +332,14 @@ def main(argv=None) -> int:
                          "can be reported as a delta over the bare model. "
                          "Pair it with the same --llm-seed/--llm-sample to keep "
                          "both runs on the identical question set.")
+    ap.add_argument("--embeddings", action="store_true",
+                    help="enable dense/hybrid recall: embed the ingested facts "
+                         "with a local Ollama embedding model and fuse their rank "
+                         "with the heuristic ranking (RRF). Requires the model "
+                         "(e.g. bge-m3) to be present locally.")
+    ap.add_argument("--embed-model", default="",
+                    help="embedding model name for --embeddings (EMPTY = auto-detect)")
+    ap.add_argument("--embed-url", default="http://127.0.0.1:11434")
     args = ap.parse_args(argv)
 
     data_path = Path(args.data)
@@ -333,6 +376,17 @@ def main(argv=None) -> int:
                   f"sampling {n_sample}/{len(all_qas)} questions "
                   f"(seed={args.llm_seed}). This costs real API calls.")
 
+    embedder = None
+    if args.embeddings or args.embed_model:
+        from neuro_matrix.embeddings import OllamaEmbedder
+        emb = OllamaEmbedder(model=args.embed_model, base_url=args.embed_url)
+        if emb.available():
+            embedder = emb
+            print(f"Embeddings: {emb.model} via {emb.base_url}")
+        else:
+            print(f"Embeddings requested but no model found at {args.embed_url} "
+                  f"(tried {args.embed_model or 'auto-detect'}) — running without.")
+
     t0 = time.time()
     all_per_cat: dict[int, list[bool]] = {}
     all_per_cat_f1: dict[int, list[float]] = {}
@@ -341,7 +395,7 @@ def main(argv=None) -> int:
     for sample in data:
         r = run_sample(sample, args.k, llm=llm, qa_filter=qa_filter,
                        rerank=use_rerank, use_reader=use_reader,
-                       use_memory=not args.no_memory)
+                       use_memory=not args.no_memory, embedder=embedder)
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

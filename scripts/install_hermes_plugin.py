@@ -24,6 +24,7 @@ FILES = [
     "store.py",
     "entities.py",
     "llm.py",
+    "embeddings.py",
     "config_schema.py",
     "plugin.yaml",
 ]

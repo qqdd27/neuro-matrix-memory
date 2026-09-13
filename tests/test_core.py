@@ -1617,6 +1617,99 @@ def test_llm_client_routing_prefers_native_ollama():
     assert not _is_local_ollama_url("")
 
 
+class _FakeEmbedder:
+    """Deterministic bag-of-words embedder for tests: no network, no model,
+    but the same duck-typed interface the real OllamaEmbedder exposes."""
+
+    def __init__(self, dim: int = 32) -> None:
+        self.model = "fake-embed"
+        self.dim = dim
+
+    def available(self) -> bool:
+        return True
+
+    def _vec(self, text: str) -> list:
+        import hashlib
+        import math
+        import re
+        v = [0.0] * self.dim
+        for w in re.findall(r"[0-9a-zа-яё_]+", str(text).lower()):
+            h = int(hashlib.sha1(w.encode("utf-8")).hexdigest()[:8], 16) % self.dim
+            v[h] += 1.0
+        norm = math.sqrt(sum(x * x for x in v)) or 1.0
+        return [x / norm for x in v]
+
+    def embed(self, texts: list) -> list:
+        return [self._vec(t) for t in texts]
+
+    def embed_one(self, text: str) -> list:
+        return self._vec(text)
+
+
+def test_embed_missing_is_incremental_and_idempotent():
+    """Vectors are written once per fact and never recomputed in a loop: the
+    drain is bounded work per session, so it must report real progress and
+    then stop (a drain that keeps re-embedding would burn a local model's GPU
+    forever)."""
+    path = os.path.join(tempfile.mkdtemp(), "emb1.db")
+    store = _fresh(path)
+    for i in range(5):
+        store.remember(f"id_{i} использует Firebase для синхронизации.")
+    assert store.embed_missing() == 0, "no embedder installed -> nothing to do"
+    store.embedder = _FakeEmbedder()
+    assert store.embed_missing() == 5
+    assert store.embed_missing() == 0, "second drain must find nothing new"
+    rows = store._conn.execute("SELECT COUNT(*) c FROM fact_embeddings").fetchone()["c"]
+    assert rows == 5, rows
+    store.close()
+
+
+def test_spreading_activation_reaches_the_second_hop():
+    """The multi-hop bridge: activation seeded on A must reach C through B,
+    which is exactly the evidence keyword matching cannot surface (measured
+    hit@8 = 0/6 on LoCoMo multi-hop before this existed)."""
+    path = os.path.join(tempfile.mkdtemp(), "ppr.db")
+    store = _fresh(path)
+    store.remember("Alpha связан с Bravo для синхронизации данных.")
+    store.remember("Bravo связан с Charlie для хранения данных.")
+    seed = store._entity_id_lookup("alpha")
+    assert seed is not None
+    act = store._spreading_activation({seed: 1.0}, iterations=3, top=10)
+    keys = {store._conn.execute("SELECT key FROM entities WHERE id = ?", (i,)).fetchone()["key"]
+            for i in act}
+    assert "charlie" in keys, f"second hop missing: {sorted(keys)}"
+    assert "bravo" in keys, f"first hop missing: {sorted(keys)}"
+    assert store._bridge_candidates({seed: 1.0}, limit=5), "no bridge candidates"
+    store.close()
+
+
+def test_rrf_fuses_on_rank_not_score():
+    """RRF must ignore score scale (BM25-style values are unbounded, cosine is
+    bounded) and reward agreement between lists."""
+    from neuro_matrix.embeddings import reciprocal_rank_fusion
+    # id 5 is rank 2 in both lists -> should outrank id 9 (rank 1 in one list
+    # only) under RRF's agreement bonus.
+    fused = reciprocal_rank_fusion([[5, 9], [5, 9]], k=20)
+    assert fused[5] > fused[9], fused
+    # adding a list that hates an id pushes it down, never below zero
+    fused2 = reciprocal_rank_fusion([[5, 9], [9, 5], [5]], k=20)
+    assert fused2[5] > fused2[9], fused2
+
+
+def test_hybrid_recall_is_a_noop_without_embedder():
+    """Backwards compatibility is a hard requirement: with no embedder the
+    search path must behave exactly as before (no rrf field, same order)."""
+    path = os.path.join(tempfile.mkdtemp(), "noemb.db")
+    store = _fresh(path)
+    for i in range(4):
+        store.remember(f"Gamma проект номер {i} про cloudflare и кеш.")
+    before = [h["fact_id"] for h in store.search("cloudflare кеш", limit=4)]
+    assert before, "baseline recall returned nothing"
+    assert all("rrf" not in h for h in store.search("cloudflare кеш", limit=4)), \
+        "fusion ran without an embedder"
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

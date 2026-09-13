@@ -307,6 +307,33 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 )
             if client is not None and self._store is not None:
                 self._store.llm = client
+        # Optional dense retrieval: a local embedding model makes paraphrase-
+        # reachable facts findable and is fused into recall by rank (RRF), so
+        # it can only re-order candidates, never lose them.  Off unless asked
+        # for; on any failure the embedder stayes None and recall is unchanged.
+        embedder = None
+        if is_truthy_value(self._config.get("embeddings_enabled")):
+            try:
+                from .embeddings import DEFAULT_BASE_URL as _EMB_URL, OllamaEmbedder
+                base = str(self._config.get("embeddings_base_url") or "").strip()
+                if not base:
+                    base = str(self._config.get("llm_base_url") or "").strip()
+                if ":11434" not in base:
+                    # A hosted LLM endpoint (DeepSeek etc.) serves no embeddings;
+                    # fall back to the local Ollama the embeddings feature needs.
+                    base = _EMB_URL
+                emb = OllamaEmbedder(
+                    model=str(self._config.get("embeddings_model") or ""), base_url=base)
+                if emb.available():
+                    embedder = emb
+                    if self._store is not None:
+                        self._store.embedder = emb
+                    logger.info("neuromatrix embeddings: %s via %s", emb.model, emb.base_url)
+                else:
+                    logger.info("neuromatrix embeddings requested but no model "
+                                "available at %s (pull one, e.g. bge-m3)", base)
+            except Exception as e:  # embeddings must never break the provider
+                logger.debug("neuromatrix embeddings init failed: %s", e)
         ws = str(self._config.get("workspace_db") or "").replace(
             "$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
         if ws and os.path.abspath(ws) != os.path.abspath(db_path):
@@ -323,6 +350,8 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     # rebuild an Anthropic-configured client with the wrong
                     # wire format.
                     self._shared.llm = client
+                if embedder is not None:
+                    self._shared.embedder = embedder
                 logger.info("neuromatrix shared workspace ready: %s", ws)
             except Exception as e:  # shared pool must never break the provider
                 logger.error("neuromatrix workspace %s failed: %s", ws, e)
@@ -536,6 +565,17 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                             logger.info("neuromatrix distill: %s", rep)
                     except Exception as e:
                         logger.debug("neuromatrix distill failed: %s", e)
+            # Dense index drain (bounded): index a slice of the unindexed facts
+            # so hybrid recall has vectors to work with.  A slice, not a full
+            # pass — the queue persists between sessions, and a session end
+            # must not block for minutes on a local embedding model.
+            if self._store.embedder is not None:
+                try:
+                    added = self._store.embed_missing(limit=256)
+                    if added:
+                        logger.debug("neuromatrix embeddings: indexed %d facts", added)
+                except Exception as e:
+                    logger.debug("neuromatrix embedding drain failed: %s", e)
             today = time.strftime("%Y%m%d")
             if self._store.get_meta("last_prune_day") != today:
                 n = self._store.prune(retention_days=self._retention_days)

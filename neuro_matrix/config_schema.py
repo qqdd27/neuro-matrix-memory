@@ -160,6 +160,20 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                       default="true", options=_tf(TRUE_FALSE),
                       description="Enable optional LLM rerank of search results "
                                   "(action=search rerank=true)"),
+        ProviderField("embeddings_enabled", "Dense embeddings (hybrid recall)", KIND_SELECT,
+                      default="false", options=_tf(TRUE_FALSE),
+                      description="Fuse local embedding similarity into recall via "
+                                  "Reciprocal Rank Fusion, alongside the entity/lexical "
+                                  "path. Needs an embedding model in the local Ollama "
+                                  "(e.g. bge-m3). Off by default: without it nothing changes",
+                      inline=True),
+        ProviderField("embeddings_model", "Embedding model", KIND_TEXT,
+                      default="",
+                      description="Ollama embedding model name; EMPTY auto-detects the "
+                                  "first installed one (prefers bge-m3 for RU+EN facts)"),
+        ProviderField("embeddings_base_url", "Embedding base URL", KIND_TEXT,
+                      default="",
+                      description="EMPTY = the local Ollama URL (http://127.0.0.1:11434)"),
         ProviderField("auto_decide", "Auto-capture decisions", KIND_SELECT,
                       default="true", options=_tf(TRUE_FALSE),
                       description="Record explicit choices from turns ('для X берём Y, "
