@@ -2442,10 +2442,17 @@ class NeuroMatrixStore:
             "SELECT d.entity_id, d.summary, d.updated_at, e.key FROM dossiers d "
             "JOIN entities e ON e.id = d.entity_id").fetchall()
         for d in dossiers:
+            # ``>=`` not ``>``: consolidate() stamps ``updated_at`` from the same
+            # wall clock, and coarse platform tick resolution (Windows: ~1 ms)
+            # can give a fact written right after a consolidation the *same*
+            # timestamp — a strict comparison silently dropped it, so conflicts
+            # were detected only ~half the time.  ``consolidated = 0`` keeps
+            # facts already folded into the dossier out of the list.
             rows = self._conn.execute(
                 "SELECT f.id, f.text, f.ts FROM fact_entities fe "
                 "JOIN facts f ON f.id = fe.fact_id "
-                "WHERE fe.entity_id = ? AND f.archived = 0 AND f.ts > ? "
+                "WHERE fe.entity_id = ? AND f.archived = 0 AND f.ts >= ? "
+                "AND f.consolidated = 0 "
                 "AND f.kind IN ('episodic','decision','goal','constraint','capability') "
                 "AND (f.meta IS NULL OR f.meta NOT LIKE '%\"negated\": true%') "
                 "ORDER BY f.ts DESC LIMIT 20",
