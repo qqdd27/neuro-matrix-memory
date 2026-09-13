@@ -468,6 +468,26 @@ SHORT facts (where morphology is accurate) while live facts are long, and the
 role data on long facts is noise. The channels that pay off on live data remain
 the lexical one and the structural one's ordering effect.
 
+**Question-type routing: measured and NOT enabled (2026-09).** Answers have
+recognisable surfaces — "when" is answered by a date, "who" by a name — while all
+types are retrieved by the same bag of words, so `question_types.py` classifies
+the question by regex (English + Russian, no model) and promotes same-shape facts
+within the window. Scored by answer F1 (the retrieval metric cannot see a
+reorder at all):
+
+| | shipped (structure) | + type routing (weight 2) |
+|---|---|---|
+| **overall F1** | **28.2%** | 25.1% |
+| temporal | 7.4% | **8.5%** |
+| single-hop | 21.0% | 20.7% |
+| open-domain | 38.1% | 33.8% |
+| adversarial | 32.7% | 26.6% |
+
+It helps exactly where it was designed to help — questions whose answer is a
+date — and loses overall, because promoting "the same SHAPE as the question"
+displaces facts that are simply more relevant. Shape is not relevance. Off by
+default (`type_boost_enabled`), kept measurable, like the bridges.
+
 ## Development
 
 ```bash
