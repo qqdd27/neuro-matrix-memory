@@ -2177,6 +2177,31 @@ def test_lemma_index_matches_a_word_to_its_other_forms():
     _local()
 
 
+def test_lemma_normalisation_is_deterministic_and_precise():
+    """Index and query must normalise IDENTICALLY, so the normaliser may not
+    depend on set iteration order — and an English lemmatiser must keep distinct
+    words distinct ("universal" vs "university") where a stemmer collides them."""
+    from neuro_matrix import morphology as M
+
+    if not M.available("en"):
+        return
+    text = "Caroline researched the memory studies in the university"
+    forms = {M.normalize(text) for _ in range(5)}
+    assert len(forms) == 1, f"normalisation is not deterministic: {forms}"
+    got = forms.pop()
+    assert "research" in got and "memory" in got, got
+    if M.english_backend() == "wordnet":
+        assert M.lemma("university") != M.lemma("universal"), "stemmer-style collision"
+        assert M.lemma("memories") == M.lemma("memory")
+    # Switching backend must not leave stale cached forms behind.
+    M.set_english_backend("snowball")
+    try:
+        assert M.lemma("memory") == "memori"
+    finally:
+        M.set_english_backend("wordnet")
+    assert M.lemma("memory") == "memory", "cache was not invalidated on switch"
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

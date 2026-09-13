@@ -57,6 +57,37 @@ _pymorphy = None
 _pymorphy_tried = False
 _snowball = None
 _snowball_tried = False
+_wordnet = None
+_wordnet_tried = False
+# Which English normaliser to use.  "wordnet" (default) is a true lemmatiser and
+# keeps distinct words distinct ("universal"/"university" stay apart, "better"
+# becomes "good"); "snowball" is a stemmer that collides them into one form
+# ("univers" for both), which inflates matches and therefore noise.
+_EN_BACKEND = "wordnet"
+
+
+def set_english_backend(name: str) -> None:
+    """Switch the English normaliser ('wordnet' | 'snowball') and drop the cache."""
+    global _EN_BACKEND
+    _EN_BACKEND = "snowball" if str(name).lower().startswith("snow") else "wordnet"
+    lemma.cache_clear()
+
+
+def english_backend() -> str:
+    return _EN_BACKEND
+
+
+def _get_wordnet():
+    global _wordnet, _wordnet_tried
+    if not _wordnet_tried:
+        _wordnet_tried = True
+        try:
+            from nltk.stem import WordNetLemmatizer
+
+            _wordnet = WordNetLemmatizer()
+        except Exception:  # noqa: BLE001
+            _wordnet = None
+    return _wordnet
 
 
 def _get_pymorphy():
@@ -91,7 +122,7 @@ def available(lang: str = "ru") -> bool:
     """Is a real lemmatiser/stemmer present for this language?"""
     if lang.startswith("ru"):
         return _get_pymorphy() is not None
-    return _get_snowball() is not None
+    return _get_wordnet() is not None or _get_snowball() is not None
 
 
 @lru_cache(maxsize=100_000)
@@ -108,6 +139,21 @@ def lemma(word: str) -> str:
             except Exception:  # noqa: BLE001
                 return w
         return w
+    if _EN_BACKEND == "wordnet":
+        lm = _get_wordnet()
+        if lm is not None and len(w) > 2:
+            try:
+                # Lemmatise as verb, noun and adjective and keep the SHORTEST
+                # form ("researching" -> research, "studies" -> study).  The
+                # order is fixed and the tie-break is by position, not by set
+                # iteration: index and query must normalise identically, and a
+                # non-deterministic pick would make the same text index two
+                # different ways between runs.
+                forms = [str(lm.lemmatize(w, "v")), str(lm.lemmatize(w, "n")),
+                         str(lm.lemmatize(w, "a"))]
+                return min(forms, key=lambda x: (len(x), forms.index(x)))
+            except Exception:  # noqa: BLE001
+                pass
     stemmer = _get_snowball()
     if stemmer is not None and len(w) > 3:
         try:
