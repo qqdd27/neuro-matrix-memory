@@ -2074,6 +2074,60 @@ def test_structure_backfill_runs_while_the_agent_is_searching():
     _local()
 
 
+def test_edge_order_keeps_the_set_and_moves_the_second_best_last():
+    """The window's middle is the least-read region, so the runner-up fact goes
+    last.  Reorder only: the returned set must be identical."""
+
+    def _local():
+        path = os.path.join(tempfile.mkdtemp(), "edge.db")
+        store = _fresh(path)
+        for i in range(6):
+            store.remember(f"Constantine checked the deployment pipeline component {chr(97 + i)}",
+                           source="turn", importance=1.0)
+        # With room for every fact the SET is unchanged and only the order moves.
+        room = 6
+        plain = [h["fact_id"] for h in store.search("deployment pipeline", limit=room)]
+        assert len(plain) >= 4, f"premise: expected several hits, got {plain}"
+        store.edge_order_enabled = True
+        edged = [h["fact_id"] for h in store.search("deployment pipeline", limit=room)]
+        assert sorted(plain) == sorted(edged), "the candidate set changed"
+        assert edged[0] == plain[0], "the best fact must stay first"
+        assert edged[-1] == plain[1], f"runner-up not moved last: {edged} vs {plain}"
+        # Truncating to a smaller window therefore returns a DIFFERENT set:
+        # the runner-up is pushed out.  That is inherent to moving it last, and
+        # it is why this feature must be judged by answer quality, not hit@k.
+        store.edge_order_enabled = False
+        small_plain = [h["fact_id"] for h in store.search("deployment pipeline", limit=3)]
+        store.edge_order_enabled = True
+        small_edged = [h["fact_id"] for h in store.search("deployment pipeline", limit=3)]
+        assert small_edged != small_plain, "a truncated window should differ"
+        store.close()
+
+    _local()
+
+
+def test_ranking_settings_are_part_of_the_cache_key():
+    """A repeated search must not serve the previous order after a setting
+    change.  Found by a failing test: with the setting absent from the key the
+    second call returned the first call's result, so the feature looked inert."""
+
+    def _local():
+        path = os.path.join(tempfile.mkdtemp(), "cachekey.db")
+        store = _fresh(path)
+        for i in range(6):
+            store.remember(f"Constantine checked the deployment pipeline {chr(97 + i)}",
+                           source="turn", importance=1.0)
+        plain = [h["fact_id"] for h in store.search("deployment pipeline", limit=5)]
+        store.edge_order_enabled = True
+        edged = [h["fact_id"] for h in store.search("deployment pipeline", limit=5)]
+        assert edged != plain, (
+            "the cached order was reused after the setting changed — ranking "
+            "settings must be part of the cache key")
+        store.close()
+
+    _local()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

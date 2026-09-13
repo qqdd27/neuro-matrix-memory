@@ -290,7 +290,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               slot_weight: "float | None" = None, role_bridge: bool = False,
               role_bridge_weight: "float | None" = None,
               type_boost: bool = False,
-              type_boost_weight: "float | None" = None) -> dict:
+              type_boost_weight: "float | None" = None,
+              edge_order: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -324,6 +325,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     store.type_boost_enabled = bool(type_boost)
     if type_boost_weight is not None:
         store.type_boost_weight = float(type_boost_weight)
+    store.edge_order_enabled = bool(edge_order)
     base_ts = time.time() - 400 * 86400
     for i, sk in enumerate(session_keys):
         dt_str = conv.get(f"{sk}_date_time", "")
@@ -532,6 +534,10 @@ def main(argv=None) -> int:
                          "reordering only, the candidate set is unchanged")
     ap.add_argument("--type-boost-weight", type=float, default=None,
                     help="how far a same-shape fact is lifted (default 1)")
+    ap.add_argument("--edge-order", action="store_true",
+                    help="place the second-strongest fact LAST (readers attend to "
+                         "the edges of a long context more than to its middle); "
+                         "reordering only")
     ap.add_argument("--diag", type=int, default=0,
                     help="print N temporal questions with gold answer, retrieved "
                          "context and the reader's prediction (diagnosis mode)")
@@ -613,7 +619,8 @@ def main(argv=None) -> int:
                        role_bridge=bool(args.role_bridge),
                        role_bridge_weight=args.role_bridge_weight,
                        type_boost=bool(args.type_boost),
-                       type_boost_weight=args.type_boost_weight)
+                       type_boost_weight=args.type_boost_weight,
+                       edge_order=bool(args.edge_order))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

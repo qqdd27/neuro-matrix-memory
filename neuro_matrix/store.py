@@ -481,6 +481,10 @@ class NeuroMatrixStore:
         # window-widening experiments failed.
         self.type_boost_enabled = False
         self.type_boost_weight = 1.0
+        # "Lost in the middle": place the second-strongest fact at the END of the
+        # window instead of second, since readers attend to the edges.  Reorder
+        # only — the returned set is unchanged.
+        self.edge_order_enabled = False
         # How much the fused rank decides the final order vs the evidence score
         # (see _apply_fusion).  1.0 = pure RRF, which loses kind priority.
         self.fusion_blend = 0.9
@@ -1564,6 +1568,14 @@ class NeuroMatrixStore:
                                        float(getattr(self, "type_boost_weight", 0.0)))
             except Exception:  # noqa: BLE001 - routing must never break recall
                 pass
+
+        if getattr(self, "edge_order_enabled", False) and len(order) > 3:
+            # "Lost in the middle": a reader attends to the START and the END of
+            # its context more than to the middle (documented for long-context
+            # LLMs), so the second-strongest fact is better placed last than
+            # second, where it would sit in the least-read region.  Same set of
+            # facts, only their order changes.
+            order = [order[0]] + order[2:] + [order[1]]
         out = []
         for fid in order:
             item = by_id[fid]
@@ -1669,7 +1681,22 @@ class NeuroMatrixStore:
             rerank = bool(getattr(self, "llm_rerank_default", False))
         now = now if now is not None else time.time()
         act_t = as_of if as_of is not None else now
-        cache_key = f"{query}|{limit}|{include_dossiers}|{as_of!r}|rerank={rerank}"
+        # The settings that shape RANKING must be part of the key: without them a
+        # search repeated after a setting change returns the previous order from
+        # cache (found while testing edge ordering — the second call silently
+        # reused the first call's result), and measurement runs compare a
+        # configuration against a stale copy of itself.
+        _opts = (
+            f"fts={getattr(self, 'fts_enabled', None)}:{getattr(self, 'fts_weight', None)}"
+            f":slot={getattr(self, 'slots_enabled', None)}:{getattr(self, 'slot_weight', None)}"
+            f":blend={getattr(self, 'fusion_blend', None)}"
+            f":tb={getattr(self, 'type_boost_enabled', None)}:{getattr(self, 'type_boost_weight', None)}"
+            f":eo={getattr(self, 'edge_order_enabled', None)}"
+            f":rb={getattr(self, 'role_bridge_enabled', None)}:{getattr(self, 'role_bridge_weight', None)}"
+            f":mmr={getattr(self, 'mmr_enabled', None)}:bridge={getattr(self, 'bridge_enabled', None)}"
+            f":cap={getattr(self, 'per_kind_cap', None)}"
+        )
+        cache_key = (f"{query}|{limit}|{include_dossiers}|{as_of!r}|rerank={rerank}|{_opts}")
         # Repeated-question cache: an identical normalized ask that was
         # resolved before returns the frozen answer instantly (checked BEFORE
         # the 30s LRU so even a same-minute repeat gets the cached answer).
