@@ -225,6 +225,31 @@ class NeuromatrixMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return NAME
 
+    def _start_structure_backfill(self) -> None:
+        """Give pre-existing facts a structural form, off the critical path.
+
+        Facts written before the structural channel existed have no propositions,
+        so slot search cannot see them — measured on a real profile: 65 facts,
+        0 propositions, every slot query returning nothing.  Bounded batches in a
+        daemon thread keep provider start-up fast and never block the first turn;
+        repeating is safe because only facts without propositions are touched.
+        """
+        try:
+            import threading
+
+            def _run() -> None:
+                try:
+                    n = self._store.reindex_propositions(limit=5000)
+                    if n:
+                        logger.info("neuromatrix: structured %d pre-existing facts", n)
+                except Exception as e:  # noqa: BLE001 - never break the agent
+                    logger.debug("neuromatrix structure backfill failed: %s", e)
+
+            threading.Thread(target=_run, name="neuromatrix-structure-backfill",
+                             daemon=True).start()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("neuromatrix: could not start structure backfill: %s", e)
+
     def is_available(self) -> bool:
         return True  # SQLite always available
 
@@ -269,6 +294,7 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 self._config.get("auto_decide", "true"))
             self._store.capability_enabled = is_truthy_value(
                 self._config.get("auto_decide", "true"))
+            self._start_structure_backfill()
             adir = str(self._config.get("artifacts_dir") or "").replace(
                 "$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
             if adir:

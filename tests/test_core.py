@@ -1967,6 +1967,33 @@ def test_role_bridge_ignores_pronouns():
     store.close()
 
 
+def test_reindex_structures_pre_existing_facts():
+    """The channel must reach facts written before it existed.
+
+    Real profile measured: 65 facts, 0 propositions, every slot query empty — the
+    feature looked broken on exactly the data a user already has.  Backfill is
+    idempotent and only touches facts without propositions.
+    """
+    from neuro_matrix.propositions import available
+
+    if not available("ru"):
+        return
+    path = os.path.join(tempfile.mkdtemp(), "backfill.db")
+    store = _fresh(path)
+    a = store.remember("Алиса подарила книгу Пете", source="turn", importance=1.0)
+    assert a, "premise: the fact must be stored"
+    # simulate a fact stored before the channel existed
+    store._conn.execute("DELETE FROM propositions")
+    store._conn.commit()
+    assert store._conn.execute("SELECT COUNT(*) FROM propositions").fetchone()[0] == 0
+    n = store.reindex_propositions()
+    assert n >= 1, f"nothing was backfilled (n={n})"
+    assert store._conn.execute("SELECT COUNT(*) FROM propositions").fetchone()[0] >= 1
+    # idempotent: a second run has nothing left to do
+    assert store.reindex_propositions() == 0
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

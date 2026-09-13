@@ -717,6 +717,44 @@ class NeuroMatrixStore:
         seen = set(seeds)
         return [fid for fid in out if fid not in seen][: int(limit)]
 
+    def reindex_propositions(self, *, limit: Optional[int] = None,
+                             batch: int = 200) -> int:
+        """Structure facts that were stored before this channel existed.
+
+        Without this, the structural layer only ever helps facts written after
+        installation: a real database measured 65 facts and **0 propositions**,
+        so slot search returned nothing and the feature looked broken on exactly
+        the data the user has.  Safe to call repeatedly: it only touches facts
+        that have no propositions yet.
+        """
+        from .propositions import available
+
+        if not available():
+            return 0
+        done = 0
+        while True:
+            take = batch if limit is None else min(batch, max(0, limit - done))
+            if take <= 0:
+                break
+            rows = self._conn.execute(
+                "SELECT f.id, f.text, f.ts FROM facts f "
+                "WHERE f.archived = 0 AND NOT EXISTS "
+                "(SELECT 1 FROM propositions p WHERE p.fact_id = f.id) "
+                "ORDER BY f.id LIMIT ?", (int(take),)).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                try:
+                    self._index_propositions(int(r["id"]), str(r["text"]), float(r["ts"]))
+                except (sqlite3.Error, ValueError):
+                    pass
+            self._conn.commit()
+            done += len(rows)
+            if len(rows) < take:
+                break
+        self._cache.clear()
+        return done
+
     def add_turn(
         self,
         user_content: str,
