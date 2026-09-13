@@ -367,6 +367,48 @@ category it was built for (multi-hop 7.9% → 11.2% alone), so it stays implemen
 and measurable, but off by default: it belongs behind a query-type router, not in
 the default path.
 
+## Meaning as structure: predicate + roles (2026-09)
+
+The lexical fix above took recall to 57.8%, but it cannot see one thing at all:
+**direction of action**.  "Маша подарила книгу Пете" and "Петя подарил книгу
+Маше" contain identical content words and opposite meanings — BM25, embeddings
+and the graph all score them the same.
+
+`neuro_matrix/propositions.py` adds a structural channel that reads roles from
+morphology, with **no model call and no training**:
+
+| case | role | example |
+|---|---|---|
+| именительный / subject-first | agent | **Маша** подарила |
+| винительный | patient | подарила **книгу** |
+| дательный | recipient | подарила **Пете** |
+| творительный | instrument | открыл **ключом** |
+| предложный | location | был в **Берлине** |
+
+English uses word order plus prepositions (`to` → recipient, `with` →
+instrument, `in/at` → location).  Two further details were necessary and are
+measured:
+
+- **First person must be resolved to the speaker**: dialogue turns say
+  "Caroline: I gave a speech", while questions ask "When did **Caroline** give a
+  speech?".  Without that mapping the agent slot never matches and the channel
+  stays silent on exactly the data it was built for (1529 propositions indexed,
+  0-2 candidates per question).
+- **Slot voting beats strict matching**: demanding every role the question names
+  returned zero candidates on 20 of 20 temporal questions, because question roles
+  and fact roles rarely align exactly.  Counting agreeing roles keeps the signal.
+
+Measured on the full population (1977 questions):
+
+| | overall | single-hop | temporal | multi-hop | open-domain | adversarial |
+|---|---|---|---|---|---|---|
+| lexical only | 57.8% | 44.5% | 64.1% | 28.1% | 61.7% | 60.3% |
+| **+ structure** | **58.9%** | **46.3%** | **66.9%** | 29.2% | 62.5% | 60.3% |
+
++1.1 pp overall, concentrated exactly where roles matter.  It is optional in the
+same sense as the embedder: without `pymorphy3`/`nltk` installed the channel is
+an empty list and behaviour is byte-identical to before (pinned by a test).
+
 ## Development
 
 ```bash

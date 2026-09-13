@@ -1872,6 +1872,48 @@ def test_fts_candidates_are_ordered_by_bm25():
     store.close()
 
 
+def test_structural_channel_distinguishes_who_did_what_to_whom():
+    """Roles, not words: the two facts below share every content word.
+
+    "Маша подарила книгу Пете" and "Петя подарил книгу Маше" are the same bag of
+    words with opposite meanings — BM25 and embeddings score them identically,
+    which is exactly the failure the structural channel exists to fix.  It reads
+    roles from morphology (dative = recipient, nominative = agent) with no model
+    call, so the question resolves to the correct one of the two.
+    """
+    from neuro_matrix.propositions import available
+
+    if not available("ru"):
+        return  # optional dependency absent — the channel is documented as a no-op
+    path = os.path.join(tempfile.mkdtemp(), "slots.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    a = store.remember("Маша подарила книгу Пете", source="turn", importance=1.0)
+    b = store.remember("Петя подарил книгу Маше", source="turn", importance=1.0)
+    assert a and b, "premise: both facts must be stored"
+    rows = store._conn.execute(
+        "SELECT fact_id, agent, patient, recipient FROM propositions ORDER BY fact_id").fetchall()
+    assert len(rows) == 2, [(r["fact_id"], r["predicate"], r["agent"]) for r in rows]
+    got = {int(r["fact_id"]): (r["agent"], r["patient"], r["recipient"]) for r in rows}
+    assert got[a] == ("маша", "книга", "петя"), got
+    assert got[b] == ("петя", "книга", "маша"), got
+    first = store._slot_candidates("Кто подарил книгу Пете?", limit=5)
+    second = store._slot_candidates("Кто подарил книгу Маше?", limit=5)
+    assert first and int(first[0]) == a, f"wrong fact for 'Пете': {first} (want {a})"
+    assert second and int(second[0]) == b, f"wrong fact for 'Маше': {second} (want {b})"
+    store.close()
+
+
+def test_structural_channel_survives_a_fact_without_verbs():
+    """A fact the parser cannot structure must not become unfindable."""
+    path = os.path.join(tempfile.mkdtemp(), "slots2.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    fid = store.remember("id_777: важная заметка без глаголов", source="tool", importance=1.0)
+    assert fid, "premise: the fact must be stored"
+    hits = store.search("важная заметка", limit=3, include_dossiers=False)
+    assert any(int(h["fact_id"]) == fid for h in hits), [h["text"] for h in hits]
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

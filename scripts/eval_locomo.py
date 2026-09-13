@@ -286,7 +286,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               bridge_topk: int = 0, fts: "bool | None" = None,
               fts_weight: "float | None" = None,
               fusion_blend: "float | None" = None, diag: int = 0,
-              resolve_relative: bool = False) -> dict:
+              resolve_relative: bool = False, slots: bool = False,
+              slot_weight: "float | None" = None) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -311,6 +312,9 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
         store.fts_weight = float(fts_weight)
     if fusion_blend is not None:
         store.fusion_blend = float(fusion_blend)
+    store.slots_enabled = bool(slots)
+    if slot_weight is not None:
+        store.slot_weight = float(slot_weight)
     base_ts = time.time() - 400 * 86400
     for i, sk in enumerate(session_keys):
         dt_str = conv.get(f"{sk}_date_time", "")
@@ -499,6 +503,13 @@ def main(argv=None) -> int:
                          "hand the agent absolute dates?), not about the "
                          "reader's prompt — tuning the latter to lift the score "
                          "would be fitting the test.")
+    ap.add_argument("--slots", action="store_true",
+                    help="enable the structural channel (predicate + semantic roles "
+                         "from morphology, no model call). It distinguishes "
+                         "'Маша дала книгу Пете' from 'Петя дал книгу Маше', which "
+                         "share every word.")
+    ap.add_argument("--slot-weight", type=float, default=None,
+                    help="weight of the structural list inside RRF")
     ap.add_argument("--diag", type=int, default=0,
                     help="print N temporal questions with gold answer, retrieved "
                          "context and the reader's prediction (diagnosis mode)")
@@ -575,7 +586,8 @@ def main(argv=None) -> int:
                        bridge_edge=args.bridge_edge, bridge_topk=args.bridge_topk,
                        fts=(False if args.no_fts else None), fts_weight=args.fts_weight,
                        fusion_blend=args.fusion_blend, diag=args.diag,
-                       resolve_relative=bool(args.rel_time))
+                       resolve_relative=bool(args.rel_time),
+                       slots=bool(args.slots), slot_weight=args.slot_weight)
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

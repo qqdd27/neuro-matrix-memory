@@ -4,13 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuro-matrix-memory"
-version = "0.10.0"
+version = "0.11.0"
 description = "Local-first temporal knowledge-graph memory provider for Hermes Agent (NeuroMatrix). Cross-session entity IDs, weighted associations, sleep-style consolidation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["hermes-agent", "memory", "knowledge-graph", "llm", "agents"]
 dependencies = []
+
+[project.optional-dependencies]
+# Optional. Unlocks the structural channel (predicate + semantic roles from
+# morphology: "Маша дала книгу Пете" vs "Петя дал книгу Маше"). Without it the
+# provider runs on the standard library alone and behaves exactly as before.
+structure = ["pymorphy3>=2.0", "nltk>=3.8"]
 
 [project.entry-points."hermes_agent.memory_providers"]
 neuromatrix = "neuro_matrix.provider:register"

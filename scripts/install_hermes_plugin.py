@@ -25,6 +25,7 @@ FILES = [
     "entities.py",
     "llm.py",
     "embeddings.py",
+    "propositions.py",
     "config_schema.py",
     "plugin.yaml",
 ]
