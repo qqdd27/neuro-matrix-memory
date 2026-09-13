@@ -488,6 +488,26 @@ date — and loses overall, because promoting "the same SHAPE as the question"
 displaces facts that are simply more relevant. Shape is not relevance. Off by
 default (`type_boost_enabled`), kept measurable, like the bridges.
 
+**Edge ordering ("lost in the middle"): measured and NOT enabled (2026-09).**
+Placing the runner-up fact LAST (readers attend to the edges of a long context
+more than to its middle) — again scored by answer F1, since the retrieval metric
+cannot see a reorder:
+
+| | shipped (structure) | + edge ordering |
+|---|---|---|
+| **overall F1** | **28.2%** | 22.2% |
+| temporal | 7.4% | **11.8%** |
+| single-hop | 21.0% | **23.3%** |
+| multi-hop | 16.7% (n=6) | 11.2% |
+| open-domain | 38.1% | 29.3% |
+| adversarial | 32.7% | 19.2% |
+
+Two of five categories improve markedly and the total collapses, mostly through
+adversarial questions (ones whose answer is NOT in the window): reordering makes
+the window look more authoritative and the model stops saying "no information".
+The honest summary of the whole ordering line of work: **nothing that reorders
+the window has beaten leaving it alone**, measured four ways.
+
 ## Development
 
 ```bash
