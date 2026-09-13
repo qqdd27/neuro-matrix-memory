@@ -2024,6 +2024,56 @@ def test_question_type_routing_promotes_the_right_shape():
     assert boost(ids, texts, "What is the plan?", weight=5) == ids
 
 
+def test_structure_backfill_runs_while_the_agent_is_searching():
+    """Backfill happens in a daemon thread on a LIVE database, so it must not
+    block or break concurrent reads (WAL + busy_timeout)."""
+
+    def _local():
+        import threading
+
+        path = os.path.join(tempfile.mkdtemp(), "conc.db")
+        store = _fresh(path)
+        assert store._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        for i in range(120):
+            store.remember(f"Constantine discussed the deployment pipeline {i}",
+                           source="turn", importance=1.0)
+        store._conn.execute("DELETE FROM propositions")
+        store._conn.commit()
+        errors: list[str] = []
+        stop = {"v": False}
+        searches = {"n": 0}
+
+        def writer() -> None:
+            try:
+                store.reindex_propositions(batch=20)
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        def reader() -> None:
+            while not stop["v"]:
+                try:
+                    store.search("deployment pipeline", limit=5)
+                    searches["n"] += 1
+                except Exception as e:  # noqa: BLE001
+                    errors.append(repr(e))
+                    return
+
+        w = threading.Thread(target=writer)
+        r = threading.Thread(target=reader)
+        w.start()
+        r.start()
+        w.join()
+        stop["v"] = True
+        r.join()
+        assert not errors, f"concurrent backfill broke reads: {errors[:2]}"
+        assert searches["n"] > 10, "reader never ran"
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM propositions").fetchone()[0] >= 1
+        store.close()
+
+    _local()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
