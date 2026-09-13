@@ -86,6 +86,16 @@ def _tf(choices: tuple[str, ...]) -> tuple[ProviderFieldOption, ...]:
 
 TRUE_FALSE = ("true", "false")
 
+# Selectable LLM providers for the settings panel.  The empty value means
+# "follow whatever Hermes is already configured with"; "ollama" is the local
+# one (see llm.OllamaLLMClient for why it needs its own wiring).
+LLM_PROVIDERS = ("", "deepseek", "openai", "anthropic", "ollama", "openrouter",
+                 "groq", "gemini", "xai", "mistral", "together")
+
+
+def _pf(choices: tuple[str, ...]) -> tuple[ProviderFieldOption, ...]:
+    return tuple(ProviderFieldOption(value=c, label=c or "follow Hermes") for c in choices)
+
 # ── Declared schema (generic Hermes settings panel) ──────────────────────────
 CONFIG_SCHEMA = ProviderConfigSchema(
     name="neuromatrix",
@@ -106,6 +116,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         ProviderField("llm_enabled", "LLM consolidation", KIND_SELECT,
                       default="true", options=_tf(TRUE_FALSE),
                       description="Allow optional LLM consolidation (requires API key below)",
+                      inline=True),
+        ProviderField("llm_provider", "LLM provider", KIND_SELECT,
+                      default="", options=_pf(LLM_PROVIDERS),
+                      description="Wire format/routing. Empty = follow Hermes' active "
+                                  "provider. 'ollama' (or any localhost:11434 base URL) "
+                                  "uses Ollama's native API with thinking disabled — "
+                                  "needed for local models, where the OpenAI-compatible "
+                                  "endpoint burns hundreds of hidden reasoning tokens per "
+                                  "call and returns an EMPTY answer once the token budget "
+                                  "runs out",
                       inline=True),
         ProviderField("llm_base_url", "LLM base URL", KIND_TEXT,
                       default="",
@@ -173,6 +193,14 @@ LEGACY_CONFIG_SCHEMA = [
         "description": "Allow optional LLM consolidation (requires API key below)",
         "default": "true",
         "choices": ["true", "false"],
+    },
+    {
+        "key": "llm_provider",
+        "description": "Wire format/routing: empty = follow Hermes; 'ollama' (or any "
+                       "localhost:11434 base URL) uses Ollama's native API with thinking "
+                       "disabled — needed for local models",
+        "default": "",
+        "choices": list(LLM_PROVIDERS),
     },
     {
         "key": "llm_base_url",

@@ -1591,6 +1591,32 @@ def test_invent_capability_boost_and_purpose_deadend() -> None:
     store.close()
 
 
+def test_llm_client_routing_prefers_native_ollama():
+    """A local Ollama endpoint must NOT go through the OpenAI-compatible wire
+    format.  Measured on qwen3.5:9b with the same one-line QA prompt: /v1 spent
+    330 completion tokens (hidden thinking) and 6.7s, and returned an EMPTY
+    content at max_tokens 256/64/16; /api/chat with think=false took 0.33s and
+    13 tokens.  The empty-content case is the dangerous one — callers read it
+    as 'LLM unavailable' and silently degrade to extractive mode."""
+    from neuro_matrix.llm import (LLMClient, OllamaLLMClient, build_llm_client,
+                                  _is_local_ollama_url)
+    assert isinstance(build_llm_client("", provider="ollama", model="m1"),
+                      OllamaLLMClient)
+    # a pasted OpenAI-style local URL is detected even with no provider name
+    c = build_llm_client("k", base_url="http://127.0.0.1:11434/v1", model="m1")
+    assert isinstance(c, OllamaLLMClient)
+    assert c.base_url == "http://127.0.0.1:11434", c.base_url
+    # hosted providers keep the OpenAI-compatible client
+    assert isinstance(build_llm_client("k", provider="deepseek"), LLMClient)
+    assert not isinstance(
+        build_llm_client("k", provider="deepseek",
+                         base_url="https://api.deepseek.com/v1", model="deepseek-chat"),
+        OllamaLLMClient)
+    assert _is_local_ollama_url("http://localhost:11434")
+    assert not _is_local_ollama_url("https://api.openai.com/v1")
+    assert not _is_local_ollama_url("")
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

@@ -178,7 +178,8 @@ def _dia_map(conv: dict) -> dict[str, str]:
 
 def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               qa_filter: "set[tuple[str, str]] | None" = None,
-              rerank: bool = False, use_reader: bool = True) -> dict:
+              rerank: bool = False, use_reader: bool = True,
+              use_memory: bool = True) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -199,12 +200,14 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             store.remember(f"{turn['speaker']}: {turn['text']}", source="turn",
                            session_id=sid, ts=ts, importance=1.0)
 
-    if llm is not None:
+    if llm is not None and use_memory:
         # Write-time trait distillation (v0.7.4): targets exactly the
         # inferential/multi-hop questions this benchmark scores worst on
         # ("what field would X pursue?"), which single-shot retrieval
         # structurally cannot answer. Bounded to a handful of batches so one
         # long conversation's cost stays predictable.
+        # Skipped in --no-memory runs: the baseline never reads the store, so
+        # distilling into it would only burn local compute for nothing.
         for _ in range(15):
             if store.sweep_traits(batch=12) == 0:
                 break
@@ -221,12 +224,19 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             continue  # no gold evidence to check against (rare, skip)
         if qa_filter is not None and (sample["sample_id"], qa["question"]) not in qa_filter:
             continue
-        t0 = time.time()
-        hits = store.search(qa["question"], limit=k, rerank=rerank and llm is not None)
-        lat.append((time.time() - t0) * 1000)
-        hit_blob = "\n".join(h.get("text", "") for h in hits)
-        found = any(ev in hit_blob for ev in ev_texts)
-        per_cat.setdefault(cat, []).append(found)
+        if use_memory:
+            t0 = time.time()
+            hits = store.search(qa["question"], limit=k, rerank=rerank and llm is not None)
+            lat.append((time.time() - t0) * 1000)
+            hit_blob = "\n".join(h.get("text", "") for h in hits)
+            found = any(ev in hit_blob for ev in ev_texts)
+            per_cat.setdefault(cat, []).append(found)
+        else:
+            # Baseline: the SAME reader on the SAME questions with NO retrieved
+            # context at all.  Without this the with-memory F1 has nothing to
+            # be compared against — "our memory scored 34%" only means
+            # something next to "the bare model scored X%".
+            hits = []
         if llm is not None and use_reader:
             pred = llm_answer(llm, qa["question"], [h.get("text", "") for h in hits])
             # Category 5 (adversarial) stores its gold answer under a
@@ -255,13 +265,20 @@ def main(argv=None) -> int:
                          "(F1 score) -- the number comparable to published "
                          "LoCoMo leaderboard entries. Costs real API calls.")
     ap.add_argument("--llm-api-key", default=(
-        os.environ.get("NEUROMATRIX_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""))
+        os.environ.get("NEUROMATRIX_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""),
+        help="API key for the --llm reader/rerank pass. ANTHROPIC_API_KEY is "
+             "deliberately NOT auto-detected here: this benchmark is aimed at "
+             "LOCAL models plus the cheap OpenAI-compatible providers, and a "
+             "stray sk-ant-* key in the environment used to silently route a "
+             "whole run to paid Claude. Pass --llm-provider anthropic AND an "
+             "explicit --llm-api-key if you really want Claude.")
     ap.add_argument("--llm-provider", default="",
                     help="'anthropic' routes through the native Messages API "
-                         "(auto-detected from an 'sk-ant-' key prefix if "
-                         "left blank); anything else uses the OpenAI-"
-                         "compatible wire format (DeepSeek default).")
+                         "(must be stated explicitly — never inferred from the "
+                         "key); 'ollama' talks to a local server's native API "
+                         "with thinking disabled; anything else uses the "
+                         "OpenAI-compatible wire format (DeepSeek default).")
     ap.add_argument("--llm-base-url", default="")
     ap.add_argument("--llm-model", default="")
     ap.add_argument("--llm-sample", type=int, default=200,
@@ -274,6 +291,12 @@ def main(argv=None) -> int:
                          "Only active together with --llm (needs the same "
                          "key); an extra LLM call per question, on top of "
                          "the reader call.")
+    ap.add_argument("--no-memory", action="store_true",
+                    help="baseline: run the reader WITHOUT any retrieved facts "
+                         "(and skip the retrieval metric) so the with-memory run "
+                         "can be reported as a delta over the bare model. "
+                         "Pair it with the same --llm-seed/--llm-sample to keep "
+                         "both runs on the identical question set.")
     args = ap.parse_args(argv)
 
     data_path = Path(args.data)
@@ -288,7 +311,10 @@ def main(argv=None) -> int:
     use_rerank = args.rerank
     if use_reader or use_rerank:
         provider = args.llm_provider or (
-            "anthropic" if args.llm_api_key.startswith("sk-ant-") else "")
+            # NOTE: no sk-ant-* sniffing anymore — Anthropic is opt-in via an
+            # explicit --llm-provider anthropic, never inferred from whatever
+            # key happens to sit in the environment.
+            "anthropic" if args.llm_provider == "anthropic" else "")
         llm = build_llm_client(args.llm_api_key, provider=provider,
                               base_url=args.llm_base_url, model=args.llm_model)
         if not llm.available():
@@ -314,7 +340,8 @@ def main(argv=None) -> int:
     per_sample_summary = []
     for sample in data:
         r = run_sample(sample, args.k, llm=llm, qa_filter=qa_filter,
-                       rerank=use_rerank, use_reader=use_reader)
+                       rerank=use_rerank, use_reader=use_reader,
+                       use_memory=not args.no_memory)
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

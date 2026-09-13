@@ -50,6 +50,39 @@ The package publishes the `hermes_agent.memory_providers` entry point
 (`neuro_matrix.provider:register`), so nothing is copied; `config_schema.py`
 sits next to the package `__init__.py` for the dashboard.
 
+### Option C — a local model via Ollama (no cloud, no key, nothing leaves the machine)
+
+The LLM half of this provider (consolidation, trait distillation, rerank,
+artifact extraction) runs on a local model. Point it at Ollama and set the
+provider — no API key is needed, and the key-less path is explicitly allowed
+so a local setup is not mistaken for "no LLM configured":
+
+```bash
+ollama pull qwen3.5:9b        # or any model you already pulled
+hermes memory setup           # plugins.neuromatrix → llm_provider = ollama
+```
+
+Routing is automatic: `llm_provider = ollama` **or** any base URL containing
+`:11434` selects Ollama's native `/api/chat` instead of the
+OpenAI-compatible `/v1`, and the model name is resolved from `/api/tags`
+when left empty. That is not a style preference — it is a correctness fix,
+measured on qwen3.5:9b with one short QA prompt (identical answer both ways):
+
+| endpoint | latency | completion tokens | content |
+|---|---|---|---|
+| `/v1` (OpenAI-compatible), `max_tokens=800` | 6.7 s | 330 | ok |
+| `/v1`, `max_tokens=256` / `64` / `16` | 4.8 / 1.3 / 0.4 s | 256 / 64 / 16 | **empty** |
+| `/api/chat` with `think: false` | **0.33 s** | **13** | ok |
+
+Reasoning-capable models (qwen3.5:*, deepseek-r1, …) spend hundreds of
+hidden "thinking" tokens per call on the `/v1` path and return an **empty
+`content`** once the token budget runs out — which this provider reads as
+"LLM unavailable" and silently degrades to extractive mode. Local inference is
+free, so the daily LLM budget is not meaningful there; note that
+`llm_daily_budget = 0` currently means *the opposite* of "unlimited" (it
+zeroes the remaining budget, disabling every LLM step) — use a large number
+until this is fixed.
+
 ## Configuration (`hermes memory setup` → `plugins.neuromatrix` in config.yaml)
 
 | Field | Default | Meaning |
@@ -208,6 +241,35 @@ questions (12.4%) remain the hardest, an honest, expected limit for
 single-shot retrieval without multi-hop reasoning. Full breakdown in
 `docs/locomo-report.md`. The dataset (CC BY-NC 4.0) is fetched on demand,
 never vendored into this MIT-licensed repo.
+
+**Local-model run — does the memory help the model at all? (2026-09-13):**
+the numbers above measure *our retrieval*. The question a user actually asks
+is how much the memory adds to the answers of a small **local** model, which
+is the configuration this provider is meant for. Same 154 sampled questions,
+same reader (qwen3.5:9b on an RTX 5060 Laptop via Ollama), two runs — once
+with retrieved facts, once with the reader answering alone (`--no-memory`):
+
+| Category | without memory | with memory | Δ |
+|---|---|---|---|
+| 1 single-hop | 4.0% | 11.0% | +7.0 pp |
+| 2 temporal | 5.2% | 4.7% | −0.5 pp |
+| 3 multi-hop | 17.9% | 16.7% | −1.2 pp |
+| 4 open-domain | 9.3% | 20.2% | +10.9 pp |
+| 5 adversarial | 8.0% | 18.7% | +10.7 pp |
+| **Overall F1** | **7.9%** | **15.7%** | **+7.8 pp (×1.99)** |
+
+Retrieval in that run: **evidence-hit@8 = 31.8%**, reproducing the earlier
+full-population 32.3% on a different sample. Two findings worth more than the
+headline: (1) `temporal` has the *best* retrieval (hit@8 41.4%) and the
+*worst* answer score (4.7%) — the evidence is handed to the model and the
+reader still cannot extract the date, so that gap is a reader/prompt problem,
+not a memory problem; (2) `multi-hop` retrieved **0 of 6** gold turns — the
+one category an associative graph is supposed to win, and it currently
+contributes nothing. Reproduce the comparison with:
+
+```bash
+python scripts/compare_locomo_runs.py docs/locomo-local-baseline.md docs/locomo-local-memory.md
+```
 
 **Entity-match saturation (2026-09, zero LLM cost):** the additive fix above
 still let a fact that happened to co-mention several query-adjacent
