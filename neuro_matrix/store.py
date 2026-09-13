@@ -475,6 +475,12 @@ class NeuroMatrixStore:
         # structurally honest version of the same idea.
         self.role_bridge_enabled = False
         self.role_bridge_weight = 1.0
+        # Question-type routing: reorder the found facts so a "when" question
+        # sees dates first and a "who" question sees names first.  Reordering
+        # cannot drop a candidate, which is why it is worth trying after four
+        # window-widening experiments failed.
+        self.type_boost_enabled = False
+        self.type_boost_weight = 1.0
         # How much the fused rank decides the final order vs the evidence score
         # (see _apply_fusion).  1.0 = pure RRF, which loses kind priority.
         self.fusion_blend = 0.9
@@ -1545,6 +1551,19 @@ class NeuroMatrixStore:
             order = sorted(by_id, key=_key, reverse=True)
         else:
             order = sorted(by_id, key=lambda i: fused.get(i, 0.0), reverse=True)
+
+        if getattr(self, "type_boost_enabled", False):
+            # Reorder only — the returned set is unchanged, so this cannot cost
+            # a candidate (the four failed graph experiments all WIDENED the
+            # window and displaced precise hits; this does not widen anything).
+            try:
+                from .question_types import boost as _boost_by_type
+
+                texts = {fid: str(by_id[fid].get("text") or "") for fid in order}
+                order = _boost_by_type(order, texts, query,
+                                       float(getattr(self, "type_boost_weight", 0.0)))
+            except Exception:  # noqa: BLE001 - routing must never break recall
+                pass
         out = []
         for fid in order:
             item = by_id[fid]

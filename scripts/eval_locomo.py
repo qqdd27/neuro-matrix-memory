@@ -288,7 +288,9 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               fusion_blend: "float | None" = None, diag: int = 0,
               resolve_relative: bool = False, slots: bool = False,
               slot_weight: "float | None" = None, role_bridge: bool = False,
-              role_bridge_weight: "float | None" = None) -> dict:
+              role_bridge_weight: "float | None" = None,
+              type_boost: bool = False,
+              type_boost_weight: "float | None" = None) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -319,6 +321,9 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     store.role_bridge_enabled = bool(role_bridge)
     if role_bridge_weight is not None:
         store.role_bridge_weight = float(role_bridge_weight)
+    store.type_boost_enabled = bool(type_boost)
+    if type_boost_weight is not None:
+        store.type_boost_weight = float(type_boost_weight)
     base_ts = time.time() - 400 * 86400
     for i, sk in enumerate(session_keys):
         dt_str = conv.get(f"{sk}_date_time", "")
@@ -521,6 +526,12 @@ def main(argv=None) -> int:
                          "graph is nearly complete")
     ap.add_argument("--role-bridge-weight", type=float, default=None,
                     help="weight of the role-bridge list inside RRF")
+    ap.add_argument("--type-boost", action="store_true",
+                    help="reorder found facts by QUESTION TYPE (when -> dates, "
+                         "who -> names, where -> places, count -> numbers); "
+                         "reordering only, the candidate set is unchanged")
+    ap.add_argument("--type-boost-weight", type=float, default=None,
+                    help="how far a same-shape fact is lifted (default 1)")
     ap.add_argument("--diag", type=int, default=0,
                     help="print N temporal questions with gold answer, retrieved "
                          "context and the reader's prediction (diagnosis mode)")
@@ -600,7 +611,9 @@ def main(argv=None) -> int:
                        resolve_relative=bool(args.rel_time),
                        slots=bool(args.slots), slot_weight=args.slot_weight,
                        role_bridge=bool(args.role_bridge),
-                       role_bridge_weight=args.role_bridge_weight)
+                       role_bridge_weight=args.role_bridge_weight,
+                       type_boost=bool(args.type_boost),
+                       type_boost_weight=args.type_boost_weight)
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

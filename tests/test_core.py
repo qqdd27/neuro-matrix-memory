@@ -1994,6 +1994,36 @@ def test_reindex_structures_pre_existing_facts():
     store.close()
 
 
+def test_question_type_routing_promotes_the_right_shape():
+    """A "when" question should see date-bearing facts first, a "who" question
+    name-bearing facts — without changing WHICH facts are returned."""
+    from neuro_matrix.question_types import boost, question_type
+
+    assert question_type("When did Caroline go to the conference?") == "when"
+    assert question_type("Who did Melanie paint with?") == "who"
+    assert question_type("Where did they meet?") == "where"
+    assert question_type("How many books did she read?") == "count"
+    assert question_type("Когда Каролина ходила на конференцию?") == "when"
+    assert question_type("Кто помог Мелани?") == "who"
+    assert question_type("Что случилось с проектом?") is None
+
+    ids = [1, 2, 3]
+    texts = {
+        1: "Caroline talked about the weather with her neighbour",
+        2: "Caroline went to the LGBTQ conference on 7 May 2023",
+        3: "Caroline: it was nice",
+    }
+    # the date-bearing fact sits last and is promoted by a "when" question
+    assert boost(ids, texts, "When did Caroline go to the conference?", weight=1)[0] == 2
+    # a "who" question promotes the name-bearing fact instead
+    texts[1] = "Melanie painted a sunrise with Caroline yesterday"
+    assert boost(ids, texts, "Who painted a sunrise?", weight=1)[0] == 1
+    # and the candidate SET never changes, whatever the weight
+    assert sorted(boost(ids, texts, "When did Caroline go?", weight=5)) == ids
+    # an unrelated question is left alone
+    assert boost(ids, texts, "What is the plan?", weight=5) == ids
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
