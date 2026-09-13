@@ -63,7 +63,40 @@ def f1(pred: str, gold: str) -> float:
     return 2 * prec * rec / (prec + rec)
 
 
+_READER = None
+
+
 def ask(question: str, context: list[str]) -> str:
+    """Ask the local reader through THIS PROJECT's client.
+
+    An earlier version posted to a small OpenAI-compatible shim on :11435 that
+    lived in a scratch directory; when that directory was deleted the shim died
+    and every mode scored 0.0% — a broken harness that looked like a result.
+    The project's own client is used instead: native /api/chat, thinking off,
+    the same path the live agent and every other number in the README use.
+    """
+    global _READER
+    if _READER is None:
+        from neuro_matrix.llm import OllamaLLMClient
+
+        _READER = OllamaLLMClient(model="qwen3.5:9b", timeout_s=240.0, max_tokens=200)
+    messages = [
+        {"role": "system", "content": READER_SYSTEM},
+        {"role": "user", "content": "FACTS:\n"
+         + "\n".join(f"- {t}" for t in context[:12])
+         + f"\n\nQUESTION: {question}"},
+    ]
+    try:
+        data = _READER.chat_json(messages)
+    except Exception:  # noqa: BLE001
+        return ""
+    if isinstance(data, dict):
+        return str(data.get("answer") or "")
+    return ""
+
+
+def ask_via_shim(question: str, context: list[str]) -> str:  # pragma: no cover
+    """Kept for reference: the deleted-shim path."""
     import urllib.request
 
     body = json.dumps({
