@@ -1170,21 +1170,26 @@ class NeuroMatrixStore:
         parts: list[str] = []
         for t in tokens[:8]:
             if re.search(r"[а-яё]", t) and len(t) >= 4:
-                variants = list(_ru_variants(t))
+                # Russian: FTS5 matches whole tokens, so neither the exact form nor a
+                # prefix of the *inflected* form is enough — "модели" never matches
+                # "модель".  _ru_variants() invents forms that do not exist
+                # ("модела", "памята"), which adds noise rather than recall, so trim
+                # the inflection instead and search by stem prefix ("модел*" covers
+                # модель/модели/моделями, "памят*" covers память/памяти).
+                stem = t[:-1] if len(t) >= 5 else t
+                opts = [f'"{t}"', f"{stem}*"]
             else:
                 variants = [t]
-            for v in list(variants):
-                for sv in _synonym_variants(v):
+                for sv in _synonym_variants(t):
                     if sv not in variants:
                         variants.append(sv)
-            opts = [f'"{v}"' for v in variants]
-            if len(t) >= 4:
-                # FTS5 matches whole tokens, so a query for "research" misses
-                # "researching" — the relevant fact then gets no lexical signal
-                # and empty filler that merely repeats a speaker's name takes the
-                # slots.  A prefix term fixes the morphology gap for both English
-                # ("research" -> researching/researcher) and inflection.
-                opts.append(f"{t}*")
+                opts = [f'"{v}"' for v in variants]
+                if len(t) >= 4:
+                    # FTS5 matches whole tokens, so a query for "research" misses
+                    # "researching" — the relevant fact then gets no lexical signal
+                    # and empty filler that merely repeats a speaker's name takes the
+                    # slots.
+                    opts.append(f"{t}*")
             parts.append("( " + " OR ".join(opts) + " )")
         match_q = " OR ".join(parts)
         try:
