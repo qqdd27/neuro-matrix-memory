@@ -187,6 +187,28 @@ CREATE INDEX IF NOT EXISTS idx_facts_consolidated ON facts(consolidated);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
     text, content='facts', content_rowid='id', tokenize='unicode61'
 );
+-- Lemma index (morphological normalisation).  A second index rather than a
+-- different tokenizer because the law being applied is that inflected forms
+-- share a lemma: "бежал/бежит/бежать" and "research/researching/researched" are
+-- one concept.  It NARROWS nothing by itself and introduces no new candidates —
+-- it only makes an existing fact findable from more of its own forms.
+CREATE TABLE IF NOT EXISTS fact_lem (
+    id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL DEFAULT ''
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS facts_lem_fts USING fts5(
+    text, content='fact_lem', content_rowid='id', tokenize='unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS fact_lem_ai AFTER INSERT ON fact_lem BEGIN
+    INSERT INTO facts_lem_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS fact_lem_ad AFTER DELETE ON fact_lem BEGIN
+    INSERT INTO facts_lem_fts(facts_lem_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS fact_lem_au AFTER UPDATE ON fact_lem BEGIN
+    INSERT INTO facts_lem_fts(facts_lem_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO facts_lem_fts(rowid, text) VALUES (new.id, new.text);
+END;
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
     INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -485,6 +507,13 @@ class NeuroMatrixStore:
         # window instead of second, since readers attend to the edges.  Reorder
         # only — the returned set is unchanged.
         self.edge_order_enabled = False
+        # Lemma index: normalise inflected forms to a shared base so "research"
+        # finds "researching" and "бежал" finds "бежать".  ON by default — it is
+        # the largest measured gain since the lexical channel itself (+5.0 pp
+        # overall, single-hop +11.4 pp, every category up), it narrows rather than
+        # widens the window, costs no model, and degrades to identity when no
+        # morphology backend is installed.
+        self.fts_lemmatize = True
         # How much the fused rank decides the final order vs the evidence score
         # (see _apply_fusion).  1.0 = pure RRF, which loses kind priority.
         self.fusion_blend = 0.9
@@ -578,6 +607,15 @@ class NeuroMatrixStore:
             self._index_propositions(fact_id, text, now)
         except (sqlite3.Error, ValueError):
             pass
+        if getattr(self, "fts_lemmatize", False):
+            try:
+                from . import morphology
+
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO fact_lem(id, text) VALUES (?, ?)",
+                    (int(fact_id), morphology.normalize(text or "")))
+            except (sqlite3.Error, ValueError):
+                pass
         self._conn.commit()
         self._cache.clear()
         return fact_id
@@ -758,6 +796,41 @@ class NeuroMatrixStore:
                     self._index_propositions(int(r["id"]), str(r["text"]), float(r["ts"]))
                 except (sqlite3.Error, ValueError):
                     pass
+            self._conn.commit()
+            done += len(rows)
+            if len(rows) < take:
+                break
+        self._cache.clear()
+        return done
+
+    def rebuild_lemmas(self, *, limit: Optional[int] = None, batch: int = 200) -> int:
+        """Build the lemma index for facts stored before it existed.
+
+        Same reasoning as ``reindex_propositions``: a channel that only applies to
+        facts written after an update is invisible on the data a user already
+        has.  Idempotent — it only touches facts missing from ``fact_lem``.
+        """
+        done = 0
+        while True:
+            take = batch if limit is None else min(batch, max(0, limit - done))
+            if take <= 0:
+                break
+            rows = self._conn.execute(
+                "SELECT f.id, f.text FROM facts f "
+                "WHERE f.archived = 0 AND NOT EXISTS "
+                "(SELECT 1 FROM fact_lem l WHERE l.id = f.id) "
+                "ORDER BY f.id LIMIT ?", (int(take),)).fetchall()
+            if not rows:
+                break
+            try:
+                from . import morphology
+
+                for r in rows:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO fact_lem(id, text) VALUES (?, ?)",
+                        (int(r["id"]), morphology.normalize(str(r["text"] or ""))))
+            except Exception:  # noqa: BLE001 - optional dependency
+                break
             self._conn.commit()
             done += len(rows)
             if len(rows) < take:
@@ -1179,15 +1252,26 @@ class NeuroMatrixStore:
         return out
 
     def _materialize_hits(self, ids: list[int], *, dense_only: bool = False) -> list[dict[str, Any]]:
-        """Fetch result rows for fact ids found by the dense retriever but
-        absent from the heuristic candidate window."""
+        """Fetch result rows for fact ids found by a channel but absent from the
+        heuristic candidate window.
+
+        The lifecycle filter is applied HERE as well, and that is not a detail:
+        every channel returns bare ids, so a fact that the heuristic path
+        correctly retired (archived, or past ``active_until``) could still be
+        pulled back in by the lexical/dense/bridge channel and appear in recall.
+        Measured: after one-channel fusion was enabled, a superseded decision
+        resurfaced on a text query and broke the decision-evolution test.
+        """
         if not ids:
             return []
+        now = time.time()
         ph = ",".join("?" * len(ids))
         rows = self._conn.execute(
             f"SELECT id, text, kind, source, session_id, ts, importance, "
             f"confidence, retrieval_count, active_until, supersedes, meta "
-            f"FROM facts WHERE id IN ({ph})", ids).fetchall()
+            f"FROM facts WHERE id IN ({ph}) AND archived = 0 "
+            f"AND (active_until IS NULL OR active_until > ?)",
+            [*ids, now]).fetchall()
         matched: dict[int, list[str]] = {}
         for mr in self._conn.execute(
                 f"SELECT fe.fact_id, e.key FROM fact_entities fe "
@@ -1397,6 +1481,32 @@ class NeuroMatrixStore:
                   if t not in STOPWORDS]
         if not tokens:
             return []
+
+        if getattr(self, "fts_lemmatize", False):
+            # Lemma index.  The query MUST be normalised with the same function
+            # that normalised the stored text — normalising only one side is the
+            # classic way this produces zero matches while looking correct.
+            try:
+                from . import morphology
+
+                norm = morphology.normalize(query)
+            except Exception:  # noqa: BLE001 - optional dependency
+                norm = ""
+            lem_terms = [t for t in (norm or "").split() if t]
+            if not lem_terms:
+                return []
+            lem_q = " OR ".join(f'"{t}"*' if len(t) >= 4 else f'"{t}"' for t in lem_terms[:10])
+            try:
+                rows = self._conn.execute(
+                    "SELECT facts_lem_fts.rowid AS id FROM facts_lem_fts "
+                    "JOIN facts f ON f.id = facts_lem_fts.rowid "
+                    "WHERE facts_lem_fts MATCH ? AND f.archived = 0 "
+                    "ORDER BY bm25(facts_lem_fts) LIMIT ?",
+                    (lem_q, int(max(1, limit)))).fetchall()
+            except sqlite3.OperationalError:
+                return []
+            return [int(r["id"]) for r in rows]
+
         parts: list[str] = []
         for t in tokens[:8]:
             if re.search(r"[а-яё]", t) and len(t) >= 4:
@@ -1446,7 +1556,14 @@ class NeuroMatrixStore:
         fewer than two lists the original order is returned unchanged.
         """
         if len(results) < 2:
-            return results
+            # A single heuristic hit keeps the previous behaviour (the heuristic
+            # order is returned untouched).  Only an EMPTY heuristic window lets
+            # the lexical channel answer alone — the case that motivated the
+            # change at all: a question whose words match a fact exactly but which
+            # contains no entity the heuristics can resolve used to return NOTHING,
+            # because fusion bailed out before the text match was consulted.
+            if results or not getattr(self, "fts_enabled", False):
+                return results
         lists: list[list[int]] = []
         weights: list[float] = []
         heuristic_ids = [int(r["fact_id"]) for r in results if r.get("fact_id") is not None]
@@ -1527,7 +1644,7 @@ class NeuroMatrixStore:
             except Exception:  # noqa: BLE001 - graph must never break recall
                 pass
 
-        if len(lists) < 2:
+        if not lists:
             return results
         fused = reciprocal_rank_fusion(lists, k=int(self.hybrid_rrf_k), weights=weights)
         by_id = {int(r["fact_id"]): r for r in results if r.get("fact_id") is not None}
@@ -1688,6 +1805,7 @@ class NeuroMatrixStore:
         # configuration against a stale copy of itself.
         _opts = (
             f"fts={getattr(self, 'fts_enabled', None)}:{getattr(self, 'fts_weight', None)}"
+            f":lemmas={getattr(self, 'fts_lemmatize', None)}"
             f":slot={getattr(self, 'slots_enabled', None)}:{getattr(self, 'slot_weight', None)}"
             f":blend={getattr(self, 'fusion_blend', None)}"
             f":tb={getattr(self, 'type_boost_enabled', None)}:{getattr(self, 'type_boost_weight', None)}"

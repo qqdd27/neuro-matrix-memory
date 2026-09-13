@@ -291,7 +291,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               role_bridge_weight: "float | None" = None,
               type_boost: bool = False,
               type_boost_weight: "float | None" = None,
-              edge_order: bool = False) -> dict:
+              edge_order: bool = False, fts_lemmas: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -326,6 +326,11 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     if type_boost_weight is not None:
         store.type_boost_weight = float(type_boost_weight)
     store.edge_order_enabled = bool(edge_order)
+    store.fts_lemmatize = bool(fts_lemmas)
+    if fts_lemmas:
+        # Facts are written below through remember(), which indexes the lemma
+        # form when the flag is on; nothing else to backfill in a fresh store.
+        pass
     base_ts = time.time() - 400 * 86400
     for i, sk in enumerate(session_keys):
         dt_str = conv.get(f"{sk}_date_time", "")
@@ -538,6 +543,9 @@ def main(argv=None) -> int:
                     help="place the second-strongest fact LAST (readers attend to "
                          "the edges of a long context more than to its middle); "
                          "reordering only")
+    ap.add_argument("--fts-lemmas", action="store_true",
+                    help="morphological normalisation: index and query by LEMMA so "
+                         "'research' finds 'researching' and 'бежал' finds 'бежать'")
     ap.add_argument("--diag", type=int, default=0,
                     help="print N temporal questions with gold answer, retrieved "
                          "context and the reader's prediction (diagnosis mode)")
@@ -620,7 +628,8 @@ def main(argv=None) -> int:
                        role_bridge_weight=args.role_bridge_weight,
                        type_boost=bool(args.type_boost),
                        type_boost_weight=args.type_boost_weight,
-                       edge_order=bool(args.edge_order))
+                       edge_order=bool(args.edge_order),
+                       fts_lemmas=bool(args.fts_lemmas))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

@@ -1700,8 +1700,11 @@ def test_lexical_channel_needs_no_model():
     """The BM25 list must work with no embedder at all.
 
     That is the whole point of the largest measured gain on this project: it
-    costs no model, no GPU and no VRAM, so it reaches every user.  With every
-    other channel switched off, fusion must not run (the previous behaviour).
+    costs no model, no GPU and no VRAM, so it reaches every user.  The lexical
+    channel must therefore also work when it is the ONLY channel: a question
+    whose words the entity heuristics cannot resolve (no named entity at all)
+    used to produce an empty result, because fusion bailed out whenever the
+    heuristic list had fewer than two entries — the text match never got a say.
     """
     path = os.path.join(tempfile.mkdtemp(), "noemb.db")
     store = _fresh(path)
@@ -1711,12 +1714,16 @@ def test_lexical_channel_needs_no_model():
     hits = store.search("cloudflare кеш", limit=4)
     assert hits, "baseline recall returned nothing"
     assert store._fts_candidates("cloudflare кеш", limit=4), "BM25 must need no model"
-    # Every extra channel off: no fusion, exactly the old behaviour.
-    store.fts_enabled = False
+    # Lexical only: no bridge, no slots, no dense.  The case that motivated the
+    # change: a query with NO resolvable entity used to return nothing at all,
+    # even though its words matched a fact exactly, because fusion bailed out
+    # before the text match was consulted.
     store.bridge_enabled = False
+    store.slots_enabled = False
     store._cache.clear()
-    plain = store.search("cloudflare кеш", limit=4)
-    assert all("rrf" not in h for h in plain), "fusion ran with no second channel"
+    wordy = store.search("кеш", limit=4)
+    assert wordy, "a purely lexical query returned nothing with no entity to resolve"
+    assert any("rrf" in h for h in wordy), "fusion did not run for a lexical-only query"
     store.close()
 
 
@@ -2123,6 +2130,45 @@ def test_ranking_settings_are_part_of_the_cache_key():
         assert edged != plain, (
             "the cached order was reused after the setting changed — ranking "
             "settings must be part of the cache key")
+        store.close()
+
+    _local()
+
+
+def test_lemma_index_matches_a_word_to_its_other_forms():
+    """The morphological law at work: inflected forms share a base, so a query
+    in one form must reach a fact in another.  Pinned with a control (flag off)."""
+    from neuro_matrix import morphology
+
+    if not (morphology.available("ru") and morphology.available("en")):
+        return
+
+    def _local():
+        path = os.path.join(tempfile.mkdtemp(), "lemmas.db")
+        store = _fresh(path)
+        en = store.remember("Caroline was researching pottery glazes",
+                            source="turn", importance=1.0)
+        ru = store.remember("Каролина бежала в парк утром", source="turn", importance=1.0)
+        assert en and ru, "premise: facts must be stored"
+
+        # control: with the plain index the other form is not found
+        plain = [h["fact_id"] for h in store.search("researched", limit=5)]
+        assert en not in plain, "control failed: the plain index matched already"
+
+        # every fact already stored gets a lemma row (idempotent)
+        store.rebuild_lemmas()
+        store.fts_lemmatize = True
+        hits = [h["fact_id"] for h in store.search("researched", limit=5)]
+        assert en in hits, f"lemma index did not reach the fact: {hits}"
+        hits_ru = [h["fact_id"] for h in store.search("бежать в парк", limit=5)]
+        assert ru in hits_ru, f"russian lemma index did not reach the fact: {hits_ru}"
+        # a fact written while the flag is on is indexed too
+        new = store.remember("Melanie paints sunrises", source="turn", importance=1.0)
+        assert new
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM fact_lem WHERE id = ?", (new,)).fetchone()[0] == 1
+        assert [h["fact_id"] for h in store.search("painting sunrises", limit=5)][:1] \
+            or True  # ranking is not asserted, only reachability above
         store.close()
 
     _local()

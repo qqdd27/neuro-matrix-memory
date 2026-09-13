@@ -244,6 +244,15 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                         logger.info("neuromatrix: structured %d pre-existing facts", n)
                 except Exception as e:  # noqa: BLE001 - never break the agent
                     logger.debug("neuromatrix structure backfill failed: %s", e)
+                try:
+                    # Same reasoning for the lemma index: a channel that only
+                    # applies to facts written after an update is invisible on
+                    # the data a user already has.
+                    m = self._store.rebuild_lemmas(limit=5000)
+                    if m:
+                        logger.info("neuromatrix: indexed %d pre-existing facts by lemma", m)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("neuromatrix lemma backfill failed: %s", e)
 
             threading.Thread(target=_run, name="neuromatrix-structure-backfill",
                              daemon=True).start()

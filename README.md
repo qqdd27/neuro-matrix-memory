@@ -508,6 +508,53 @@ the window look more authoritative and the model stops saying "no information".
 The honest summary of the whole ordering line of work: **nothing that reorders
 the window has beaten leaving it alone**, measured four ways.
 
+## Meaning as morphology: one lemma per concept
+
+The second language law worth applying — after roles from case — is the one that
+makes a dictionary possible at all: an inflected word is a LEMMA plus features
+(tense, case, number), so "бежал / бежит / бежать" and "research / researching /
+researched" denote one concept. A lexical index keyed on SURFACE forms treats them
+as unrelated strings, so a question phrased in one form cannot reach a fact phrased
+in another. Measured on the full population (k=8), with everything else unchanged:
+
+| | shipped before | with the lemma index |
+|---|---|---|
+| **overall** | 57.8% | **62.8%** |
+| single-hop | 46.3% | **57.7%** |
+| multi-hop | 29.2% | **34.8%** |
+| temporal | 66.9% | 67.5% |
+| open-domain | 62.5% | 64.9% |
+| adversarial | 60.3% | 64.3% |
+
+Every category improves; single-hop — the largest class — gains 11.4 pp. This is
+the biggest single step since the lexical channel was revived, and it costs no
+model: pymorphy for Russian, Snowball for English, both optional, memoised at
+0.05 ms/word, and it degrades to identity when neither is installed.
+
+Why it is safe where four graph experiments were not: normalisation **narrows**
+rather than widens. It introduces no new candidates and cannot displace a correct
+hit — it only makes an existing fact reachable from more of its own forms.
+
+Three defects surfaced while building it, each caught by a test rather than by
+reasoning:
+
+- **Russian names were dropped by the write filter.** `extract_entities` gated
+  Cyrillic proper nouns on position ("sentence-initial capitalisation is
+  ambiguous"), so "Каролина изучала модели памяти" produced ZERO entities and was
+  discarded entirely as ephemeral — while Latin names had already had that gate
+  removed. Fixed by accepting a morphologically CONFIRMED name (Name/Surn/Patr in
+  ANY parse, since pymorphy tags "каролина" as a Geox first and a Name later) in
+  any position, keeping the gate for unverified words so "Новый факт…" and
+  "Привет…" stay discarded.
+- **A query with no resolvable entity returned nothing at all.** Fusion bailed
+  out whenever the heuristic list had fewer than two entries, so the text match
+  was never consulted: asking for "кеш" with no named entity produced an empty
+  result even when facts contained the word. Now an empty heuristic window lets
+  the lexical channel answer alone; a single hit keeps the old path.
+- **Channels bypassed the lifecycle filter.** Every channel returns bare ids and
+  the materialisation step re-fetched them without checking `archived` or
+  `active_until`, so a superseded decision could resurface through text search.
+
 ## Development
 
 ```bash

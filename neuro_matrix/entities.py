@@ -195,11 +195,32 @@ def extract_entities(text: str, max_entities: int = 16) -> list[str]:
     # it measurably fixed a real, reproduced recall gap for its original,
     # narrower case (a genuine RU proper noun mid-sentence); the edge case is
     # now documented rather than silently unknown.
-    for w in _titlecase_candidates(_TITLECASE_RU_RE, text):
-        key = w.lower()
-        if key in STOPWORDS or key in found or len(key) > 30:
-            continue
-        found.append(key)
+    # Cyrillic proper nouns.  The position gate stays for an UNVERIFIED
+    # capitalised word — sentence-initial capitalisation is ambiguous ("Новый
+    # факт…", "Привет…"), and dropping the gate outright produced fake entities
+    # and broke five tests.  A morphologically CONFIRMED name is accepted in any
+    # position, because this engine's own "Speaker: message" convention puts the
+    # single most important entity first every time: measured on a live fact,
+    # "Каролина изучала модели памяти" yielded ZERO entities and was therefore
+    # discarded by the write-path importance filter, while "Новый факт…" must
+    # stay discarded.
+    try:
+        from .morphology import is_proper_name as _ru_confirmed_name
+    except Exception:  # noqa: BLE001 - optional dependency
+        def _ru_confirmed_name(word: str) -> bool:  # type: ignore[misc]
+            return False
+
+    for sent in re.split(r"(?<=[.!?])\s+", text):
+        head = _WORD_START_RE.search(sent)
+        head_start = head.start() if head else -1
+        for m in _TITLECASE_RU_RE.finditer(sent):
+            w = m.group(1)
+            if m.start() == head_start and not _ru_confirmed_name(w):
+                continue  # sentence-initial capitalisation is ambiguous
+            key = w.lower()
+            if key in STOPWORDS or key in found or len(key) > 30:
+                continue
+            found.append(key)
     return found[:max_entities]
 
 
