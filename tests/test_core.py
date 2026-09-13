@@ -2151,13 +2151,16 @@ def test_lemma_index_matches_a_word_to_its_other_forms():
         ru = store.remember("Каролина бежала в парк утром", source="turn", importance=1.0)
         assert en and ru, "premise: facts must be stored"
 
-        # control: with the plain index the other form is not found
+        # control: with the lemma index OFF the other form is not found
+        store.fts_lemmatize = False
+        store._cache.clear()
         plain = [h["fact_id"] for h in store.search("researched", limit=5)]
         assert en not in plain, "control failed: the plain index matched already"
 
         # every fact already stored gets a lemma row (idempotent)
         store.rebuild_lemmas()
         store.fts_lemmatize = True
+        store._cache.clear()
         hits = [h["fact_id"] for h in store.search("researched", limit=5)]
         assert en in hits, f"lemma index did not reach the fact: {hits}"
         hits_ru = [h["fact_id"] for h in store.search("бежать в парк", limit=5)]
