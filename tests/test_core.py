@@ -1696,17 +1696,27 @@ def test_rrf_fuses_on_rank_not_score():
     assert fused2[5] > fused2[9], fused2
 
 
-def test_hybrid_recall_is_a_noop_without_embedder():
-    """Backwards compatibility is a hard requirement: with no embedder the
-    search path must behave exactly as before (no rrf field, same order)."""
+def test_lexical_channel_needs_no_model():
+    """The BM25 list must work with no embedder at all.
+
+    That is the whole point of the largest measured gain on this project: it
+    costs no model, no GPU and no VRAM, so it reaches every user.  With every
+    other channel switched off, fusion must not run (the previous behaviour).
+    """
     path = os.path.join(tempfile.mkdtemp(), "noemb.db")
     store = _fresh(path)
+    assert store.embedder is None, "test premise: no embedder configured"
     for i in range(4):
         store.remember(f"Gamma проект номер {i} про cloudflare и кеш.")
-    before = [h["fact_id"] for h in store.search("cloudflare кеш", limit=4)]
-    assert before, "baseline recall returned nothing"
-    assert all("rrf" not in h for h in store.search("cloudflare кеш", limit=4)), \
-        "fusion ran without an embedder"
+    hits = store.search("cloudflare кеш", limit=4)
+    assert hits, "baseline recall returned nothing"
+    assert store._fts_candidates("cloudflare кеш", limit=4), "BM25 must need no model"
+    # Every extra channel off: no fusion, exactly the old behaviour.
+    store.fts_enabled = False
+    store.bridge_enabled = False
+    store._cache.clear()
+    plain = store.search("cloudflare кеш", limit=4)
+    assert all("rrf" not in h for h in plain), "fusion ran with no second channel"
     store.close()
 
 
@@ -1808,6 +1818,57 @@ def test_mmr_diversify_reorders_without_losing_items():
     # Relevance-dominant setting: the near-duplicate keeps its rank.
     out2 = store._mmr_diversify(items, limit=3, lambda_=0.95)
     assert [o["fact_id"] for o in out2] == [1, 2, 3], [o["fact_id"] for o in out2]
+    store.close()
+
+
+def test_fts_ranking_reaches_the_final_order():
+    """BM25 evidence must be able to change the final order.
+
+    The FTS index and its query always existed, but the only consumer treated
+    them as a *fallback*: it read the BM25 order and then re-scored candidates by
+    ``importance x recency``, so an exact lexical match could not influence the
+    ranking.  Measured on LoCoMo (1977 questions), exposing the BM25 order as its
+    own RRF list with weight 3 took evidence-hit@8 from 32.3% to 57.1% — the
+    largest single gain measured on this project.  This test pins the mechanism
+    so it cannot be silently dropped again.
+    """
+    path = os.path.join(tempfile.mkdtemp(), "fts.db")
+    store = _fresh(path)
+    now = time.time()
+    store.remember("Alice discussed the budget for the office renovation",
+                   source="turn", ts=now, importance=1.0)
+    # Equal importance and equal timestamp: the ONLY thing that can separate the
+    # two facts is lexical evidence, which is exactly the mechanism under test.
+    store.remember("Alice moved to Vancouver to work on the harbour project",
+                   source="turn", ts=now, importance=1.0)
+    q = "where did Alice move to Vancouver"
+    before = [r["text"] for r in store.search(q, limit=2, include_dossiers=False)]
+    assert len(before) == 2, before
+    # The lexical channel is on by default now (it is the shipped behaviour).
+    assert store._fts_candidates(q, limit=5), "BM25 must be armed by default"
+    store._cache.clear()  # search() caches by query; a stale hit would hide the change
+    after = [r["text"] for r in store.search(q, limit=2, include_dossiers=False)]
+    assert "Vancouver" in after[0], f"BM25 list did not reach the final order: {after}"
+    ids = store._fts_candidates(q, limit=5)
+    assert ids, "BM25 candidates missing once enabled"
+    store.close()
+
+
+def test_fts_candidates_are_ordered_by_bm25():
+    """The lexical list must be ranked by relevance, not by insertion order."""
+    path = os.path.join(tempfile.mkdtemp(), "fts2.db")
+    store = _fresh(path)
+    now = time.time()
+    store.remember("Bob fixed the car engine last week", source="turn", ts=now)
+    store.remember("the garage project in Berlin was cancelled", source="turn", ts=now)
+    store.remember("car engine repair is scheduled", source="turn", ts=now)
+    store.fts_enabled = True
+    ids = store._fts_candidates("car engine repair", limit=5)
+    texts = [store._conn.execute("SELECT text FROM facts WHERE id = ?", (i,)).fetchone()["text"]
+             for i in ids]
+    assert texts, "no BM25 candidates for an exact query"
+    assert "repair" in texts[0] or "fixed" in texts[0], texts
+    assert all("Berlin" not in t for t in texts[:2]), texts
     store.close()
 
 

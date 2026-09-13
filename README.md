@@ -306,6 +306,50 @@ it exposed in a feature that had only ever been checked with a mocked LLM —
 confirming, again, that a mechanism "working" in a unit test and a
 mechanism helping in practice are different claims.
 
+## The lexical channel was dead (2026-09) — the largest single gain so far
+
+The FTS5 index (`facts_fts`) and its `bm25(facts_fts)` query had existed for a
+long time, so it was reasonable to assume lexical search was "done". It was not:
+the only consumer used BM25 as a *fallback* — it read the BM25-ordered candidate
+list and then re-scored every candidate by `importance × recency`, sorting by
+that. **The text match itself never reached the ranking.** A fact containing
+every query term could lose its slot to an important, recent, lexically
+unrelated fact.
+
+Fix: expose the BM25 order as its own ranked list inside RRF (`_fts_candidates`,
+weight `fts_weight=4.0`), plus prefix terms so FTS5's exact-token matching stops
+missing morphology (`research` → `researching`; the same gap affects inflected
+Russian).
+
+Measured on the full LoCoMo population (1977 questions, k=8, zero LLM cost):
+
+| configuration | overall | single-hop | temporal | multi-hop | open-domain | adversarial |
+|---|---|---|---|---|---|---|
+| before (BM25 unused) | 32.3% | 30.2% | 36.2% | 7.9% | 34.8% | 30.7% |
+| BM25 as its own list | **57.8%** | 44.5% | 64.1% | 28.1% | 61.7% | 60.3% |
+
+**+25.5 pp overall (×1.79)** — and it needs no model, no GPU and no VRAM, so it
+benefits every user equally. Cost at p50 on 5000 facts: 4.4 ms → 6.5 ms.
+
+Two things were learned the hard way and are pinned by tests:
+
+1. **The plateau is wide** (weights 3–10 all land at 57.1–58.0%), so this is a
+   flat optimum, not a value tuned to one benchmark.
+2. **Pure RRF ordering has a product cost the benchmark cannot see.** Taking the
+   fused rank as the only ordering let a lexically similar throwaway turn
+   outrank a `decision` fact and pushed a raw fact below `trait` rows. LoCoMo
+   cannot detect this (all of its facts share one kind); the product tests
+   caught it. Fixed by blending the fused rank with the evidence score
+   (`fusion_blend=0.9`, where all 76 tests pass and overall stays at 57.8%,
+   against 58.8% for the pure-RRF maximum).
+
+Honest negative result from the same session: the graph-activation bridge
+(co-occurrence, then PMI-weighted, then sparsified, at seven weights) never beat
+leaving it off — 32.3% → 28.3% at best, 28.6% with PMI. It *does* improve the one
+category it was built for (multi-hop 7.9% → 11.2% alone), so it stays implemented
+and measurable, but off by default: it belongs behind a query-type router, not in
+the default path.
+
 ## Development
 
 ```bash

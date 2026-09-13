@@ -199,7 +199,13 @@ def _dia_map(conv: dict) -> dict[str, str]:
 def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               qa_filter: "set[tuple[str, str]] | None" = None,
               rerank: bool = False, use_reader: bool = True,
-              use_memory: bool = True, embedder=None) -> dict:
+              use_memory: bool = True, embedder=None,
+              no_bridge: bool = False, bridge_weight: float = 1.0,
+              bridge_min_act: float = 0.0, bridge_max_entities: int = 0,
+              bridge_adaptive: bool = False, bridge_edge: str = "count",
+              bridge_topk: int = 0, fts: "bool | None" = None,
+              fts_weight: "float | None" = None,
+              fusion_blend: "float | None" = None) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -211,6 +217,19 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     # silently start no-op'ing rerank/reader calls partway through a single
     # long conversation's questions.
     store = NeuroMatrixStore(path, llm=llm, llm_daily_budget=100_000)
+    if no_bridge:
+        store.bridge_enabled = False
+    store.bridge_weight = float(bridge_weight)
+    store.bridge_min_activation = float(bridge_min_act)
+    store.bridge_max_entities = int(bridge_max_entities)
+    store.bridge_adaptive = bool(bridge_adaptive)
+    store.bridge_edge_weight = str(bridge_edge)
+    store.bridge_topk = int(bridge_topk)
+    store.fts_enabled = True if fts is None else bool(fts)
+    if fts_weight is not None:
+        store.fts_weight = float(fts_weight)
+    if fusion_blend is not None:
+        store.fusion_blend = float(fusion_blend)
     base_ts = time.time() - 400 * 86400
     for i, sk in enumerate(session_keys):
         dt_str = conv.get(f"{sk}_date_time", "")
@@ -340,6 +359,51 @@ def main(argv=None) -> int:
     ap.add_argument("--embed-model", default="",
                     help="embedding model name for --embeddings (EMPTY = auto-detect)")
     ap.add_argument("--embed-url", default="http://127.0.0.1:11434")
+    ap.add_argument("--no-bridge", action="store_true",
+                    help="disable graph-activation bridges (the multi-hop part of "
+                         "hybrid recall). Graph bridges need no model and no "
+                         "download, so this exists to isolate their contribution "
+                         "against the pure heuristic/lexical baseline.")
+    ap.add_argument("--bridge-weight", type=float, default=1.0,
+                    help="weight of the bridge list inside RRF. Unweighted (1.0) "
+                         "measured WORSE overall (28.3%% vs 32.3%%) while doubling "
+                         "multi-hop (7.9%% -> 11.2%%): the bridge list is broad and "
+                         "out-votes the precise heuristic list. Lower values keep "
+                         "the multi-hop gain without the regression.")
+    ap.add_argument("--bridge-min-act", type=float, default=0.0,
+                    help="drop bridge entities below this activation (0 = keep all). "
+                         "Locality knob: the heat-kernel literature localises a "
+                         "neighbourhood better than PPR's long random-walk tail.")
+    ap.add_argument("--bridge-max-entities", type=int, default=0,
+                    help="cap how many activated entities may contribute bridges "
+                         "(0 = no cap)")
+    ap.add_argument("--bridge-edge", choices=("count", "pmi"), default="count",
+                    help="edge weight for graph activation. 'count' = raw "
+                         "co-occurrence (the original: the transcript graph is "
+                         "nearly complete, so activation spreads everywhere and "
+                         "trades hits instead of adding them). 'pmi' = mutual "
+                         "information, so only specific associations carry weight.")
+    ap.add_argument("--bridge-topk", type=int, default=0,
+                    help="keep only each node's K strongest neighbours (0 = all). "
+                         "Cheap localisation in place of a heat-kernel solver.")
+    ap.add_argument("--fts", action="store_true",
+                    help="add the BM25/FTS5 lexical ranking as its own list inside "
+                         "RRF. The index always existed but its ranking never "
+                         "reached the score: candidates found by BM25 were re-scored "
+                         "by importance x recency, so a fact matching every query "
+                         "token could lose to an important but unrelated one.")
+    ap.add_argument("--no-fts", action="store_true",
+                    help="disable the BM25 lexical channel (it is ON by default)")
+    ap.add_argument("--fusion-blend", type=float, default=None,
+                    help="1.0 = pure RRF order; lower values let the evidence "
+                         "score (kind priority, importance, content relevance) "
+                         "share the final ordering")
+    ap.add_argument("--fts-weight", type=float, default=None,
+                    help="weight of the BM25 list inside RRF")
+    ap.add_argument("--bridge-adaptive", action="store_true",
+                    help="only add bridges when the entity/lexical path returned "
+                         "few confident hits — i.e. answer the questions it cannot, "
+                         "instead of displacing the ones it already answers")
     args = ap.parse_args(argv)
 
     data_path = Path(args.data)
@@ -395,7 +459,14 @@ def main(argv=None) -> int:
     for sample in data:
         r = run_sample(sample, args.k, llm=llm, qa_filter=qa_filter,
                        rerank=use_rerank, use_reader=use_reader,
-                       use_memory=not args.no_memory, embedder=embedder)
+                       use_memory=not args.no_memory, embedder=embedder,
+                       no_bridge=args.no_bridge, bridge_weight=args.bridge_weight,
+                       bridge_min_act=args.bridge_min_act,
+                       bridge_max_entities=args.bridge_max_entities,
+                       bridge_adaptive=args.bridge_adaptive,
+                       bridge_edge=args.bridge_edge, bridge_topk=args.bridge_topk,
+                       fts=(False if args.no_fts else None), fts_weight=args.fts_weight,
+                       fusion_blend=args.fusion_blend)
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

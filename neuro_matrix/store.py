@@ -405,6 +405,46 @@ class NeuroMatrixStore:
         # MMR diversity is available but off by default (see _mmr_diversify):
         # it must be measured, not assumed.
         self.mmr_enabled = False
+        # Graph-activation bridges (multi-hop evidence).  Costs no model and no
+        # download — it runs on the association graph this store already has —
+        # but measurement (below) says it must stay OFF by default.
+        self.bridge_enabled = False
+        # Measured, and disappointing: the co-occurrence graph is nearly complete
+        # in a conversation transcript, so activation spreads everywhere and the
+        # bridge list only displaces precise hits.  Every weight tried was worse
+        # than leaving it off (overall hit@8: off 32.3% -> 28.3% at weight 1.0),
+        # and PMI-weighted edges were worse still (28.6%); with BM25 in place it
+        # also costs (58.0% -> 56.7%).  Its one real signal is multi-hop
+        # (7.9% -> 11.2% alone, 28.1% -> 30.3% at weight 4 over BM25), which is
+        # why it stays implemented and measurable instead of being deleted —
+        # it belongs behind a query-type router, not in the default path.
+        # Weight of the bridge list inside RRF (see _apply_fusion).
+        self.bridge_weight = 1.0
+        # Localisation knobs for graph bridges (see _bridge_candidates): raw
+        # activation is too broad to fuse safely.  Defaults keep the previous
+        # behaviour so a change here is always a measured decision.
+        self.bridge_min_activation = 0.0
+        self.bridge_max_entities = 0
+        self.bridge_adaptive = False
+        # Edge weighting for graph activation: "count" (raw co-occurrence, the
+        # original) or "pmi" (specificity-weighted).  Measured: raw counts make
+        # the transcript graph nearly complete, so activation spreads to
+        # everything and trades hits instead of adding them.
+        self.bridge_edge_weight = "count"
+        # Keep only each node's K strongest neighbours (0 = keep all).
+        self.bridge_topk = 0
+        # Lexical (BM25/FTS5) list inside RRF.  ON by default: measured on LoCoMo
+        # (1977 questions, k=8) this single change took evidence-hit@8 from 32.3%
+        # to 57.1-58.0%, the largest gain ever measured in this project — and it
+        # needs no model, no GPU and no VRAM, so it helps every user equally.
+        # The plateau is wide (weight 3..10 all land at 57.1-58.0%), so this is
+        # not a tuned value: 4.0 is the middle of a flat optimum.  The index was
+        # always maintained; only the *use* of its ranking was missing.
+        self.fts_enabled = True
+        self.fts_weight = 4.0
+        # How much the fused rank decides the final order vs the evidence score
+        # (see _apply_fusion).  1.0 = pure RRF, which loses kind priority.
+        self.fusion_blend = 0.9
 
     # ------------------------------------------------------------------ write
 
@@ -972,6 +1012,14 @@ class NeuroMatrixStore:
             return {}
         total = sum(float(v) for v in seeds.values()) or 1.0
         p = {int(k): float(v) / total for k, v in seeds.items()}
+        edge_mode = str(getattr(self, "bridge_edge_weight", "count") or "count").lower()
+        topk = int(getattr(self, "bridge_topk", 0) or 0)
+        # Total mention volume, needed to turn raw co-occurrence counts into
+        # pointwise mutual information (see below).  Cheap: one aggregate.
+        _tot = 0.0
+        if edge_mode == "pmi":
+            _r = self._conn.execute("SELECT SUM(hits) s FROM entities").fetchone()
+            _tot = float((_r["s"] if _r else 1.0) or 1.0)
         act = dict(p)
         for _ in range(max(1, int(iterations))):
             nodes = [n for n, w in act.items() if w > 1e-6]
@@ -985,12 +1033,60 @@ class NeuroMatrixStore:
                 [*nodes, *nodes]).fetchall()
             if not rows:
                 break
+            node_ids: set[int] = set()
+            for r in rows:
+                node_ids.add(int(r["a"]))
+                node_ids.add(int(r["b"]))
+            hits_map: dict[int, float] = {}
+            if edge_mode == "pmi" and node_ids:
+                _ph2 = ",".join("?" * len(node_ids))
+                for hr in self._conn.execute(
+                        f"SELECT id, hits FROM entities WHERE id IN ({_ph2})",
+                        list(node_ids)).fetchall():
+                    hits_map[int(hr["id"])] = float(hr["hits"] or 1.0)
+
+            def _edge_w(cnt: float, stab: float, a: int, b: int) -> float:
+                """Edge conductance.
+
+                ``count`` (the original) is pure co-occurrence: in a
+                conversation transcript almost every entity co-occurs with
+                almost every frequent one, so the graph is nearly complete and
+                activation spreads everywhere — measured: multi-hop rose
+                7.9% -> 11.2% but overall fell 32.3% -> 28.3%, i.e. the graph
+                traded hits rather than adding them.  ``pmi`` divides the
+                co-occurrence by how often each side occurs on its own, so
+                ubiquitous hub pairs stop dominating and only *specific*
+                associations carry weight.  Negative PMI becomes 0 (an
+                association weaker than chance is not an association).
+                """
+                if edge_mode == "pmi":
+                    ha = max(1.0, hits_map.get(a, 1.0))
+                    hb = max(1.0, hits_map.get(b, 1.0))
+                    pmi = math.log((max(1.0, cnt) * max(1.0, _tot)) / (ha * hb))
+                    return max(0.0, pmi) * (1.0 + stab)
+                return cnt * (1.0 + stab)
+
             edges: list[tuple[int, int, float]] = []
             deg: dict[int, float] = {}
+            adj: dict[int, list[tuple[int, float]]] = {}
             for r in rows:
                 a, b = int(r["a"]), int(r["b"])
-                w = float(r["count"] or 1.0) * (1.0 + float(r["stability"] or 0.0))
+                w = _edge_w(float(r["count"] or 1.0), float(r["stability"] or 0.0), a, b)
+                if w <= 0.0:
+                    continue
                 edges.append((a, b, w))
+                adj.setdefault(a, []).append((b, w))
+                adj.setdefault(b, []).append((a, w))
+            # Optional sparsification: keep only each node's K strongest
+            # neighbours, which is the cheap way to buy locality (the heat
+            # kernel's localisation) without solving a diffusion kernel.
+            if topk > 0:
+                keep: set[tuple[int, int]] = set()
+                for node, nbrs in adj.items():
+                    for other, _w in sorted(nbrs, key=lambda kv: kv[1], reverse=True)[:topk]:
+                        keep.add((min(node, other), max(node, other)))
+                edges = [(a, b, w) for (a, b, w) in edges if (min(a, b), max(a, b)) in keep]
+            for a, b, w in edges:
                 deg[a] = deg.get(a, 0.0) + w
                 deg[b] = deg.get(b, 0.0) + w
             new: dict[int, float] = {}
@@ -1011,8 +1107,26 @@ class NeuroMatrixStore:
 
     def _bridge_candidates(self, seeds: dict[int, float], *, limit: int = 20) -> list[int]:
         """Facts reachable only through the graph — the 'bridge' evidence a
-        multi-hop question needs and keyword matching cannot produce."""
+        multi-hop question needs and keyword matching cannot produce.
+
+        Two localisation knobs exist because a RAW activation list is too broad
+        to fuse safely: at equal weight the bridge list out-voted the precise
+        heuristic list and overall hit@8 fell from 32.3% to 28.3% while
+        multi-hop rose 7.9% -> 11.2%.  Diffusion that spreads to every reachable
+        entity is the textbook failure mode here — the heat-kernel literature
+        (Chung, PNAS 2007) makes the same point, that a heat kernel localises a
+        neighbourhood better than PPR's longer random-walk tail.  These knobs
+        are how that locality is expressed without a full heat-kernel solver.
+        """
         active = self._spreading_activation(seeds, top=max(8, int(limit) // 2))
+        if not active:
+            return []
+        min_act = float(getattr(self, "bridge_min_activation", 0.0) or 0.0)
+        if min_act > 0.0:
+            active = {k: v for k, v in active.items() if v >= min_act}
+        max_ent = int(getattr(self, "bridge_max_entities", 0) or 0)
+        if max_ent > 0:
+            active = dict(sorted(active.items(), key=lambda kv: kv[1], reverse=True)[:max_ent])
         if not active:
             return []
         ids = list(active)
@@ -1031,23 +1145,84 @@ class NeuroMatrixStore:
                 best[fid] = w
         return [fid for fid, _ in sorted(best.items(), key=lambda kv: kv[1], reverse=True)][:int(limit)]
 
+    def _fts_candidates(self, query: str, *, limit: int = 40) -> list[int]:
+        """Lexical candidates ordered by BM25 — exposed as a real signal.
+
+        The index and the query already existed (``facts_fts``,
+        ``bm25(facts_fts)``), but their only consumer treated them as a
+        *fallback*: it read the BM25 order and then scored those candidates by
+        ``0.35 * importance * recency`` and sorted by that, so the text match
+        itself could not influence the final ranking.  A fact matching every
+        query token could lose its slot to an important but lexically unrelated
+        one.  Returning the BM25 order as its own ranked list lets RRF weigh
+        lexical evidence alongside entity evidence.
+
+        Matching reuses the fallback path's construction (tokens ->
+        morphological variants -> curated synonyms, OR-ed) so the two cannot
+        drift apart.
+        """
+        if not getattr(self, "fts_enabled", False):
+            return []
+        tokens = [t for t in re.findall(r"[0-9A-Za-zА-Яа-яЁё]{3,}", query.lower())
+                  if t not in STOPWORDS]
+        if not tokens:
+            return []
+        parts: list[str] = []
+        for t in tokens[:8]:
+            if re.search(r"[а-яё]", t) and len(t) >= 4:
+                variants = list(_ru_variants(t))
+            else:
+                variants = [t]
+            for v in list(variants):
+                for sv in _synonym_variants(v):
+                    if sv not in variants:
+                        variants.append(sv)
+            opts = [f'"{v}"' for v in variants]
+            if len(t) >= 4:
+                # FTS5 matches whole tokens, so a query for "research" misses
+                # "researching" — the relevant fact then gets no lexical signal
+                # and empty filler that merely repeats a speaker's name takes the
+                # slots.  A prefix term fixes the morphology gap for both English
+                # ("research" -> researching/researcher) and inflection.
+                opts.append(f"{t}*")
+            parts.append("( " + " OR ".join(opts) + " )")
+        match_q = " OR ".join(parts)
+        try:
+            rows = self._conn.execute(
+                "SELECT facts_fts.rowid AS id FROM facts_fts "
+                "JOIN facts f ON f.id = facts_fts.rowid "
+                "WHERE facts_fts MATCH ? AND f.archived = 0 "
+                "ORDER BY bm25(facts_fts) LIMIT ?",
+                (match_q, int(max(1, limit)))).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [int(r["id"]) for r in rows]
+
     def _apply_fusion(self, query: str, results: list[dict[str, Any]], limit: int,
                       q_entities: Optional[dict[int, float]] = None) -> list[dict[str, Any]]:
-        """Fuse up to three ranked lists — heuristic, dense (embeddings) and
-        bridge (graph activation) — with Reciprocal Rank Fusion.
+        """Fuse up to four ranked lists — heuristic, lexical (BM25), dense
+        (embeddings) and bridge (graph activation) — with Reciprocal Rank
+        Fusion.
 
         RRF decides ORDER only: the ``score`` field is left untouched so a
         caller's min-score gate keeps meaning what it meant before (an RRF
         value is ~1/20, an entirely different scale).  Any list that cannot be
-        produced (no embedder, no graph) is simply absent; with fewer than two
-        lists the original order is returned unchanged.
+        produced (no embedder, no graph, FTS disabled) is simply absent; with
+        fewer than two lists the original order is returned unchanged.
         """
         if len(results) < 2:
             return results
         lists: list[list[int]] = []
+        weights: list[float] = []
         heuristic_ids = [int(r["fact_id"]) for r in results if r.get("fact_id") is not None]
         if heuristic_ids:
             lists.append(heuristic_ids)
+            weights.append(1.0)
+
+        fts_ids = self._fts_candidates(query, limit=max(limit * 3, 20))
+        if fts_ids:
+            lists.append(fts_ids)
+            weights.append(float(getattr(self, "fts_weight", 1.0)))
 
         emb = self.embedder
         if emb is not None and getattr(emb, "available", lambda: False)():
@@ -1069,26 +1244,62 @@ class NeuroMatrixStore:
                     dense = [fid for fid, sim in scored[: max(limit * 6, 60)] if sim > 0.45]
                     if dense:
                         lists.append(dense)
+                        weights.append(1.0)
             except Exception:  # noqa: BLE001 - dense must never break recall
                 pass
 
-        if q_entities:
+        if q_entities and getattr(self, "bridge_enabled", True):
             try:
-                bridge = self._bridge_candidates(q_entities, limit=max(limit * 3, 24))
+                # Adaptive routing: bridges exist to answer what the
+                # entity/lexical path cannot.  When that path already returned a
+                # full window of confident hits, a broad graph list can only
+                # displace them (that is exactly what the unweighted run
+                # measured), so only add it when the precise path came up short.
+                use_bridge = True
+                if getattr(self, "bridge_adaptive", False):
+                    strong = [r for r in results if float(r.get("score") or 0.0) >= 1.0]
+                    use_bridge = len(strong) < max(2, int(limit) // 2)
+                bridge = self._bridge_candidates(q_entities, limit=max(limit * 3, 24)) if use_bridge else []
                 if bridge:
                     lists.append(bridge)
+                    # Bridge lists are broad by construction (everything the
+                    # graph can reach), so at equal weight they out-vote the
+                    # precise heuristic list and cost more than they add: an
+                    # unweighted run measured 28.3% overall vs 32.3% without
+                    # bridges, while multi-hop rose 7.9% -> 11.2%.  The weight is
+                    # the knob that keeps the multi-hop gain without the rest.
+                    weights.append(float(getattr(self, "bridge_weight", 1.0)))
             except Exception:  # noqa: BLE001 - graph must never break recall
                 pass
 
         if len(lists) < 2:
             return results
-        fused = reciprocal_rank_fusion(lists, k=int(self.hybrid_rrf_k))
+        fused = reciprocal_rank_fusion(lists, k=int(self.hybrid_rrf_k), weights=weights)
         by_id = {int(r["fact_id"]): r for r in results if r.get("fact_id") is not None}
         missing = [i for i in fused if i not in by_id]
         if missing:
             for r in self._materialize_hits(missing[: max(limit * 2, 20)]):
                 by_id[int(r["fact_id"])] = r
-        order = sorted(by_id, key=lambda i: fused.get(i, 0.0), reverse=True)
+        # Final order blends RRF with the original evidence score.  Pure RRF
+        # ignores everything that score encodes (kind priority, importance,
+        # confidence, content relevance) and that is a real, product-visible
+        # regression: a lexically similar ephemeral turn outranked a `decision`
+        # fact, and a raw fact was pushed below `trait` rows.  LoCoMo cannot see
+        # it — all of its facts share one kind — while the product tests catch it
+        # immediately, which is why both exist.  blend=1.0 keeps pure RRF.
+        blend = float(getattr(self, "fusion_blend", 1.0))
+        if blend < 1.0:
+            _max_rrf = max([fused.get(i, 0.0) for i in by_id] + [1e-9])
+            _max_score = max([float(by_id[i].get("score") or 0.0) for i in by_id] + [1e-9])
+
+            def _key(i: int) -> float:
+                r = fused.get(i, 0.0) / _max_rrf
+                s = float(by_id[i].get("score") or 0.0) / _max_score
+                return blend * r + (1.0 - blend) * s
+
+            order = sorted(by_id, key=_key, reverse=True)
+        else:
+            order = sorted(by_id, key=lambda i: fused.get(i, 0.0), reverse=True)
         out = []
         for fid in order:
             item = by_id[fid]
