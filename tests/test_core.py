@@ -1914,6 +1914,59 @@ def test_structural_channel_survives_a_fact_without_verbs():
     store.close()
 
 
+def test_role_bridge_links_facts_through_a_shared_participant():
+    """The structural bridge: two facts are related when they name the same
+    participant, NOT when they merely share words.
+
+    "Алиса подарила книгу Пете" and "книга лежала на столе" share the object
+    «книга», so a question about the book can reach the donation through it —
+    that is the multi-hop case the word-level graph could not do without linking
+    everything to everything.
+    """
+    from neuro_matrix.propositions import available
+
+    if not available("ru"):
+        return
+    path = os.path.join(tempfile.mkdtemp(), "rbridge.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    a = store.remember("Алиса подарила книгу Пете", source="turn", importance=1.0)
+    b = store.remember("Книга лежала на столе в Берлине", source="turn", importance=1.0)
+    c = store.remember("Борис купил зонт в Лондоне", source="turn", importance=1.0)
+    assert a and b and c, "premise: all three facts must be stored"
+    hop1 = store._slot_candidates("Где лежала книга?", limit=8)
+    assert b in [int(x) for x in hop1], f"hop 1 missed the book fact: {hop1}"
+    bridge = [int(x) for x in store._role_bridge_candidates("Где лежала книга?", limit=8, hop1=hop1)]
+    assert a in bridge, f"bridge did not link the gift through «книга»: {bridge}"
+    assert c not in bridge, f"bridge linked an unrelated fact: {bridge} (c={c})"
+    store.close()
+
+
+def test_role_bridge_ignores_pronouns():
+    """A bridge through «я» would link every fact to every other — the exact
+    failure mode of the co-occurrence graph, reintroduced by the back door."""
+    from neuro_matrix.propositions import available
+
+    if not available("ru"):
+        return
+    path = os.path.join(tempfile.mkdtemp(), "rbridge2.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    # durable kinds so the importance filter keeps them (bare dialogue turns
+    # without an anchor are dropped by design)
+    a = store.remember("Маша: я купила книгу", source="decision", kind="decision", importance=1.0)
+    b = store.remember("Петя: я купил зонт", source="decision", kind="decision", importance=1.0)
+    assert a and b, "premise: both facts must be stored"
+    rows = store._conn.execute("SELECT fact_id, agent FROM propositions ORDER BY fact_id").fetchall()
+    agents = {int(r["fact_id"]): str(r["agent"]) for r in rows}
+    assert agents.get(int(a)) == "маша", f"first person not resolved to the speaker: {agents}"
+    assert agents.get(int(b)) == "петя", f"first person not resolved to the speaker: {agents}"
+    # now a bridge: with the speaker resolved there is no shared participant, and
+    # a bridge through the pronoun itself would link unrelated facts
+    bridge = [int(x) for x in store._role_bridge_candidates(
+        "я купил зонт", limit=8, hop1=[int(b)])]
+    assert int(a) not in bridge, f"linked through the pronoun: {bridge}"
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

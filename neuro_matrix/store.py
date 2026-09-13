@@ -470,6 +470,11 @@ class NeuroMatrixStore:
         # installed, so the floor for every user is unchanged.
         self.slots_enabled = True
         self.slot_weight = 4.0
+        # Role-level bridge (shared participant -> another fact).  Off until
+        # measured: the co-occurrence bridge was a dead end, and this is the
+        # structurally honest version of the same idea.
+        self.role_bridge_enabled = False
+        self.role_bridge_weight = 1.0
         # How much the fused rank decides the final order vs the evidence score
         # (see _apply_fusion).  1.0 = pure RRF, which loses kind priority.
         self.fusion_blend = 0.9
@@ -617,29 +622,100 @@ class NeuroMatrixStore:
             named = {k: v for k, v in p.slots().items() if v}
             if not named:
                 continue
-            sentinel = "\x00"
-            score_expr = " + ".join(f"(CASE WHEN pr.{c} = ? THEN 1 ELSE 0 END)" for c in cols)
-            where_any = " OR ".join(f"pr.{c} = ?" for c in cols)
-            params: list[Any] = [named.get(c, sentinel) for c in cols]
-            params.append(p.predicate)
-            params.extend(named.get(c, sentinel) for c in cols)
-            sql = (f"SELECT pr.fact_id, ({score_expr}) AS hits, pr.fact_id AS fid "
-                   f"FROM propositions pr JOIN facts f ON f.id = pr.fact_id "
+            values = sorted(set(named.values()))
+            # Candidate pool: the participant appears in ANY role of the fact.
+            # Role-by-role comparison cannot be the filter, because the same
+            # inanimate noun lands in different roles on each side ("книга" is the
+            # object of a question but the subject of "Книга лежала…"), and an
+            # earlier version that filtered role-by-role returned nothing.
+            val_ph = ",".join("?" * len(values))
+            where_any = " OR ".join(f"pr.{c} IN ({val_ph})" for c in cols)
+            sql = (f"SELECT pr.fact_id, pr.agent, pr.patient, pr.recipient, "
+                   f"pr.instrument, pr.location FROM propositions pr "
+                   f"JOIN facts f ON f.id = pr.fact_id "
                    f"WHERE f.archived = 0 AND pr.predicate = ? AND ({where_any}) "
-                   f"ORDER BY hits DESC, pr.id DESC LIMIT ?")
+                   f"ORDER BY pr.id DESC LIMIT ?")
             try:
-                rows = self._conn.execute(sql, [*params, int(max(1, limit))]).fetchall()
+                rows = self._conn.execute(
+                    sql, [p.predicate, *list(values) * len(cols),
+                          int(max(1, limit))]).fetchall()
             except sqlite3.Error:
                 rows = []
             for r in rows:
                 fid = int(r["fact_id"])
-                hits = float(r["hits"] or 0)
-                if hits <= 0:
-                    continue
-                # 2.0 base + 1.0 per agreeing role: a fact matching the action
-                # and two roles outranks one matching the action alone.
-                scored[fid] = max(scored.get(fid, 0.0), 1.0 + hits)
+                exact = sum(1 for role, value in named.items()
+                            if str(r[role] or "") == value)
+                present = sum(1 for value in values
+                              if value in {str(r[c] or "") for c in cols})
+                if exact:
+                    # role AND participant agree: strongest signal
+                    score = 1.0 + exact
+                else:
+                    # participant agrees, role is a positional guess (the
+                    # nominative/accusative ambiguity above): partial credit
+                    score = 0.4 + 0.2 * present
+                scored[fid] = max(scored.get(fid, 0.0), score)
         return [fid for fid, _ in sorted(scored.items(), key=lambda kv: kv[1], reverse=True)][: int(limit)]
+
+    def _role_bridge_candidates(self, query: str, *, limit: int = 20,
+                                hop1: Optional[list[int]] = None) -> list[int]:
+        """Facts reachable through a SHARED PARTICIPANT — a role-level bridge.
+
+        Why not the co-occurrence graph: in a transcript almost every entity
+        co-occurs with every frequent one, so that graph is nearly complete and
+        activation spreads everywhere (measured: every weight made recall worse).
+        This bridge joins on role *values* instead — the same name in the same
+        slot — so the link means something concrete:
+
+            подарок(agent=маша, patient=книга)   +   книга(patient=книга, ...)
+
+        A question naming "книга" reaches the donation through the shared
+        object.  Nothing is joined on raw word overlap, only on participants.
+
+        Two hops: (1) facts whose roles overlap the question, (2) facts sharing a
+        participant with those.  Values that are too generic to identify anyone
+        ("i", "you", "the", single letters) are excluded, otherwise every fact
+        links to every other through a pronoun.
+        """
+        from .propositions import parse
+
+        generic = {"i", "you", "me", "we", "they", "he", "she", "it", "the", "a",
+                   "я", "ты", "вы", "мы", "он", "она", "они", "это", "все", "что"}
+        props = parse(query)
+        seeds: list[int] = [int(x) for x in (hop1 or [])]
+        # The bridge starts FROM facts already found.  An earlier version also
+        # seeded itself from the question's own participants and then excluded
+        # those same facts from its result — so it always returned nothing.
+        if not seeds:
+            return []
+        cols = ("agent", "patient", "recipient", "instrument", "location")
+        try:
+            # hop 2: facts sharing a participant with any seed fact
+            seed_ph = ",".join("?" * len(seeds))
+            values: set[str] = set()
+            for r in self._conn.execute(
+                    f"SELECT agent, patient, recipient, instrument, location "
+                    f"FROM propositions WHERE fact_id IN ({seed_ph})", seeds).fetchall():
+                for c in cols:
+                    v = r[c]
+                    if v and len(str(v)) > 2 and str(v) not in generic:
+                        values.add(str(v))
+            if not values:
+                return []
+            val_ph = ",".join("?" * len(values))
+            or_parts = " OR ".join(
+                f"(pr.{c} IS NOT NULL AND pr.{c} <> '' AND pr.{c} IN ({val_ph}))" for c in cols)
+            rows2 = self._conn.execute(
+                f"SELECT DISTINCT pr.fact_id FROM propositions pr "
+                f"JOIN facts f ON f.id = pr.fact_id "
+                f"WHERE f.archived = 0 AND ({or_parts}) "
+                f"ORDER BY pr.fact_id DESC LIMIT ?",
+                [*list(values)] * len(cols) + [int(max(1, limit))]).fetchall()
+        except sqlite3.Error:
+            return []
+        out = [int(r["fact_id"]) for r in rows2]
+        seen = set(seeds)
+        return [fid for fid in out if fid not in seen][: int(limit)]
 
     def add_turn(
         self,
@@ -1343,6 +1419,17 @@ class NeuroMatrixStore:
             if slot_ids:
                 lists.append(slot_ids)
                 weights.append(float(getattr(self, "slot_weight", 2.0)))
+
+        if getattr(self, "role_bridge_enabled", False):
+            try:
+                hop1 = self._slot_candidates(query, limit=max(limit * 2, 12))
+                bridge = self._role_bridge_candidates(
+                    query, limit=max(limit * 2, 16), hop1=hop1)
+            except Exception:  # noqa: BLE001 - bridges must never break recall
+                bridge = []
+            if bridge:
+                lists.append(bridge)
+                weights.append(float(getattr(self, "role_bridge_weight", 1.0)))
 
         emb = self.embedder
         if emb is not None and getattr(emb, "available", lambda: False)():

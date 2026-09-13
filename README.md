@@ -409,6 +409,27 @@ Measured on the full population (1977 questions):
 same sense as the embedder: without `pymorphy3`/`nltk` installed the channel is
 an empty list and behaviour is byte-identical to before (pinned by a test).
 
+**Honest negative: the role bridge does not help either (2026-09).** The natural
+next step after the structural channel was to link facts through a *shared
+participant* — `подарить(agent=маша, patient=книга)` is connected to any other
+fact naming «книга» — instead of through word co-occurrence. It is implemented
+(`_role_bridge_candidates`, two hops, pronouns excluded, pinned by two tests) and
+it does not pay off:
+
+| configuration | overall | multi-hop |
+|---|---|---|
+| structure only (shipped) | **58.9%** | 29.2% |
+| + role bridge, weight 0.5 | 57.9% | 28.1% |
+| + role bridge, weight 1.0 | 58.0% | 28.1% |
+| + role bridge, weight 2.0 | 57.8% | 28.1% |
+
+Consistent with the co-occurrence and PMI bridges before it: **any extra channel
+that adds a broad candidate list loses to leaving it out**, because the slate is
+finite and the precise lexical/role hits are exactly what gets displaced. Three
+different graph formulations, one verdict — the default path stays lexical +
+structural, and `role_bridge_enabled` remains off with the code kept for anyone
+who wants to retest it.
+
 ## Development
 
 ```bash
