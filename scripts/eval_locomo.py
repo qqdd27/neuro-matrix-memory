@@ -291,7 +291,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               role_bridge_weight: "float | None" = None,
               type_boost: bool = False,
               type_boost_weight: "float | None" = None,
-              edge_order: bool = False, fts_lemmas: bool = False) -> dict:
+              edge_order: bool = False, fts_lemmas: "bool | None" = None,
+              lemma_weight: "float | None" = None) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -326,7 +327,10 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     if type_boost_weight is not None:
         store.type_boost_weight = float(type_boost_weight)
     store.edge_order_enabled = bool(edge_order)
-    store.fts_lemmatize = bool(fts_lemmas)
+    if fts_lemmas is not None:
+        store.fts_lemmatize = bool(fts_lemmas)
+    if lemma_weight is not None:
+        store.lemma_weight = float(lemma_weight)
     if fts_lemmas:
         # Facts are written below through remember(), which indexes the lemma
         # form when the flag is on; nothing else to backfill in a fresh store.
@@ -543,9 +547,16 @@ def main(argv=None) -> int:
                     help="place the second-strongest fact LAST (readers attend to "
                          "the edges of a long context more than to its middle); "
                          "reordering only")
-    ap.add_argument("--fts-lemmas", action="store_true",
+    ap.add_argument("--fts-lemmas", dest="fts_lemmas", action="store_true", default=None,
                     help="morphological normalisation: index and query by LEMMA so "
-                         "'research' finds 'researching' and 'бежал' finds 'бежать'")
+                         "'research' finds 'researching' and 'бежал' finds 'бежать' "
+                         "(ON by default, mirroring the product)")
+    ap.add_argument("--no-lemmas", dest="fts_lemmas", action="store_false",
+                    help="turn the lemma channel off (surface index only)")
+    ap.add_argument("--lemma-weight", type=float, default=None,
+                    help="weight of the lemma channel inside RRF (default 2.0); the "
+                         "lemma index always runs BESIDE the surface index, never "
+                         "instead of it")
     ap.add_argument("--diag", type=int, default=0,
                     help="print N temporal questions with gold answer, retrieved "
                          "context and the reader's prediction (diagnosis mode)")
@@ -629,7 +640,8 @@ def main(argv=None) -> int:
                        type_boost=bool(args.type_boost),
                        type_boost_weight=args.type_boost_weight,
                        edge_order=bool(args.edge_order),
-                       fts_lemmas=bool(args.fts_lemmas))
+                       fts_lemmas=args.fts_lemmas,
+                       lemma_weight=args.lemma_weight)
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():

@@ -514,6 +514,9 @@ class NeuroMatrixStore:
         # widens the window, costs no model, and degrades to identity when no
         # morphology backend is installed.
         self.fts_lemmatize = True
+        # Weight of the lemma channel inside RRF.  Always paired with the surface
+        # channel, never replacing it.
+        self.lemma_weight = 2.0
         # How much the fused rank decides the final order vs the evidence score
         # (see _apply_fusion).  1.0 = pure RRF, which loses kind priority.
         self.fusion_blend = 0.9
@@ -1482,31 +1485,6 @@ class NeuroMatrixStore:
         if not tokens:
             return []
 
-        if getattr(self, "fts_lemmatize", False):
-            # Lemma index.  The query MUST be normalised with the same function
-            # that normalised the stored text — normalising only one side is the
-            # classic way this produces zero matches while looking correct.
-            try:
-                from . import morphology
-
-                norm = morphology.normalize(query)
-            except Exception:  # noqa: BLE001 - optional dependency
-                norm = ""
-            lem_terms = [t for t in (norm or "").split() if t]
-            if not lem_terms:
-                return []
-            lem_q = " OR ".join(f'"{t}"*' if len(t) >= 4 else f'"{t}"' for t in lem_terms[:10])
-            try:
-                rows = self._conn.execute(
-                    "SELECT facts_lem_fts.rowid AS id FROM facts_lem_fts "
-                    "JOIN facts f ON f.id = facts_lem_fts.rowid "
-                    "WHERE facts_lem_fts MATCH ? AND f.archived = 0 "
-                    "ORDER BY bm25(facts_lem_fts) LIMIT ?",
-                    (lem_q, int(max(1, limit)))).fetchall()
-            except sqlite3.OperationalError:
-                return []
-            return [int(r["id"]) for r in rows]
-
         parts: list[str] = []
         for t in tokens[:8]:
             if re.search(r"[а-яё]", t) and len(t) >= 4:
@@ -1543,6 +1521,45 @@ class NeuroMatrixStore:
             return []
         return [int(r["id"]) for r in rows]
 
+    def _lemma_candidates(self, query: str, *, limit: int = 40) -> list[int]:
+        """Lexical candidates from the LEMMA index, ordered by BM25.
+
+        Kept apart from ``_fts_candidates`` (surface forms) because the two play
+        different roles: the surface channel rewards exact wording, this one
+        reaches the same fact from another inflection.  Measured together they
+        beat either alone — as a REPLACEMENT the lemma index raised retrieval but
+        lowered answer quality.
+
+        Index and query must be normalised by the SAME function; normalising one
+        side only matches nothing while looking perfectly correct.
+        """
+        if not getattr(self, "fts_enabled", False):
+            return []
+        tokens = [t for t in re.findall(r"[0-9A-Za-zА-Яа-яЁё]{3,}", query.lower())
+                  if t not in STOPWORDS]
+        if not tokens:
+            return []
+        try:
+            from . import morphology
+
+            norm = morphology.normalize(query)
+        except Exception:  # noqa: BLE001 - optional dependency
+            return []
+        lem_terms = [t for t in (norm or "").split() if t]
+        if not lem_terms:
+            return []
+        lem_q = " OR ".join(f'"{t}"*' if len(t) >= 4 else f'"{t}"' for t in lem_terms[:10])
+        try:
+            rows = self._conn.execute(
+                "SELECT facts_lem_fts.rowid AS id FROM facts_lem_fts "
+                "JOIN facts f ON f.id = facts_lem_fts.rowid "
+                "WHERE facts_lem_fts MATCH ? AND f.archived = 0 "
+                "ORDER BY bm25(facts_lem_fts) LIMIT ?",
+                (lem_q, int(max(1, limit)))).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [int(r["id"]) for r in rows]
+
     def _apply_fusion(self, query: str, results: list[dict[str, Any]], limit: int,
                       q_entities: Optional[dict[int, float]] = None) -> list[dict[str, Any]]:
         """Fuse up to four ranked lists — heuristic, lexical (BM25), dense
@@ -1575,6 +1592,19 @@ class NeuroMatrixStore:
         if fts_ids:
             lists.append(fts_ids)
             weights.append(float(getattr(self, "fts_weight", 1.0)))
+
+        if getattr(self, "fts_lemmatize", False):
+            # Lemma index, as a SEPARATE channel beside the surface one — never as
+            # a replacement. Measured: replacing the surface index with the lemma
+            # index raised retrieval (57.8% -> 62.8%) but LOWERED answer quality
+            # (28.2% -> 25.3%), because normalisation also pulls unrelated words
+            # together ("studies"/"studio") and the window then fills with
+            # topically similar rather than exact facts.  Kept as an extra list so
+            # exact matches keep their strength and lemma matches only add.
+            lem_ids = self._lemma_candidates(query, limit=max(limit * 3, 20))
+            if lem_ids:
+                lists.append(lem_ids)
+                weights.append(float(getattr(self, "lemma_weight", 2.0)))
 
         if getattr(self, "slots_enabled", False):
             try:
@@ -1805,7 +1835,7 @@ class NeuroMatrixStore:
         # configuration against a stale copy of itself.
         _opts = (
             f"fts={getattr(self, 'fts_enabled', None)}:{getattr(self, 'fts_weight', None)}"
-            f":lemmas={getattr(self, 'fts_lemmatize', None)}"
+            f":lemmas={getattr(self, 'fts_lemmatize', None)}:{getattr(self, 'lemma_weight', None)}"
             f":slot={getattr(self, 'slots_enabled', None)}:{getattr(self, 'slot_weight', None)}"
             f":blend={getattr(self, 'fusion_blend', None)}"
             f":tb={getattr(self, 'type_boost_enabled', None)}:{getattr(self, 'type_boost_weight', None)}"
