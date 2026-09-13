@@ -140,7 +140,72 @@ def f1_score(pred: str, gold: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def _ctx_line(h: dict) -> str:
+# Relative time expressions that a fact's text can contain while its stored
+# timestamp gives the anchor to resolve them.  Without this the reader receives
+# "[2023-06-09] ...my school event last week..." and answers "last week" — the
+# gold answer is "the week before 9 June 2023", i.e. arithmetic the reader
+# cannot do from the text alone.  Measured on temporal questions: retrieval was
+# already correct (hit@8 62%) while F1 sat at 4.7%.
+_RELATIVE_TIME = [
+    (re.compile(r"\bthe day before yesterday\b", re.I), -2),
+    (re.compile(r"\byesterday\b", re.I), -1),
+    (re.compile(r"\blast night\b", re.I), -1),
+    (re.compile(r"\b(today|this morning|tonight|right now)\b", re.I), 0),
+    (re.compile(r"\btomorrow\b", re.I), 1),
+    (re.compile(r"\bnext week\b", re.I), 7),
+    (re.compile(r"\blast weekend\b", re.I), -7),
+    (re.compile(r"\btwo weekends ago\b", re.I), -14),
+    (re.compile(r"\b(a|last) week( ago)?\b", re.I), -7),
+    (re.compile(r"\btwo weeks ago\b", re.I), -14),
+    (re.compile(r"\b(three|3) weeks ago\b", re.I), -21),
+    (re.compile(r"\blast month\b", re.I), -30),
+    (re.compile(r"\ba month ago\b", re.I), -30),
+    (re.compile(r"\blast year\b", re.I), -365),
+    (re.compile(r"\b(позавчера)\b", re.I), -2),
+    (re.compile(r"\b(вчера)\b", re.I), -1),
+    (re.compile(r"\b(сегодня)\b", re.I), 0),
+    (re.compile(r"\b(завтра)\b", re.I), 1),
+    (re.compile(r"\b(на прошлой неделе|неделю назад)\b", re.I), -7),
+    (re.compile(r"\b(в прошлом месяце|месяц назад)\b", re.I), -30),
+    (re.compile(r"\b(два? дня назад)\b", re.I), -2),
+]
+
+
+def absolutize_relative_dates(text: str, ts: float | None) -> str:
+    """Append resolved absolute dates for relative time expressions in `text`.
+
+    Memory's job is to hand the reader facts it can actually use.  A fact
+    saying "my school event last week" is anchored by its own timestamp, so the
+    absolute date is derivable — the reader just cannot derive it reliably.
+    Returns the text unchanged when there is nothing to resolve.
+    """
+    if not text or ts is None:
+        return text
+    try:
+        base = float(ts)
+    except (TypeError, ValueError):
+        return text
+    hits: list[str] = []
+    for rx, delta in _RELATIVE_TIME:
+        m = rx.search(text)
+        if not m:
+            continue
+        phrase = m.group(0)
+        try:
+            resolved = time.strftime("%Y-%m-%d", time.localtime(base + delta * 86400))
+        except (OSError, ValueError):
+            continue
+        token = f'"{phrase}" = {resolved}'
+        if token not in hits:
+            hits.append(token)
+        if len(hits) >= 3:
+            break
+    if not hits:
+        return text
+    return f"{text}  (relative time resolved: {'; '.join(hits)})"
+
+
+def _ctx_line(h: dict, *, resolve_relative: bool = False) -> str:
     """Render one hit the way the LIVE agent sees it.
 
     provider._format_hit has always appended the fact's date, but this reader
@@ -148,6 +213,11 @@ def _ctx_line(h: dict) -> str:
     answered with a handicap the benchmark invented, not a limitation of the
     memory (temporal had the best retrieval of all categories, hit@8 41.4%,
     and the worst answer score, F1 4.7%).
+
+    `resolve_relative` is OFF by default: annotating facts with resolved dates
+    measured worse on every category (temporal 7.3% -> 5.1% F1, overall 20.8%
+    -> 19.1%), because it perturbs every fact in the window.  Kept as a flag so
+    the negative result stays reproducible.
     """
     ts = h.get("ts")
     try:
@@ -155,14 +225,24 @@ def _ctx_line(h: dict) -> str:
     except (TypeError, ValueError, OSError):
         when = ""
     text = str(h.get("text", ""))
+    if resolve_relative:
+        text = absolutize_relative_dates(text, ts)
     return f"[{when}] {text}" if when else text
 
 
 def llm_answer(llm: LLMClient, question: str, context_texts: list[str]) -> str:
     """Ask the configured LLM to answer `question` using ONLY the retrieved
-    facts as context — the standard retrieve-then-read QA step. Returns ''
-    on any failure (network, no key, bad JSON) so callers just score it as
-    wrong rather than crash the whole run."""
+    facts as context — the standard retrieve-then-read QA step. Returns '' on
+    any failure (network, no key, bad JSON) so callers just score it as wrong
+    rather than crash the whole run.
+
+    This prompt is part of the MEASURING INSTRUMENT, not of the product.  It is
+    deliberately left alone: tuning a benchmark's reader to raise its score is
+    fitting the test, not improving memory.  Product-side findings (what the
+    memory itself ranks, stores and hands over) are the only thing that may
+    change here, and any change to this string invalidates comparisons with
+    every earlier run.
+    """
     context = "\n".join(f"- {t}" for t in context_texts[:12])
     content = llm.chat_json([
         {"role": "system",
@@ -205,7 +285,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               bridge_adaptive: bool = False, bridge_edge: str = "count",
               bridge_topk: int = 0, fts: "bool | None" = None,
               fts_weight: "float | None" = None,
-              fusion_blend: "float | None" = None) -> dict:
+              fusion_blend: "float | None" = None, diag: int = 0,
+              resolve_relative: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -267,6 +348,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               f"({embedder.model})", flush=True)
 
     dmap = _dia_map(conv)
+    temporal_cat = 2
+    diag_shown = [0]
     per_cat: dict[int, list[bool]] = {}
     per_cat_f1: dict[int, list[float]] = {}
     lat = []
@@ -292,7 +375,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             # something next to "the bare model scored X%".
             hits = []
         if llm is not None and use_reader:
-            pred = llm_answer(llm, qa["question"], [_ctx_line(h) for h in hits])
+            ctx_lines = [_ctx_line(h, resolve_relative=resolve_relative) for h in hits]
+            pred = llm_answer(llm, qa["question"], ctx_lines)
             # Category 5 (adversarial) stores its gold answer under a
             # DIFFERENT key ('adversarial_answer', not 'answer') in the raw
             # dataset -- missing this silently scored every adversarial
@@ -300,6 +384,17 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             gold = qa.get("answer")
             if gold is None:
                 gold = qa.get("adversarial_answer", "")
+            if diag and cat == temporal_cat and diag_shown[0] < diag:
+                diag_shown[0] += 1
+                print(f"\n--- DIAG temporal #{diag_shown[0]} [{sample['sample_id']}] ---")
+                print(f"Q    : {qa['question']}")
+                print(f"GOLD : {gold!r}")
+                print(f"PRED : {pred!r}   F1={f1_score(pred, gold):.2f}")
+                print(f"EVID : {ev_texts[:2]}")
+                print("CTX  :")
+                for line in ctx_lines[:6]:
+                    mark = " <== EVIDENCE" if any(ev in line for ev in ev_texts) else ""
+                    print(f"       {line[:160]}{mark}")
             per_cat_f1.setdefault(cat, []).append(f1_score(pred, gold))
     store.close()
     return {"sample_id": sample["sample_id"], "per_cat": per_cat,
@@ -394,6 +489,19 @@ def main(argv=None) -> int:
                          "token could lose to an important but unrelated one.")
     ap.add_argument("--no-fts", action="store_true",
                     help="disable the BM25 lexical channel (it is ON by default)")
+    ap.add_argument("--rel-time", action="store_true",
+                    help="EXPERIMENT, not a product feature: annotate facts with "
+                         "resolved absolute dates. Measured WORSE on every "
+                         "category (temporal F1 7.3%% -> 5.1%%, overall 20.8%% -> "
+                         "19.1%%), so it is off by default and kept only to "
+                         "reproduce that result. It is here because the "
+                         "hypothesis was about the PRODUCT (should the memory "
+                         "hand the agent absolute dates?), not about the "
+                         "reader's prompt — tuning the latter to lift the score "
+                         "would be fitting the test.")
+    ap.add_argument("--diag", type=int, default=0,
+                    help="print N temporal questions with gold answer, retrieved "
+                         "context and the reader's prediction (diagnosis mode)")
     ap.add_argument("--fusion-blend", type=float, default=None,
                     help="1.0 = pure RRF order; lower values let the evidence "
                          "score (kind priority, importance, content relevance) "
@@ -466,7 +574,8 @@ def main(argv=None) -> int:
                        bridge_adaptive=args.bridge_adaptive,
                        bridge_edge=args.bridge_edge, bridge_topk=args.bridge_topk,
                        fts=(False if args.no_fts else None), fts_weight=args.fts_weight,
-                       fusion_blend=args.fusion_blend)
+                       fusion_blend=args.fusion_blend, diag=args.diag,
+                       resolve_relative=bool(args.rel_time))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():
