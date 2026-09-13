@@ -258,6 +258,23 @@ with retrieved facts, once with the reader answering alone (`--no-memory`):
 | 5 adversarial | 8.0% | 18.7% | +10.7 pp |
 | **Overall F1** | **7.9%** | **15.7%** | **+7.8 pp (×1.99)** |
 
+**Re-measured after reviving the lexical channel (v0.10.0), same methodology,
+same sample size, same reader:**
+
+| Category | without memory | with memory (v0.8.0) | with memory (v0.10.0) |
+|---|---|---|---|
+| 1 single-hop | 4.0% | 11.0% | **19.7%** |
+| 2 temporal | 5.2% | 4.7% | **7.4%** |
+| 3 multi-hop | 17.9% | 16.7% | 16.7% (n=6, noise) |
+| 4 open-domain | 9.3% | 20.2% | **35.3%** |
+| 5 adversarial | 8.0% | 18.7% | **23.4%** |
+| **Overall F1** | **7.9%** | 15.7% | **24.6%** |
+
+So memory now multiplies this local model's answer accuracy by **×3.1** (was
+×1.99), and the retrieval ceiling moved 32.3% → 53.2% on the same sample.
+`temporal` is still the outlier: retrieval is fine, the reader cannot extract
+dates — a prompt/reader problem that no retrieval change addresses.
+
 Retrieval in that run: **evidence-hit@8 = 31.8%**, reproducing the earlier
 full-population 32.3% on a different sample. Two findings worth more than the
 headline: (1) `temporal` has the *best* retrieval (hit@8 41.4%) and the
