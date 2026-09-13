@@ -446,6 +446,28 @@ before the lexical channel and ×3.1 before structure).  Note that structure
 helped ANSWERS more than its +1.1 pp on retrieval suggested: answers also came
 from a better-ordered window, not only from a longer list of candidates.
 
+**Write-time splitting: measured and NOT shipped (2026-09).** The real database
+stores whole assistant answers (~1000 characters), which makes morphology produce
+junk roles, so splitting looked like the obvious prerequisite. Scored by answer F1
+with the same reader, on one dialog, 60 questions:
+
+| write shape | answer F1 | vs short turns |
+|---|---|---|
+| turns (as published) | 11.9% | — |
+| **blocks (joined, live shape)** | **16.3%** | **+4.5 pp** |
+| chunked (split at write time) | 15.3% | +3.4 pp |
+
+Joining turns into big facts HELPS the reader: a longer fact carries the detail
+around the answer, and splitting removes it. So the hypothesis that long facts
+break retrieval was wrong, and the earlier evidence-hit@8 figure (88.3% for
+blocks) was not purely an artefact either — it pointed the same way the answer
+metric does. Nothing was shipped: no splitting, no chunking.
+
+Note the honest caveat this leaves: the structural channel therefore helps
+SHORT facts (where morphology is accurate) while live facts are long, and the
+role data on long facts is noise. The channels that pay off on live data remain
+the lexical one and the structural one's ordering effect.
+
 ## Development
 
 ```bash
