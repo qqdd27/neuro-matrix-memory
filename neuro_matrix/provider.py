@@ -358,6 +358,15 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 self._shared = None
         self._retention_days = float(self._config.get("retention_days", 365) or 365)
         self._auto_consolidate = is_truthy_value(self._config.get("auto_consolidate", "true"))
+        # The llm_rerank setting finally does something: it decides whether
+        # search() may spend an LLM call reordering candidates when the caller
+        # did not ask either way.  A local model makes this cheap; a hosted one
+        # makes it seconds per recall, which is why it is a setting and not a
+        # hardcoded default.
+        self._store.llm_rerank_default = is_truthy_value(
+            self._config.get("llm_rerank", "true")) and bool(self._store.llm)
+        if self._shared is not None:
+            self._shared.llm_rerank_default = self._store.llm_rerank_default
         ctx = kwargs.get("agent_context")
         self._active = ctx in (None, "", "primary", "flush")
         logger.info("neuromatrix ready: %s (active=%s, llm=%s)",

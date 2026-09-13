@@ -397,6 +397,14 @@ class NeuroMatrixStore:
         self.hybrid_rrf_k = 20
         self.hybrid_max_candidates = 400
         self._vec_cache: dict[int, list[float]] = {}
+        # Whether search() may spend an LLM call reordering candidates when the
+        # caller does not say otherwise (the llm_rerank setting).  Default False
+        # here so the library stays cheap unless a provider opts in: on a local
+        # model the call costs ~0.3s, on a hosted one seconds per recall.
+        self.llm_rerank_default = False
+        # MMR diversity is available but off by default (see _mmr_diversify):
+        # it must be measured, not assumed.
+        self.mmr_enabled = False
 
     # ------------------------------------------------------------------ write
 
@@ -1088,6 +1096,72 @@ class NeuroMatrixStore:
             out.append(item)
         return out
 
+    def _cap_by_kind(self, items: list[dict[str, Any]], limit: int, *,
+                     per_kind: int = 1, dossier_slots: int = 2) -> list[dict[str, Any]]:
+        """Keep one KIND from occupying the whole recall window.
+
+        Measured live before this existed: a query about "interface and build"
+        returned two dead-end warnings (score 9.5, injected deliberately to warn
+        about known dead ends) plus one irrelevant fact — 2 of 3 slots spent on
+        notices, and the relevant facts never surfaced at all.  Dossiers already
+        had a 2-slot cap for the same reason; this generalises it.
+
+        This REORDERS, it does not shrink: capped items move behind the evidence
+        rather than being dropped, so a caller asking for k still gets k rows
+        when the store has them (shrinking the window would silently cost
+        retrieval recall, which is the metric this project is judged on).
+        """
+        budget = max(1, int(limit))
+        primary: list[dict[str, Any]] = []
+        overflow: list[dict[str, Any]] = []
+        seen: dict[str, int] = {}
+        for item in items:
+            kind = str(item.get("kind") or "episodic")
+            cap = dossier_slots if kind == "dossier" else (budget if kind == "episodic" else per_kind)
+            if kind != "episodic" and seen.get(kind, 0) >= cap:
+                overflow.append(item)
+                continue
+            seen[kind] = seen.get(kind, 0) + 1
+            primary.append(item)
+        return (primary + overflow)[:budget]
+
+    def _mmr_diversify(self, items: list[dict[str, Any]], limit: int, *,
+                       lambda_: float = 0.5) -> list[dict[str, Any]]:
+        """Maximal Marginal Relevance over token overlap (no model needed).
+
+        ``lambda_`` is the relevance/diversity trade: 1.0 keeps the relevance
+        order untouched, 0.0 picks purely for dissimilarity.  The default 0.5
+        was chosen because the classic 0.7 still let a near-duplicate keep its
+        slot when its relevance was slightly higher — measured in the test
+        below, not assumed.  Note the penalty is multiplied by the item's own
+        relevance, so a low-relevance oddity cannot outrank a strong match just
+        for being different.
+
+        Off by default (``mmr_enabled``): MMR trades a little top-1 precision
+        for a more diverse window — right for a reader that sees k items at
+        once, wrong for a metric that only asks "is the gold turn in the
+        window".  Kept here so the trade can be measured, not argued about.
+        """
+        if not items or len(items) < 2:
+            return items
+        budget = max(1, int(limit))
+        remaining = list(items)
+        chosen: list[dict[str, Any]] = []
+        while remaining and len(chosen) < budget:
+            if not chosen:
+                chosen.append(remaining.pop(0))
+                continue
+            best_i, best_score = 0, float("-inf")
+            for i, cand in enumerate(remaining):
+                rel = float(cand.get("score") or 0.0)
+                sim = max(self._jaccard(str(cand.get("text", "")),
+                                        str(c.get("text", ""))) for c in chosen)
+                score = lambda_ * rel - (1.0 - lambda_) * sim * max(rel, 1.0)
+                if score > best_score:
+                    best_i, best_score = i, score
+            chosen.append(remaining.pop(best_i))
+        return chosen
+
     def search(
         self,
         query: str,
@@ -1097,7 +1171,7 @@ class NeuroMatrixStore:
         session_id: str = "",
         now: Optional[float] = None,
         as_of: Optional[float] = None,
-        rerank: bool = False,
+        rerank: Optional[bool] = None,
     ) -> list[dict[str, Any]]:
         """Hybrid associative recall.
 
@@ -1112,6 +1186,12 @@ class NeuroMatrixStore:
         Retrieved facts are rehearsed (§22.1): retrieval_count +1 and the
         fact's association edges gain a little stability.
         """
+        if rerank is None:
+            # None means "whatever the provider configured" (the llm_rerank
+            # setting).  An explicit True/False from a caller still wins, so the
+            # existing tool contract is unchanged; before this, the setting was
+            # declared, defaulted to true, and read by nobody.
+            rerank = bool(getattr(self, "llm_rerank_default", False))
         now = now if now is not None else time.time()
         act_t = as_of if as_of is not None else now
         cache_key = f"{query}|{limit}|{include_dossiers}|{as_of!r}|rerank={rerank}"
@@ -1453,9 +1533,24 @@ class NeuroMatrixStore:
                                 "via": [],
                             })
                     if _warns:
-                        out = _warns + out
+                        # Warnings must not eat the caller's slots: keep at most
+                        # `limit` rows in total, evidence first after them.
+                        _keep = max(0, limit - len(_warns))
+                        out = _warns + [x for x in out if x.get("source") != "deadend-warning"][:_keep]
             except sqlite3.Error:
                 pass
+
+        # Relevance hygiene (see _cap_by_kind): reorder so one kind cannot fill
+        # the window, then honour the caller's limit exactly — before this, the
+        # dead-end injection above could return limit+2 rows.
+        if as_of is None and len(out) > 1:
+            try:
+                out = self._cap_by_kind(out, limit)
+                if getattr(self, "mmr_enabled", False):
+                    out = self._mmr_diversify(out, limit)
+            except Exception:  # noqa: BLE001 - hygiene must never break recall
+                pass
+        out = out[:limit]
 
         # Reconsolidation on retrieval: rehearse returned facts (skip dossier
         # stubs and historical point-in-time reads — the past is not rehearsed).
@@ -2939,9 +3034,20 @@ class NeuroMatrixStore:
     # -------------------------------------------------------- LLM daily budget
 
     def llm_budget_remaining(self) -> int:
+        """Remaining LLM calls for today.
+
+        ``0`` means UNLIMITED, exactly as the settings field documents it.  The
+        previous implementation computed ``max(0, 0 - used)`` = 0, i.e. the one
+        value a user sets to mean "no limit" silently disabled every LLM step
+        (consolidation, decision/trait sweeps, rerank, distillation) — which is
+        precisely what someone running a free local model would set.
+        """
+        budget = int(getattr(self, "llm_daily_budget", 20))
+        if budget <= 0:
+            return 10 ** 9
         day = time.strftime("%Y%m%d")
         used = int(self.get_meta(f"llm_budget:{day}", "0") or 0)
-        return max(0, int(getattr(self, "llm_daily_budget", 20)) - used)
+        return max(0, budget - used)
 
     def llm_spend(self, n: int = 1) -> int:
         day = time.strftime("%Y%m%d")

@@ -1710,6 +1710,107 @@ def test_hybrid_recall_is_a_noop_without_embedder():
     store.close()
 
 
+class _CountingLLM:
+    """Minimal LLM stub: counts calls and returns a valid rerank payload."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def available(self) -> bool:
+        return True
+
+    def chat_json(self, messages):
+        self.calls += 1
+        return {"order": []}
+
+
+def test_zero_llm_budget_means_unlimited():
+    """The settings field documents '0 = unlimited'.  The old computation,
+    max(0, 0 - used) = 0, did the opposite: it disabled consolidation, the
+    decision/trait sweeps, rerank and distillation at once — and 0 is exactly
+    what someone running a free local model would set."""
+    path = os.path.join(tempfile.mkdtemp(), "budget.db")
+    store = _fresh(path)
+    store.llm_daily_budget = 0
+    assert store.llm_budget_remaining() > 10 ** 8, store.llm_budget_remaining()
+    store.llm_spend(50)
+    assert store.llm_budget_remaining() > 10 ** 8, "0 must stay unlimited after spending"
+    # Reset the day's counter, then check a finite budget still runs out.
+    store.set_meta(f"llm_budget:{time.strftime('%Y%m%d')}", "0")
+    store.llm_daily_budget = 3
+    assert store.llm_budget_remaining() == 3, store.llm_budget_remaining()
+    store.llm_spend(3)
+    assert store.llm_budget_remaining() == 0, "a finite budget still runs out"
+    store.close()
+
+
+def test_llm_rerank_setting_is_honoured():
+    """llm_rerank was declared in the settings, defaulted to true, and read by
+    nobody.  It now decides the default rerank behaviour while an explicit
+    caller flag still wins."""
+    path = os.path.join(tempfile.mkdtemp(), "rerank.db")
+    store = _fresh(path)
+    for i in range(5):
+        store.remember(f"Delta проект {i}: cloudflare кеш и api.")
+    stub = _CountingLLM()
+    store.llm = stub
+    store.llm_daily_budget = 0            # unlimited, so the budget cannot mask it
+    store.llm_rerank_default = False
+    store.search("cloudflare кеш", limit=3, rerank=None)
+    assert stub.calls == 0, "rerank ran although the setting is off"
+    store.search("cloudflare кеш", limit=3, rerank=True)
+    assert stub.calls == 1, "explicit rerank=True was ignored"
+    store.llm_rerank_default = True
+    store.search("облачный кеш", limit=3, rerank=None)
+    assert stub.calls == 2, "setting on but rerank did not run"
+    store.search("другой запрос", limit=3, rerank=False)
+    assert stub.calls == 2, "explicit rerank=False was ignored"
+    store.close()
+
+
+def test_deadend_warnings_cannot_flood_recall():
+    """Measured live: two dead-end warnings (injected with score 9.5 to warn
+    about known dead ends) plus limit=3 returned FOUR rows, two of them
+    warnings — relevant evidence got one slot out of three.  Warnings are
+    useful; they must not outnumber the facts they warn about, and the caller
+    must never receive more rows than it asked for."""
+    path = os.path.join(tempfile.mkdtemp(), "flood.db")
+    store = _fresh(path)
+    store.mark_deadend("start", "iOS-сборку локально на Windows не проверить")
+    for i in range(6):
+        store.remember(f"start и сборка: шаг {i} про cloudflare и кеш файлов.")
+    res = store.search("start сборка cloudflare", limit=3)
+    assert len(res) <= 3, f"more rows than limit: {len(res)}"
+    warns = [r for r in res if r.get("source") == "deadend-warning"]
+    assert len(warns) <= 1, f"warnings flooded the window: {len(warns)} of {len(res)}"
+    # Capping must REORDER, not shrink: with room for more, the count is kept.
+    res8 = store.search("start сборка cloudflare", limit=8)
+    assert len(res8) <= 8, len(res8)
+    assert len(res8) >= len(res), (len(res), len(res8))
+    store.close()
+
+
+def test_mmr_diversify_reorders_without_losing_items():
+    """The lambda knob must do what it says at both ends: the default (0.5)
+    demotes a near-duplicate in favour of a different fact, while 0.95 keeps the
+    pure relevance order.  Both directions are asserted because a knob that only
+    works one way is how the 0.7 default silently failed."""
+    path = os.path.join(tempfile.mkdtemp(), "mmr.db")
+    store = _fresh(path)
+    items = [
+        {"fact_id": 1, "text": "кеш cloudflare и api слой настроены одинаково", "score": 1.0, "kind": "episodic"},
+        {"fact_id": 2, "text": "кеш cloudflare и api слой настроены одинаково дважды", "score": 0.99, "kind": "episodic"},
+        {"fact_id": 3, "text": "миграции базы данных и бэкапы по расписанию", "score": 0.5, "kind": "episodic"},
+    ]
+    out = store._mmr_diversify(items, limit=3)
+    assert len(out) == 3, [o["fact_id"] for o in out]
+    assert out[1]["fact_id"] == 3, f"near-duplicate not demoted: {[o['fact_id'] for o in out]}"
+    # Relevance-dominant setting: the near-duplicate keeps its rank.
+    out2 = store._mmr_diversify(items, limit=3, lambda_=0.95)
+    assert [o["fact_id"] for o in out2] == [1, 2, 3], [o["fact_id"] for o in out2]
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
