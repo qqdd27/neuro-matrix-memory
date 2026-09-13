@@ -430,6 +430,22 @@ different graph formulations, one verdict — the default path stays lexical +
 structural, and `role_bridge_enabled` remains off with the code kept for anyone
 who wants to retest it.
 
+**Re-measured after the structural channel (v0.11.0), same sample and reader:**
+
+| Category | without memory | v0.8.0 | v0.10.0 (lexical) | v0.11.0 (+structure) |
+|---|---|---|---|---|
+| 1 single-hop | 4.0% | 11.0% | 19.7% | **21.0%** |
+| 2 temporal | 5.2% | 4.7% | 7.4% | 7.4% |
+| 3 multi-hop | 17.9% | 16.7% | 16.7% (n=6) | 16.7% (n=6) |
+| 4 open-domain | 9.3% | 20.2% | 35.3% | **38.1%** |
+| 5 adversarial | 8.0% | 18.7% | 23.4% | **32.7%** |
+| **Overall F1** | **7.9%** | 15.7% | 24.6% | **28.2%** |
+
+Memory now multiplies this local model's answer accuracy by **×3.6** (was ×1.99
+before the lexical channel and ×3.1 before structure).  Note that structure
+helped ANSWERS more than its +1.1 pp on retrieval suggested: answers also came
+from a better-ordered window, not only from a longer list of candidates.
+
 ## Development
 
 ```bash
