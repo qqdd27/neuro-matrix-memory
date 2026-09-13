@@ -515,25 +515,44 @@ makes a dictionary possible at all: an inflected word is a LEMMA plus features
 (tense, case, number), so "бежал / бежит / бежать" and "research / researching /
 researched" denote one concept. A lexical index keyed on SURFACE forms treats them
 as unrelated strings, so a question phrased in one form cannot reach a fact phrased
-in another. Measured on the full population (k=8), with everything else unchanged:
+in another.
 
-| | shipped before | with the lemma index |
+**The important part is HOW it is applied.** Two placements were measured, and the
+one that raises retrieval the most is the one that damages answers:
+
+| | retrieval (1977 q) | answers (154 q) |
 |---|---|---|
-| **overall** | 57.8% | **62.8%** |
-| single-hop | 46.3% | **57.7%** |
-| multi-hop | 29.2% | **34.8%** |
-| temporal | 66.9% | 67.5% |
-| open-domain | 62.5% | 64.9% |
-| adversarial | 60.3% | 64.3% |
+| surface index only (before) | 57.8% | 28.2% |
+| lemma index REPLACING the surface one | **62.8%** | 25.3% |
+| lemma index BESIDE the surface one (weight 2) | 61.2% | **28.9%** |
 
-Every category improves; single-hop — the largest class — gains 11.4 pp. This is
-the biggest single step since the lexical channel was revived, and it costs no
-model: pymorphy for Russian, Snowball for English, both optional, memoised at
-0.05 ms/word, and it degrades to identity when neither is installed.
+Replacing the surface index wins on retrieval and loses on answers: normalisation
+also pulls unrelated words together ("university"/"universal"), so the window fills
+with topically similar rather than exact facts and exact wording loses its weight.
+As a second channel — `_lemma_candidates` beside `_fts_candidates` — the same
+mechanism keeps exact matches strong and only adds:
 
-Why it is safe where four graph experiments were not: normalisation **narrows**
-rather than widens. It introduces no new candidates and cannot displace a correct
-hit — it only makes an existing fact reachable from more of its own forms.
+| category | before | beside |
+|---|---|---|
+| single-hop | 21.0% | 27.3% |
+| temporal | 7.4% | 8.5% |
+| open-domain | 38.1% | 39.9% |
+| adversarial | 32.7% | 29.4% |
+
+Weight sweep (flat plateau, so the default is not a knife edge): 1 → 60.2%,
+2 → 61.2%, 3 → 61.4%. Cost: pymorphy (ru) + WordNet (en), both optional, memoised
+at ~0.01–0.05 ms/word, identity when absent.
+
+English uses true WordNet LEMMATISATION, not a stemmer: stemming collides
+"universal"/"university" into one form, inflating matches with noise. The pick is
+fixed and tie-broken by position, never by set-iteration order — index and query
+must normalise IDENTICALLY, and a non-deterministic choice would index the same
+text two different ways between runs.
+
+Why this is safe where four graph experiments were not: normalisation **narrows**.
+It introduces no new candidates and cannot displace a correct hit — an existing
+fact simply becomes reachable from more of its own forms. (The placement lesson
+above shows even a narrowing channel can hurt when it REPLACES rather than ADDS.)
 
 Three defects surfaced while building it, each caught by a test rather than by
 reasoning:
