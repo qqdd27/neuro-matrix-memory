@@ -506,3 +506,94 @@ def resolve_with_llm(llm: Any, text: str, anchor_ts: Optional[float] = None) -> 
 
 
 _ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+# --------------------------------------------------------------------------
+# Computed time: what the reader cannot do itself.
+#
+# A stored date is not an answer to "how long ago", "how many weeks between", or
+# "which happened first" — those are ARITHMETIC over dates, and a small model is
+# measurably bad at it (the temporal category has the best retrieval of any
+# category and the worst answer score).  The memory holds both endpoints, so it can
+# do the subtraction exactly and hand over the result.
+#
+# This adds information; it does not reorder anything.  Every measured
+# rearrangement in this project (edge order, type routing, chronological context,
+# promotion) lost to leaving the window alone, while every addition (lexical
+# channel, lemmas, roles, more dates) won.
+# --------------------------------------------------------------------------
+def format_distance(event_ts: float, anchor_ts: float,
+                    granularity: str = "day") -> str:
+    """'2 years 3 months ago' / 'in 5 days' / '' when the two are the same day.
+
+    Deliberately coarse: the point is to spare the reader the subtraction, not to
+    claim more precision than the date carries.  A month-granularity event says the
+    month count; a year-granularity one says only years.
+    """
+    try:
+        delta = float(event_ts) - float(anchor_ts)
+    except (TypeError, ValueError):
+        return ""
+    g = (granularity or "day").lower()
+    days = int(round(abs(delta) / 86400.0))
+    past = delta < 0
+    if g == "day" and days == 0:
+        return "on the question's own date"
+
+    def _unit(n: int, one: str, many: str) -> str:
+        return f"{n} {one if n == 1 else many}"
+
+    if g in ("year",):
+        years = max(1, int(round(days / 365.25)))
+        body = _unit(years, "year", "years")
+    elif g in ("month", "season"):
+        months = max(1, int(round(days / 30.44)))
+        if months >= 24:
+            body = _unit(int(round(months / 12)), "year", "years")
+        else:
+            body = _unit(months, "month", "months")
+    else:
+        if days <= 14:
+            body = _unit(max(1, days), "day", "days")
+        elif days <= 90:
+            body = _unit(max(1, int(round(days / 7))), "week", "weeks")
+        elif days <= 730:
+            body = _unit(max(1, int(round(days / 30.44))), "month", "months")
+        else:
+            years = int(days / 365.25)
+            months = int(round((days - years * 365.25) / 30.44))
+            body = _unit(years, "year", "years")
+            if months >= 2:
+                body = f"{body} {_unit(months, 'month', 'months')}"
+    return f"in {body}" if delta > 0 else f"{body} ago"
+
+
+def timeline_trace(dated: list[tuple[float, str]], *, limit: int = 6,
+                   max_chars: int = 90) -> str:
+    """One line placing the retrieved dated events on a common timeline.
+
+    GRAVITY's oracle experiment is the reason this exists: with ALL gold evidence
+    already in the context, accuracy still reached only 80.9%, because relations
+    BETWEEN fragments were never made explicit — the reader had to reconstruct the
+    order itself.  This states it: the same events, oldest first, each with the
+    distance between it and the one before.
+
+    ``dated`` is [(event_ts, label)] and the result is empty for fewer than two
+    dated events, because a single event has no relation to state.
+    """
+    pts = sorted(((float(t), str(lbl)) for t, lbl in dated if lbl), key=lambda x: x[0])
+    if len(pts) < 2:
+        return ""
+    parts: list[str] = []
+    prev: Optional[float] = None
+    for ts, label in pts[:limit]:
+        human = format_human(ts, "day") or ""
+        gap = ""
+        if prev is not None:
+            # how long AFTER the previous event this one happened
+            d = format_distance(ts, prev, "day")
+            if d.startswith("in "):
+                gap = f" (+{d[3:]})"
+        parts.append(f"{human}{gap}: {label[:max_chars]}")
+        prev = ts
+    return " | ".join(parts)

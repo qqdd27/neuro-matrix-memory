@@ -62,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from neuro_matrix.store import NeuroMatrixStore  # noqa: E402
 from neuro_matrix.temporal import format_human as human_date  # noqa: E402
+from neuro_matrix.temporal import format_distance, timeline_trace  # noqa: E402
 from neuro_matrix.llm import (  # noqa: E402
     DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient, build_llm_client,
 )
@@ -332,7 +333,8 @@ def _looks_temporal(question: str) -> bool:
     return any(w in q for w in en) or any(w in q for w in ru)
 
 
-def _ctx_line(h: dict, *, resolve_relative: bool = False) -> str:
+def _ctx_line(h: dict, *, resolve_relative: bool = False,
+              anchor_ts: float | None = None) -> str:
     """Render one hit the way the LIVE agent sees it.
 
     provider._format_hit has always appended the fact's date, but this reader
@@ -365,6 +367,15 @@ def _ctx_line(h: dict, *, resolve_relative: bool = False) -> str:
             human = human_date(ev, gran)
             if human:
                 when = f"{when} · {human}"
+            if anchor_ts:
+                # The subtraction the reader cannot do reliably: how long before the
+                # question this happened.  Added information, not a reorder.
+                try:
+                    dist = format_distance(float(ev), float(anchor_ts), gran)
+                except Exception:  # noqa: BLE001
+                    dist = ""
+                if dist:
+                    when = f"{when} · {dist}"
             body = absolutize_relative_dates(text, h.get("ts")) if resolve_relative else text
             return f"[event {when}] {body}"
         except (TypeError, ValueError, OSError):
@@ -445,6 +456,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               anaphora: bool = True, time_order: bool = True,
               time_nudge: bool = True, time_nudge_weight: "float | None" = None,
               chrono_context: bool = False, llm_dates: bool = False,
+              time_distance: bool = False, timeline: bool = False,
               judge: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
@@ -494,9 +506,11 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
         # form when the flag is on; nothing else to backfill in a fresh store.
         pass
     base_ts = time.time() - 400 * 86400
+    q_anchor = base_ts
     for i, sk in enumerate(session_keys):
         dt_str = conv.get(f"{sk}_date_time", "")
         ts = _parse_dt(dt_str, base_ts + i * 86400)
+        q_anchor = max(q_anchor, float(ts))
         sid = f"{sample['sample_id']}_{sk}"
         for turn in conv[sk]:
             store.remember(f"{turn['speaker']}: {turn['text']}", source="turn",
@@ -599,7 +613,19 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
                     hits = sorted(
                         hits,
                         key=lambda h: float(h.get("event_ts") or h.get("ts") or 0.0))
-            ctx_lines = [_ctx_line(h, resolve_relative=resolve_relative) for h in hits]
+            ctx_lines = [_ctx_line(h, resolve_relative=resolve_relative,
+                                   anchor_ts=q_anchor if time_distance else None)
+                         for h in hits]
+            if timeline and len(ctx_lines) > 1:
+                # GRAVITY's finding applied as added structure: the retrieved dated
+                # events are stated once, oldest first, with the gap between them, so
+                # the reader does not have to reconstruct the order from separate
+                # lines.  Nothing is moved or removed — this is a header line.
+                dated = [(h.get("event_ts"), str(h.get("text", "")))
+                         for h in hits if h.get("event_ts")]
+                trace = timeline_trace(dated)
+                if trace:
+                    ctx_lines = [f"[timeline] {trace}"] + ctx_lines
             pred = llm_answer(llm, qa["question"], ctx_lines)
             # Category 5 (adversarial) stores its gold answer under a
             # DIFFERENT key ('adversarial_answer', not 'answer') in the raw
@@ -765,6 +791,13 @@ def main(argv=None) -> int:
                     help="weight of the lemma channel inside RRF (default 2.0); the "
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
+    ap.add_argument("--time-distance", action="store_true",
+                    help="annotate each dated fact with the gap between it and the "
+                         "question (arithmetic the reader does badly)")
+    ap.add_argument("--timeline", action="store_true",
+                    help="add one [timeline] line stating the retrieved dated events "
+                         "in order with the gaps between them (GRAVITY: make the "
+                         "relations explicit instead of reordering)")
     ap.add_argument("--llm-dates", action="store_true",
                     help="let the model date the turns the pattern resolver could not "
                          "(background-shaped, bounded, never re-asked)")
@@ -922,6 +955,8 @@ def main(argv=None) -> int:
                        time_nudge_weight=args.time_nudge_weight,
                        chrono_context=bool(args.chrono_context),
                        llm_dates=bool(args.llm_dates),
+                       time_distance=bool(args.time_distance),
+                       timeline=bool(args.timeline),
                        judge=bool(args.judge))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)

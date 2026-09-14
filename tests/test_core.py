@@ -2314,6 +2314,33 @@ def test_anaphora_makes_a_pronoun_fact_findable_by_name():
     store.close()
 
 
+def test_timeline_trace_states_the_relations_between_events():
+    """The mechanism behind the largest temporal gain measured in this project: one
+    line placing the retrieved dated events in order, with the gap between them.
+    A single event must produce nothing (no relation to state), and a wrong order of
+    arguments must not silently drop the gap."""
+    from neuro_matrix import temporal as T
+    import time as _t
+
+    a = _t.time()
+    tr = T.timeline_trace([(a - 900 * 86400, "lost her job"),
+                           (a - 500 * 86400, "moved to Lisbon")])
+    assert "lost her job" in tr and "moved to Lisbon" in tr
+    assert tr.index("lost her job") < tr.index("moved to Lisbon"), "not oldest first"
+    assert "(+" in tr, f"gap between consecutive events missing: {tr}"
+
+    # a single dated event has no relation to state
+    assert T.timeline_trace([(a - 10 * 86400, "only one")]) == ""
+    # undated entries are ignored rather than rendered as empties
+    assert T.timeline_trace([(a - 10 * 86400, "one"), (0.0, "")]) == ""
+
+    # distances: coarse on purpose, and never negative-signed nonsense
+    assert T.format_distance(a - 3 * 86400, a, "day").endswith("ago")
+    assert T.format_distance(a + 5 * 86400, a, "day").startswith("in ")
+    assert T.format_distance(a - 4000 * 86400, a, "day").count("year") == 1
+    assert T.format_distance(a, a, "day") == "on the question's own date"
+
+
 def test_llm_event_dates_are_opt_in_bounded_and_never_re_asked():
     """The model pass must be switchable, must not date a turn twice, and must not
     accept a date that is really just the conversation date."""

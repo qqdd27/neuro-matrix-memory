@@ -483,6 +483,29 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     break
                 lines.append(line)
                 used += len(line) + 1
+            # Chronological trace: ONE added line stating the retrieved dated events in
+            # order, with the gap between consecutive ones.  Measured on 607 questions
+            # with a local 1.5B reader: temporal F1 3.9% -> 24.4% (x6.3) and overall F1
+            # 31.1% -> 35.0%, while evidence-hit@8 was unchanged (61.0% -> 61.1%) — the
+            # retrieved window is untouched.  This is GRAVITY's finding applied: the
+            # reader fails not from missing evidence but from the relations BETWEEN
+            # fragments being implicit (their oracle run: all gold evidence present,
+            # accuracy still 80.9%).  Every attempt to express that relation by
+            # REORDERING the window measured worse (chronological context: F1 30.0%);
+            # adding it as a line is what worked.  Two dated facts are the minimum,
+            # because a single event has no relation to state.
+            try:
+                dated = [(r.get("event_ts"), str(r.get("text", "")))
+                         for r in results if r.get("event_ts")]
+                if len(dated) >= 2:
+                    from .temporal import timeline_trace
+
+                    trace = timeline_trace(dated)
+                    if trace:
+                        lines.insert(0, f"- [timeline] {trace}")
+                        used += len(trace)
+            except Exception as e:  # noqa: BLE001 - never break recall
+                logger.debug("neuromatrix timeline failed: %s", e)
             parts.extend(lines)
             if lines:
                 self._recall = RecallStatus(provider_label="NeuroMatrix", count=len(lines))
