@@ -2314,6 +2314,59 @@ def test_anaphora_makes_a_pronoun_fact_findable_by_name():
     store.close()
 
 
+def test_llm_event_dates_are_opt_in_bounded_and_never_re_asked():
+    """The model pass must be switchable, must not date a turn twice, and must not
+    accept a date that is really just the conversation date."""
+    from neuro_matrix import temporal as T
+
+    class Fake:
+        def __init__(self, out):
+            self.out, self.calls = out, 0
+
+        def available(self):
+            return True
+
+        def chat_json(self, messages):
+            self.calls += 1
+            return self.out
+
+    anchor = 1789000000.0  # 2026-09-10
+    # a real date is accepted
+    fake = Fake({"date": "2022-07-15", "precision": "season", "evidence": "the summer we moved"})
+    r = T.resolve_with_llm(fake, "It was right after the summer we moved", anchor)
+    assert r is not None and r.granularity == "season"
+    # "no date" is an answer, not a failure
+    assert T.resolve_with_llm(Fake({"date": None}), "We discussed the roadmap", anchor) is None
+    # the conversation date is not a date for a turn that names no time
+    assert T.resolve_with_llm(
+        Fake({"date": "2026-09-10", "precision": "day"}), "We discussed the roadmap",
+        anchor) is None
+    # garbage does not crash or date anything
+    assert T.resolve_with_llm(Fake("not json"), "Hello", anchor) is None
+
+    path = os.path.join(tempfile.mkdtemp(), "llmdates.db")
+    store = NeuroMatrixStore(path, llm=Fake({"date": "2024-03-05", "precision": "day"}),
+                             llm_daily_budget=1000)
+    assert store.enrich_event_times_via_llm(limit=10) == 0, "must do nothing while disabled"
+    store.temporal_llm_enabled = True
+    # both turns carry no time expression, so the pattern resolver leaves them undated;
+    # both name an entity, or the store would discard them as small talk before the
+    # model ever sees them
+    store.remember("Caroline started the new job",
+                   source="turn", session_id="s1", ts=anchor)
+    store.remember("Caroline mentioned the roadmap",
+                   source="turn", session_id="s1", ts=anchor)
+    assert store._conn.execute("SELECT COUNT(*) c FROM fact_time").fetchone()["c"] == 0, \
+        "premise: the pattern resolver must not have dated these"
+    gained = store.enrich_event_times_via_llm(limit=10, batch=2)
+    assert gained == 2, f"expected both facts dated by the model, got {gained}"
+    # examined facts are recorded, so a second pass asks nothing
+    checked = store._conn.execute("SELECT COUNT(*) c FROM fact_time_checked").fetchone()["c"]
+    assert checked == 2, checked
+    assert store.enrich_event_times_via_llm(limit=10, batch=2) == 0, "re-asked a fact"
+    store.close()
+
+
 def test_temporal_resolver_covers_the_gaps_research_pointed_at():
     """The fixed expression table covered only what someone thought of in advance, so
     "3 days ago" and "this summer" produced no date at all, and "in the summer of

@@ -444,7 +444,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               lemma_weight: "float | None" = None, event_date: bool = True,
               anaphora: bool = True, time_order: bool = True,
               time_nudge: bool = True, time_nudge_weight: "float | None" = None,
-              chrono_context: bool = False,
+              chrono_context: bool = False, llm_dates: bool = False,
               judge: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
@@ -501,6 +501,23 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
         for turn in conv[sk]:
             store.remember(f"{turn['speaker']}: {turn['text']}", source="turn",
                            session_id=sid, ts=ts, importance=1.0)
+
+    if llm_dates and llm is not None:
+        # Model-based event dates, as a background pass would do it: bounded per call,
+        # over facts the pattern resolver could not date, never re-asked.
+        store.temporal_llm_enabled = True
+        gained = 0
+        while True:
+            n = store.enrich_event_times_via_llm(limit=400, batch=16)
+            gained += n
+            if n == 0:
+                break
+        dated = store._conn.execute(
+            "SELECT COUNT(*) c FROM fact_time").fetchone()["c"]
+        checked = store._conn.execute(
+            "SELECT COUNT(*) c FROM fact_time_checked").fetchone()["c"]
+        print(f"    [{sample['sample_id']}] llm dates: +{gained} "
+              f"(total dated {dated}, examined {checked})", flush=True)
 
     if llm is not None and use_memory:
         # Write-time trait distillation (v0.7.4): targets exactly the
@@ -748,6 +765,9 @@ def main(argv=None) -> int:
                     help="weight of the lemma channel inside RRF (default 2.0); the "
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
+    ap.add_argument("--llm-dates", action="store_true",
+                    help="let the model date the turns the pattern resolver could not "
+                         "(background-shaped, bounded, never re-asked)")
     ap.add_argument("--no-temporal-extended", dest="temporal_extended",
                     action="store_false", default=True,
                     help="resolve only the fixed expression table (no arbitrary "
@@ -901,6 +921,7 @@ def main(argv=None) -> int:
                        time_nudge=bool(args.time_nudge),
                        time_nudge_weight=args.time_nudge_weight,
                        chrono_context=bool(args.chrono_context),
+                       llm_dates=bool(args.llm_dates),
                        judge=bool(args.judge))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)

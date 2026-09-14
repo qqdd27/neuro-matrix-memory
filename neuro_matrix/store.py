@@ -205,6 +205,14 @@ CREATE TABLE IF NOT EXISTS entity_gender (
     gender TEXT NOT NULL,
     updated_at REAL NOT NULL DEFAULT 0
 );
+-- Which facts have already been examined for an event date, whatever the answer was.
+-- Without this a background enrichment pass re-asks about the same facts forever:
+-- expensive, silent, and indistinguishable from a working feature.
+CREATE TABLE IF NOT EXISTS fact_time_checked (
+    fact_id INTEGER PRIMARY KEY,
+    checked_at REAL NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'llm'
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_lem_fts USING fts5(
     text, content='fact_lem', content_rowid='id', tokenize='unicode61'
 );
@@ -564,6 +572,10 @@ class NeuroMatrixStore:
         # on that stale number.  Kept for that work; never on by default until measured.
         self.time_nudge_enabled = False
         self.time_nudge_weight = 0.12
+        # Ask a local model for event dates the patterns could not resolve.  OFF by
+        # default: it spends model calls per fact, so it is opt-in, background-shaped,
+        # and never re-asks about a fact it has already examined.
+        self.temporal_llm_enabled = False
         # Weight of the lemma channel inside RRF.  Always paired with the surface
         # channel, never replacing it.
         self.lemma_weight = 2.0
@@ -1009,6 +1021,79 @@ class NeuroMatrixStore:
             "INSERT OR REPLACE INTO fact_time(fact_id, event_ts, granularity) "
             "VALUES (?, ?, ?)", (int(fact_id), float(r.event_ts), str(r.granularity)))
         return True
+
+    def enrich_event_times_via_llm(self, *, limit: int = 200, batch: int = 8) -> int:
+        """Ask a model for the event date of facts the pattern resolver could not date.
+
+        Rules cover the turns that CONTAIN a time expression; this covers the ones that
+        need understanding ("right after the Japan trip").  Mem0 does this at write time
+        for every memory; here it is opt-in and background-shaped:
+
+        * only facts that have never been examined (``fact_time_checked``), so a pass
+          never re-asks about the same fact — the failure mode that turns such a feature
+          into silent, repeated expense;
+        * bounded per call, so a long backlog fills in gradually instead of blocking;
+        * a fact the model cannot date is RECORDED as examined and left undated.  Most
+          turns really have no date, and an invented one would be inherited by every
+          later "when" question.
+
+        Returns how many facts gained a date.
+        """
+        if not getattr(self, "temporal_llm_enabled", False):
+            return 0
+        llm = getattr(self, "llm", None)
+        if llm is None:
+            return 0
+        try:
+            if hasattr(llm, "available") and not llm.available():
+                return 0
+        except Exception:  # noqa: BLE001
+            return 0
+        from . import temporal
+
+        try:
+            rows = self._conn.execute(
+                "SELECT f.id, f.text, f.ts FROM facts f "
+                "WHERE f.archived = 0 AND f.kind NOT IN ('rule','resolved','capability') "
+                "AND NOT EXISTS (SELECT 1 FROM fact_time t WHERE t.fact_id = f.id) "
+                "AND NOT EXISTS (SELECT 1 FROM fact_time_checked c WHERE c.fact_id = f.id) "
+                "ORDER BY f.id LIMIT ?", (int(max(1, limit)),)).fetchall()
+        except sqlite3.Error:
+            return 0
+        done = 0
+        for i in range(0, len(rows), max(1, batch)):
+            chunk = rows[i:i + max(1, batch)]
+            if not getattr(self, "temporal_llm_enabled", False):
+                break  # switched off mid-run
+            for r in chunk:
+                fid, text, ts = int(r["id"]), str(r["text"] or ""), float(r["ts"])
+                resolved = None
+                try:
+                    resolved = temporal.resolve_with_llm(llm, text, ts)
+                except Exception:  # noqa: BLE001 - never break the sweep
+                    resolved = None
+                try:
+                    if resolved is not None:
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO fact_time(fact_id, event_ts, granularity) "
+                            "VALUES (?, ?, ?)",
+                            (fid, float(resolved.event_ts), str(resolved.granularity)))
+                        done += 1
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO fact_time_checked(fact_id, checked_at, source) "
+                        "VALUES (?, ?, ?)", (fid, time.time(), "llm"))
+                except sqlite3.Error:
+                    continue
+            try:
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+        if done:
+            try:
+                self._cache.clear()
+            except Exception:  # noqa: BLE001
+                pass
+        return done
 
     def rebuild_event_times(self, *, limit: Optional[int] = None, batch: int = 200) -> int:
         """Resolve event times for facts stored before this existed.

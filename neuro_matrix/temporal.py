@@ -422,3 +422,87 @@ def order_intent(query: str) -> Optional[str]:
     if _LAST_PAT.search(query) or _LAST_PAT_RU.search(query):
         return "last"
     return None
+
+
+# --------------------------------------------------------------------------
+# Language-model extraction, for what patterns cannot reach.
+#
+# Rules resolve 79.5% of the turns that CONTAIN a time expression; the rest need
+# understanding rather than matching ("right after the Japan trip", "when we
+# moved", "the week I started the new job").  Mem0 reports extracting a time
+# signature for every memory at write time; this is the local, opt-in equivalent.
+#
+# Two disciplines keep it honest.  First, the model may answer "no date" — most
+# turns genuinely have none, and a fabricated date is worse than an absent one,
+# because every downstream "when" question would inherit it.  Second, a fact that
+# has been examined is recorded as examined, so a background pass never re-asks
+# the same question forever (the failure mode that makes such features expensive
+# and silent).
+# --------------------------------------------------------------------------
+_LLM_SYSTEM = (
+    "You extract the calendar date of the EVENT described in one conversational "
+    "turn. Reply with JSON only, no prose.\n"
+    'Schema: {"date": "YYYY-MM-DD" or null, "precision": "day"|"month"|"year"|"season", '
+    '"evidence": "<the words that gave the date, or empty>"}\n'
+    "Rules:\n"
+    "- If the turn names no time reference for the event, date MUST be null. Never "
+    "invent a date and never fall back to the conversation date.\n"
+    "- Resolve relative expressions against the conversation date given to you.\n"
+    "- For a season or a whole month use the middle of that period and say so in "
+    'the precision field ("this summer" -> July, precision "season").\n'
+    "- A duration or a recurring habit is not a date: null.\n"
+)
+_PRECISION_MAP = {"day": "day", "month": "month", "year": "year", "season": "season"}
+
+
+def resolve_with_llm(llm: Any, text: str, anchor_ts: Optional[float] = None) -> Optional[Resolved]:
+    """Ask a language model when the event happened; None when it says it cannot tell."""
+    if llm is None or not (text or "").strip():
+        return None
+    try:
+        if hasattr(llm, "available") and not llm.available():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    anchor_txt = ""
+    if anchor_ts is not None:
+        try:
+            anchor_txt = _dt.datetime.fromtimestamp(float(anchor_ts)).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError, OverflowError):
+            anchor_txt = ""
+    user = (f"Conversation date: {anchor_txt or 'unknown'}\n"
+            f"Turn: {text.strip()[:600]}")
+    try:
+        out = llm.chat_json([
+            {"role": "system", "content": _LLM_SYSTEM},
+            {"role": "user", "content": user},
+        ])
+    except Exception:  # noqa: BLE001 - an optional enrichment must not raise
+        return None
+    if not isinstance(out, dict):
+        return None
+    raw = out.get("date")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    m = _ISO.search(raw)
+    if not m:
+        return None
+    d = _safe_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if d is None:
+        return None
+    precision = str(out.get("precision") or "day").strip().lower()
+    # Sanity: the model was told not to fall back to the conversation date, so a
+    # date identical to the anchor with day precision is suspicious when the turn
+    # carried no time words — cheap guard against exactly the failure we warned it
+    # about, since a wrong date is inherited by every later "when" question.
+    if anchor_ts is not None and precision == "day" and not has_event_date(text, anchor_ts):
+        try:
+            same = abs(d.timestamp() - float(anchor_ts)) < 86400.0
+        except (ValueError, OSError, OverflowError):
+            same = False
+        if same:
+            return None
+    return Resolved(d.timestamp(), _PRECISION_MAP.get(precision, "day"))
+
+
+_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
