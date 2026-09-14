@@ -70,6 +70,23 @@ _WEEKDAYS_RU_SORTED = sorted(_WEEKDAYS_RU.items(), key=lambda kv: -len(kv[0]))
 _YEAR = r"(1[89]\d{2}|20\d{2})"
 _DAY = r"([0-3]?\d)"
 
+# A bare four-digit number is NOT a date: "2019 dollars saved" and "model 2024"
+# are the same shape as "since 2019".  The resolver therefore requires temporal
+# CONTEXT around a year-only match — a preposition before it or a year word after
+# it — instead of accepting any 4-digit figure (the false positive the old
+# shape-only regex had and that this module inherited).
+_YEAR_BEFORE_RU = re.compile(
+    r"(?:^|[\s,;:(\[])(?:в|во|с|со|до|за|к|ко|около|примерно|уже|начиная\s+с)\s+$", re.I)
+_YEAR_BEFORE_EN = re.compile(
+    r"(?:^|[\s,;:(\[])(?:in|since|until|till|by|around|circa|from|during|of|year)\s+$", re.I)
+_YEAR_AFTER = re.compile(r"^\s*(?:год|году|года|год[а-яё]*|г\.|гг\.|year|years)\b", re.I)
+
+
+def _year_has_context(text: str, m: "re.Match[str]") -> bool:
+    before, after = text[: m.start()], text[m.end():]
+    return bool(_YEAR_AFTER.search(after) or _YEAR_BEFORE_RU.search(before)
+                or _YEAR_BEFORE_EN.search(before))
+
 # Ordered most-specific-first, the same discipline question_type() documents:
 # a full date also contains a bare year, so the coarse pattern must never be
 # tried first or it would win on every input.
@@ -215,10 +232,12 @@ def resolve(text: str, anchor_ts: Optional[float] = None) -> Optional[Resolved]:
                 return Resolved(_nearest_weekday(anchor_ts, wd), "day")
 
     m = _YEAR_ONLY.search(t)
-    if m:
-        d = _safe_date(int(m.group(1)), 1, 1)
-        if d:
-            return Resolved(d.timestamp(), "year")
+    while m:
+        if _year_has_context(t, m):
+            d = _safe_date(int(m.group(1)), 1, 1)
+            if d:
+                return Resolved(d.timestamp(), "year")
+        m = _YEAR_ONLY.search(t, m.end())
 
     return None
 

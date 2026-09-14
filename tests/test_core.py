@@ -2230,6 +2230,57 @@ def test_temporal_resolve_absolute_and_relative_dates():
     assert temporal.resolve("just a random sentence") is None
 
 
+def test_event_time_is_stored_separately_from_record_time():
+    """A fact's EVENT date is stored beside it (fact_time), distinct from when the
+    fact was recorded, and a bare number is never mistaken for a date."""
+    from neuro_matrix import temporal
+
+    path = os.path.join(tempfile.mkdtemp(), "evtime.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    record = time.mktime((2024, 1, 15, 12, 0, 0, 0, 0, -1))
+
+    dated = store.remember("She graduated on March 5, 2019 in Porto",
+                           source="turn", ts=record, importance=1.0)
+    # NOTE: both remaining facts carry an anchor on purpose — the write path
+    # treats an anchor-less statement as ephemeral chatter and drops it (measured:
+    # "We shipped the fix yesterday after the review" produced ZERO entities and
+    # was discarded).  Whether a dated action without a proper noun SHOULD be
+    # dropped is an open product question, not something to decide inside a test.
+    relative = store.remember("Constantine shipped the fix yesterday after the review",
+                              source="turn", ts=record, importance=1.0)
+    numeric = store.remember("The invoice for CoinCryptoRank said 2019 dollars",
+                             source="turn", ts=record, importance=1.0)
+    assert dated and relative and numeric, "premise: facts must be stored"
+
+    ev = store.event_time(dated)
+    assert ev is not None, "an explicit date must be stored as an event time"
+    assert time.strftime("%Y-%m-%d", time.localtime(ev[0])) == "2019-03-05"
+    assert ev[1] == "day"
+
+    # relative expression resolved against the fact's OWN record time
+    ev_rel = store.event_time(relative)
+    assert ev_rel is not None
+    assert time.strftime("%Y-%m-%d", time.localtime(ev_rel[0])) == "2024-01-14"
+
+    # a four-digit number is not a date (the old shape-only false positive)
+    assert store.event_time(numeric) is None, "a bare number became a date"
+
+    # backfill is idempotent and reaches facts written before the table existed
+    store._conn.execute("DELETE FROM fact_time")
+    store._conn.commit()
+    n = store.rebuild_event_times()
+    assert n >= 3
+    assert store.event_time(dated) is not None
+    # A fact that names NO date is retried on every pass (cheap, documented), so
+    # the second run visits only those — what must hold is that nothing is lost
+    # and no date appears where there was none.
+    second = store.rebuild_event_times()
+    assert second <= 3, f"second pass revisited too much: {second}"
+    assert store.event_time(dated) is not None
+    assert store.event_time(numeric) is None
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

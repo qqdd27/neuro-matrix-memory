@@ -209,6 +209,14 @@ CREATE TRIGGER IF NOT EXISTS fact_lem_au AFTER UPDATE ON fact_lem BEGIN
     INSERT INTO facts_lem_fts(facts_lem_fts, rowid, text) VALUES ('delete', old.id, old.text);
     INSERT INTO facts_lem_fts(rowid, text) VALUES (new.id, new.text);
 END;
+-- Event time (when something HAPPENED) as opposed to facts.ts (when the fact was
+-- RECORDED).  A side table, not a column on facts, so the resolver can be
+-- re-run/backfilled without touching stored text, exactly like fact_lem.
+CREATE TABLE IF NOT EXISTS fact_time (
+    fact_id INTEGER PRIMARY KEY,
+    event_ts REAL NOT NULL,
+    granularity TEXT NOT NULL DEFAULT 'day'
+);
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
     INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -514,6 +522,10 @@ class NeuroMatrixStore:
         # widens the window, costs no model, and degrades to identity when no
         # morphology backend is installed.
         self.fts_lemmatize = True
+        # Event-time extraction (when something HAPPENED vs when it was recorded).
+        # Zero-dependency stdlib resolver; on by default, and it only ever adds a
+        # stored date — it never changes which facts are returned.
+        self.temporal_enabled = True
         # Weight of the lemma channel inside RRF.  Always paired with the surface
         # channel, never replacing it.
         self.lemma_weight = 2.0
@@ -619,6 +631,10 @@ class NeuroMatrixStore:
                     (int(fact_id), morphology.normalize(text or "")))
             except (sqlite3.Error, ValueError):
                 pass
+        try:
+            self._index_event_time(fact_id, text or "", now)
+        except (sqlite3.Error, ValueError):
+            pass
         self._conn.commit()
         self._cache.clear()
         return fact_id
@@ -840,6 +856,67 @@ class NeuroMatrixStore:
                 break
         self._cache.clear()
         return done
+
+    def _index_event_time(self, fact_id: int, text: str, record_ts: float) -> bool:
+        """Store the EVENT time named in the text, if any.
+
+        ``record_ts`` is the fact's own record time and is used as the anchor for
+        relative/partial expressions ("last week", "on Tuesday") — never
+        wall-clock now, or the same fact would resolve to a different date on
+        every run.  Returns True when a date was found and stored.
+        """
+        if not getattr(self, "temporal_enabled", True):
+            return False
+        try:
+            from . import temporal
+        except Exception:  # noqa: BLE001 - optional module
+            return False
+        r = temporal.resolve(text, float(record_ts))
+        if r is None:
+            return False
+        self._conn.execute(
+            "INSERT OR REPLACE INTO fact_time(fact_id, event_ts, granularity) "
+            "VALUES (?, ?, ?)", (int(fact_id), float(r.event_ts), str(r.granularity)))
+        return True
+
+    def rebuild_event_times(self, *, limit: Optional[int] = None, batch: int = 200) -> int:
+        """Resolve event times for facts stored before this existed.
+
+        Same reasoning as ``reindex_propositions``/``rebuild_lemmas``: a channel
+        that only applies to facts written after an update is invisible on the
+        data a user already has.  Idempotent — only facts missing from
+        ``fact_time`` are touched (a fact with no date is retried, which is cheap
+        and keeps the function simple).
+        """
+        done = 0
+        while True:
+            take = batch if limit is None else min(batch, max(0, limit - done))
+            if take <= 0:
+                break
+            rows = self._conn.execute(
+                "SELECT f.id, f.text, f.ts FROM facts f "
+                "WHERE f.archived = 0 AND NOT EXISTS "
+                "(SELECT 1 FROM fact_time t WHERE t.fact_id = f.id) "
+                "ORDER BY f.id LIMIT ?", (int(take),)).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                try:
+                    self._index_event_time(int(r["id"]), str(r["text"] or ""), float(r["ts"]))
+                except (sqlite3.Error, ValueError):
+                    pass
+            self._conn.commit()
+            done += len(rows)
+            if len(rows) < take:
+                break
+        return done
+
+    def event_time(self, fact_id: int) -> Optional[tuple[float, str]]:
+        """(event_ts, granularity) for a fact, or None when it names no date."""
+        row = self._conn.execute(
+            "SELECT event_ts, granularity FROM fact_time WHERE fact_id = ?",
+            (int(fact_id),)).fetchone()
+        return (float(row["event_ts"]), str(row["granularity"])) if row else None
 
     def add_turn(
         self,
