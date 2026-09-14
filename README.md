@@ -574,6 +574,69 @@ reasoning:
   the materialisation step re-fetched them without checking `archived` or
   `active_until`, so a superseded decision could resurface through text search.
 
+## Understanding time: what the number was actually measuring
+
+The temporal category looked like this project's worst result (5.6% for the
+1.5B reader). A diagnosis of what the reader actually answers showed the number
+was largely an artefact of FORM:
+
+| question | gold answer | model answered | token-F1 |
+|---|---|---|---|
+| When did Evan lose his job? | `end of October 2023` | `2023-10-10` | 0.00 |
+| When is the family reunion? | `Summer 2024` | `2024-07-01` | 0.00 |
+| When did Calvin first visit Tokyo? | `between 26 March and 20 April 2023` | `2023-04-20` | 0.00 |
+
+Every answer names the right calendar point — October 2023, summer 2024, April
+2023 — and scores zero, because token-F1 compares SPELLING. The same fact written
+by a machine and by a person shares no tokens.
+
+Two changes, both measured on the same 607 questions with `qwen2.5:1.5b`:
+
+| | record date (A) | event date, ISO (B) | event date + human form |
+|---|---|---|---|
+| temporal F1 | 3.8% | 2.8% | **5.5%** |
+| overall F1 | 30.4% | 32.3% | 32.1% |
+
+1. The memory now hands over the fact's EVENT date (fact_time, resolved from the
+   text, anchored to the fact's own record time) with the weekday, in BOTH the
+   machine form and the way a person writes it: `[event 2023-10-10 Tue ·
+   October 10, 2023]`. Nothing about retrieval or ranking changed — the reader
+   simply no longer has to translate, and translating was measured to lose.
+2. A second metric is reported NEXT TO F1, never instead of it: **date accuracy**,
+   which asks whether the answer names the same calendar point. On the same run:
+
+| metric | value |
+|---|---|
+| temporal token-F1 | 5.5% |
+| **temporal date accuracy** | **63.4%** (52/82) |
+
+So this memory names the correct date in ~2 of 3 temporal questions, while token
+F1 reported 5.5%. Both numbers are printed on every run, so the gap can never be
+hidden by quoting only the flattering one — and the published 42-46% temporal
+figures from other systems are F1, not date accuracy, so they are NOT comparable
+to 63.4%.
+
+## Reader models: which number is comparable to which
+
+Two readers appear in this project's measurements, and **they are not
+interchangeable** — every recorded figure is pinned to the model that produced it:
+
+- **`qwen3.5:9b`** (Ollama, RTX 5060 Laptop) — the historical reference. All
+  figures up to and including v0.12.0 were produced with it. Kept for continuity;
+  do not mix these with newer ones.
+- **`qwen2.5:1.5b`** (~1 GB, Ollama) — the current measuring reader from
+  2026-09-14 on, used for a fast loop (a full 600-question run in minutes instead
+  of tens of minutes). Its baseline on the same 203-question sample was overall
+  F1 28.2%, and the shift was explained rather than assumed: retrieval
+  (evidence-hit@8) is IDENTICAL between the two readers (61.1%), so the memory
+  hands both the same evidence quality — the difference is reader behaviour, with
+  the larger model refusing to answer on 27% of adversarial questions against an
+  explicit "always guess" instruction while the smaller one never refuses.
+
+Consequence for reading any number here: a 9B figure and a 1.5B figure may be
+compared in DIRECTION, never in absolute value. When a claim matters, both arms of
+an A/B are run on the SAME reader, in the same session, on the SAME questions.
+
 ## Development
 
 ```bash

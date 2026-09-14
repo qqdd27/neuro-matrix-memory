@@ -244,3 +244,31 @@ def resolve(text: str, anchor_ts: Optional[float] = None) -> Optional[Resolved]:
 
 def has_event_date(text: str, anchor_ts: Optional[float] = None) -> bool:
     return resolve(text, anchor_ts) is not None
+
+
+_MONTH_NAMES_EN = ["", "January", "February", "March", "April", "May", "June", "July",
+                   "August", "September", "October", "November", "December"]
+
+
+def format_human(event_ts: float, granularity: str = "day") -> str:
+    """The date as a person writes it: "October 10, 2023" / "October 2023" / "2023".
+
+    Why this exists next to the ISO form: a stored fact is dated machine-style
+    (2023-10-10), but a question about it ("when did he lose his job?") is
+    answered — by a person or by a gold standard — in words ("end of October
+    2023").  Measured on the temporal category, a correct answer loses its score
+    purely on FORM: "2023-10-10" and "end of October 2023" share no token, so
+    token-F1 scores a right answer 0.00.  Handing the reader both forms does not
+    change what the memory found or how it ranked anything; it removes a
+    translation the reader was silently doing badly.
+    """
+    try:
+        d = _dt.datetime.fromtimestamp(float(event_ts))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    g = (granularity or "day").lower()
+    if g == "year":
+        return f"{d.year}"
+    if g == "month":
+        return f"{_MONTH_NAMES_EN[d.month]} {d.year}"
+    return f"{_MONTH_NAMES_EN[d.month]} {d.day}, {d.year}"

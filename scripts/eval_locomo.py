@@ -61,6 +61,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from neuro_matrix.store import NeuroMatrixStore  # noqa: E402
+from neuro_matrix.temporal import format_human as human_date  # noqa: E402
 from neuro_matrix.llm import (  # noqa: E402
     DEFAULT_BASE_URL, DEFAULT_MODEL, LLMClient, build_llm_client,
 )
@@ -118,6 +119,71 @@ def _normalize_answer_tokens(s: str) -> list[str]:
     s = str(s).lower()
     s = "".join(ch for ch in s if ch not in string.punctuation)
     return [t for t in s.split() if t not in _ARTICLES]
+
+
+_MONTH_WORDS = {
+    name: i for i, name in enumerate(
+        ["january", "february", "march", "april", "may", "june", "july", "august",
+         "september", "october", "november", "december"], start=1)
+}
+_MONTH_WORDS.update({"jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+                     "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12})
+_SEASONS = {"summer": (6, 8), "winter": (12, 2), "spring": (3, 5),
+            "fall": (9, 11), "autumn": (9, 11)}
+
+
+def _extract_dates(text: str) -> tuple[set[int], set[int], list[tuple[int, int]]]:
+    """Years, months and seasons named in a string (ISO dates included)."""
+    t = str(text or "").lower()
+    years = {int(y) for y in re.findall(r"\b(1[89]\d{2}|20\d{2})\b", t)}
+    months: set[int] = set()
+    # Machine-written dates first: "2023-10-10", "10/10/2023", "10.10.2023" — the
+    # form this project's own memory hands to the reader, and the reason a correct
+    # machine-formatted answer must count as the same calendar point as a gold
+    # answer written in words.
+    for y, m, _d in re.findall(r"\b(1[89]\d{2}|20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", t):
+        months.add(int(m))
+        years.add(int(y))
+    for m, _d, y in re.findall(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](1[89]\d{2}|20\d{2})\b", t):
+        months.add(int(m))
+        years.add(int(y))
+    for word, num in _MONTH_WORDS.items():
+        if re.search(rf"\b{word}", t):
+            months.add(num)
+    seasons = [span for word, span in _SEASONS.items() if word in t]
+    return years, months, seasons
+
+
+def date_hit(pred: str, gold: str) -> "bool | None":
+    """Does the answer name the same CALENDAR POINT as the gold answer?
+
+    Added because token-F1 scores a correct date 0.00 whenever the two are written
+    differently: measured on this benchmark, "2023-10-10" against "end of October
+    2023" (same month, right answer) and "2024-07-01" against "Summer 2024" both
+    score zero on shared tokens.  This is a SECOND measurement shown NEXT TO F1,
+    never a replacement — the point is to see how much of the temporal gap is real
+    misunderstanding and how much is spelling.
+
+    Returns None when the gold answer names no date (nothing to compare).
+    """
+    gy, gm, gseasons = _extract_dates(gold)
+    if not gy:
+        return None
+    py, pm, _ = _extract_dates(pred)
+    if not (gy & py):
+        return False
+    if not gm:                       # gold names only a year
+        return True
+    if gm & pm:                      # same year and a shared month
+        return True
+    for start, end in gseasons:      # "Summer 2024" vs a July date
+        for m in pm:
+            if start <= end:
+                if start <= m <= end:
+                    return True
+            elif m >= start or m <= end:
+                return True
+    return False
 
 
 def f1_score(pred: str, gold: str) -> float:
@@ -214,17 +280,39 @@ def _ctx_line(h: dict, *, resolve_relative: bool = False) -> str:
     memory (temporal had the best retrieval of all categories, hit@8 41.4%,
     and the worst answer score, F1 4.7%).
 
-    `resolve_relative` is OFF by default: annotating facts with resolved dates
-    measured worse on every category (temporal 7.3% -> 5.1% F1, overall 20.8%
-    -> 19.1%), because it perturbs every fact in the window.  Kept as a flag so
+    EVENT time beats record time where both exist: temporal questions ask when
+    something HAPPENED, and a fact can be recorded long after.  The weekday is
+    spelled out because "which day of the week" is a pure calendar lookup the
+    memory can do exactly and the reader frequently gets wrong.  Facts with no
+    resolvable event date keep the old record-time rendering.
+
+    `resolve_relative` is OFF by default: annotating every fact's TEXT with
+    resolved dates measured worse on every category (temporal 7.3% -> 5.1% F1,
+    overall 20.8% -> 19.1%), because it rewrites the window.  Kept as a flag so
     the negative result stays reproducible.
     """
+    text = str(h.get("text", ""))
+    ev = h.get("event_ts")
+    if ev:
+        try:
+            d = time.localtime(float(ev))
+            gran = str(h.get("event_granularity") or "day")
+            when = time.strftime("%Y-%m" if gran == "month" else
+                                 ("%Y" if gran == "year" else "%Y-%m-%d"), d)
+            if gran == "day":
+                when = f"{when} {time.strftime('%a', d)}"
+            human = human_date(ev, gran)
+            if human:
+                when = f"{when} · {human}"
+            body = absolutize_relative_dates(text, h.get("ts")) if resolve_relative else text
+            return f"[event {when}] {body}"
+        except (TypeError, ValueError, OSError):
+            pass
     ts = h.get("ts")
     try:
         when = time.strftime("%Y-%m-%d", time.localtime(float(ts))) if ts else ""
     except (TypeError, ValueError, OSError):
         when = ""
-    text = str(h.get("text", ""))
     if resolve_relative:
         text = absolutize_relative_dates(text, ts)
     return f"[{when}] {text}" if when else text
@@ -292,7 +380,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               type_boost: bool = False,
               type_boost_weight: "float | None" = None,
               edge_order: bool = False, fts_lemmas: "bool | None" = None,
-              lemma_weight: "float | None" = None) -> dict:
+              lemma_weight: "float | None" = None, event_date: bool = True) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -375,6 +463,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     diag_shown = [0]
     per_cat: dict[int, list[bool]] = {}
     per_cat_f1: dict[int, list[float]] = {}
+    per_cat_date: dict[int, list[bool]] = {}
     lat = []
     for qa in sample["qa"]:
         cat = int(qa.get("category") or 0)
@@ -388,6 +477,16 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             t0 = time.time()
             hits = store.search(qa["question"], limit=k, rerank=rerank and llm is not None)
             lat.append((time.time() - t0) * 1000)
+            if event_date:
+                for h in hits:
+                    # Attach the EVENT time so the reader sees when the fact's
+                    # event happened, not only when the fact was recorded.
+                    try:
+                        ev = store.event_time(h["fact_id"])
+                    except Exception:  # noqa: BLE001
+                        ev = None
+                    if ev:
+                        h["event_ts"], h["event_granularity"] = ev[0], ev[1]
             hit_blob = "\n".join(h.get("text", "") for h in hits)
             found = any(ev in hit_blob for ev in ev_texts)
             per_cat.setdefault(cat, []).append(found)
@@ -419,9 +518,13 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
                     mark = " <== EVIDENCE" if any(ev in line for ev in ev_texts) else ""
                     print(f"       {line[:160]}{mark}")
             per_cat_f1.setdefault(cat, []).append(f1_score(pred, gold))
+            dh = date_hit(pred, gold)
+            if dh is not None:
+                per_cat_date.setdefault(cat, []).append(bool(dh))
     store.close()
     return {"sample_id": sample["sample_id"], "per_cat": per_cat,
-            "per_cat_f1": per_cat_f1, "latency_ms": lat}
+            "per_cat_f1": per_cat_f1, "per_cat_date": per_cat_date,
+            "latency_ms": lat}
 
 
 def main(argv=None) -> int:
@@ -556,6 +659,9 @@ def main(argv=None) -> int:
                     help="weight of the lemma channel inside RRF (default 2.0); the "
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
+    ap.add_argument("--no-event-date", dest="event_date", action="store_false", default=True,
+                    help="render the RECORD date instead of the fact's EVENT date (A/B "
+                         "switch for the event-time change)")
     ap.add_argument("--diag", type=int, default=0,
                     help="print N questions (category --diag-cat) with gold answer, "
                          "retrieved context and the reader's prediction (diagnosis mode)")
@@ -622,6 +728,7 @@ def main(argv=None) -> int:
     t0 = time.time()
     all_per_cat: dict[int, list[bool]] = {}
     all_per_cat_f1: dict[int, list[float]] = {}
+    all_per_cat_date: dict[int, list[bool]] = {}
     all_lat: list[float] = []
     per_sample_summary = []
     for sample in data:
@@ -644,11 +751,14 @@ def main(argv=None) -> int:
                        type_boost_weight=args.type_boost_weight,
                        edge_order=bool(args.edge_order),
                        fts_lemmas=args.fts_lemmas,
-                       lemma_weight=args.lemma_weight)
+                       lemma_weight=args.lemma_weight,
+                       event_date=bool(args.event_date))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():
             all_per_cat_f1.setdefault(cat, []).extend(results)
+        for cat, results in r.get("per_cat_date", {}).items():
+            all_per_cat_date.setdefault(cat, []).extend(results)
         all_lat.extend(r["latency_ms"])
         n = sum(len(v) for v in r["per_cat"].values())
         hits = sum(sum(v) for v in r["per_cat"].values())
@@ -704,6 +814,27 @@ def main(argv=None) -> int:
         print(f"\nOVERALL QA-accuracy (F1): {avg_f1:.1%} "
               f"(sampled {total_f1_n}, model={llm.model if llm else args.llm_model})")
         lines_md.append(f"\n**Overall F1: {avg_f1:.1%}** (model={llm.model if llm else args.llm_model})")
+
+    if all_per_cat_date:
+        # Second, narrower measurement shown NEXT TO F1, never replacing it: does the
+        # answer name the same CALENDAR POINT as the gold answer?  A correct date
+        # written differently scores 0.00 on token F1 ("2023-10-10" vs "end of
+        # October 2023"), so this says how much of the temporal gap is spelling.
+        dn = sum(len(v) for v in all_per_cat_date.values())
+        dh = sum(sum(v) for v in all_per_cat_date.values())
+        print(f"\n=== DATE accuracy (calendar point, only questions whose gold names a "
+              f"date), n={dn} ===")
+        lines_md += ["", f"## Date accuracy (calendar point), n={dn}", "",
+                     "| Category | n | date-hit |", "|---|---|---|"]
+        for cat in sorted(all_per_cat_date):
+            v = all_per_cat_date[cat]
+            rate = sum(v) / len(v) if v else 0.0
+            name = CATEGORY_NAMES.get(cat, str(cat))
+            print(f"[{name:11s}] n={len(v):4d}  date-hit = {sum(v):4d}/{len(v):<4d} = {rate:.1%}")
+            lines_md.append(f"| {cat} {name} | {len(v)} | {sum(v)}/{len(v)} ({rate:.1%}) |")
+        d_rate = dh / dn if dn else 0.0
+        print(f"\nOVERALL date accuracy: {dh}/{dn} = {d_rate:.1%}")
+        lines_md.append(f"\n**Overall date accuracy: {d_rate:.1%}** ({dh}/{dn})")
 
     if args.out:
         Path(args.out).write_text("\n".join(lines_md) + "\n", encoding="utf-8")

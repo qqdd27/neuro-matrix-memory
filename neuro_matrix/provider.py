@@ -470,6 +470,14 @@ class NeuromatrixMemoryProvider(MemoryProvider):
             used = 0
             lines: list[str] = []
             for r in results:
+                # Attach the EVENT date (when it happened), not just the record
+                # date, so the agent sees time the way the memory knows it.
+                try:
+                    ev = self._store.event_time(r["fact_id"]) if self._store else None
+                except Exception:  # noqa: BLE001
+                    ev = None
+                if ev:
+                    r["event_ts"], r["event_granularity"] = ev[0], ev[1]
                 line = self._format_hit(r)
                 if lines and used + len(line) > budget:
                     break
@@ -667,6 +675,29 @@ class NeuromatrixMemoryProvider(MemoryProvider):
         via = f" (via {', '.join(r['via'][:3])})" if r.get("via") else ""
         if r["source"] == "dossier":
             return f"- {r['text']}"
+        # Event date when the fact names one (with the weekday, a calendar lookup
+        # the model gets wrong), falling back to the record date otherwise.
+        ev = r.get("event_ts")
+        if ev:
+            try:
+                d = time.localtime(float(ev))
+                gran = str(r.get("event_granularity") or "day")
+                when = time.strftime("%Y-%m" if gran == "month" else
+                                     ("%Y" if gran == "year" else "%Y-%m-%d"), d)
+                if gran == "day":
+                    when = f"{when} {time.strftime('%a', d)}"
+                human = ""
+                try:
+                    from .temporal import format_human
+
+                    human = format_human(float(ev), gran)
+                except Exception:  # noqa: BLE001
+                    human = ""
+                if human:
+                    when = f"{when} · {human}"
+                return f"- {r['text'][:300]}{via} [event {when}]"
+            except (TypeError, ValueError, OSError):
+                pass
         when = time.strftime("%Y-%m-%d", time.localtime(r["ts"])) if r.get("ts") else ""
         return f"- {r['text'][:300]}{via} [{when}]"
 
