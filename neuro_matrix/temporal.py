@@ -128,6 +128,83 @@ RELATIVE: list[tuple[re.Pattern, int]] = [
 ]
 
 
+_NUM_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "a": 1, "an": 1, "couple": 2, "few": 3,
+    "один": 1, "одна": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
+    "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10,
+    "пару": 2, "несколько": 3,
+}
+_UNIT_DAYS = {
+    "day": 1, "days": 1, "день": 1, "дня": 1, "дней": 1,
+    "week": 7, "weeks": 7, "неделю": 7, "недели": 7, "недель": 7,
+    "month": 30, "months": 30, "месяц": 30, "месяца": 30, "месяцев": 30,
+    "year": 365, "years": 365, "год": 365, "года": 365, "лет": 365,
+}
+_NUM_ALT = "|".join(sorted(_NUM_WORDS, key=len, reverse=True))
+_UNIT_ALT = "|".join(sorted(_UNIT_DAYS, key=len, reverse=True))
+
+# Arbitrary counts.  The table above (RELATIVE) covers the expressions someone
+# thought of in advance — "two weeks ago", "last month" — and that fixed list was
+# the reason 139 time expressions in a 1451-fact corpus never became dates: "3 days
+# ago" and "five weeks ago" simply were not in it.  This is the general form.
+_AGO = re.compile(rf"\b(?P<n>\d+|{_NUM_ALT})\s*(?P<u>{_UNIT_ALT})\s+(?:ago|назад)\b", re.I)
+
+# Seasons name a real calendar window, and are the case where the old code was not
+# merely silent but WRONG: "in the summer of 2022" resolved to 2022-01-01, a date the
+# text never claimed.  A season resolves to the middle of that season, at season
+# granularity, so the answer can be rendered as "Summer 2022".
+_SEASON_FIRST_MONTH = {
+    "spring": 3, "summer": 6, "autumn": 9, "fall": 9, "winter": 12,
+    "весна": 3, "весной": 3, "лето": 6, "летом": 6, "осень": 9, "осенью": 9,
+    "зима": 12, "зимой": 12,
+}
+_SEASON_ALT = "|".join(sorted(_SEASON_FIRST_MONTH, key=len, reverse=True))
+_SEASON_PAT = re.compile(
+    rf"\b(?:in\s+the\s+)?(?:(this|last|next)\s+)?({_SEASON_ALT})\b"
+    rf"(?:\s+(?:of\s+)?(\d{{4}}))?", re.I)
+
+# Vague expressions still place an event in time, coarsely: "recently" is not a
+# date, but it is certainly within the last couple of weeks, and saying so at week
+# granularity is honest — the alternative is claiming no time at all.
+_APPROX = re.compile(
+    r"\b(recently|lately|not long ago|a while ago|the other day|недавно|на днях)\b", re.I)
+_APPROX_DAYS = {"на днях": -4, "the other day": -4}
+
+
+# Extended rules (arbitrary "N ago", seasons, vague expressions).  Switchable so the
+# improvement can be measured against the fixed-table behaviour it replaces rather
+# than argued about.
+EXTENDED_RULES = True
+
+
+def _season_resolved(m: "re.Match[str]", anchor_ts: float) -> Optional[Resolved]:
+    rel, name, year_s = m.group(1), m.group(2).lower(), m.group(3)
+    first = _SEASON_FIRST_MONTH.get(name)
+    if not first:
+        return None
+    anchor = _dt.datetime.fromtimestamp(float(anchor_ts))
+    year = int(year_s) if year_s else anchor.year
+    if not year_s and rel:
+        rel = rel.lower()
+        if rel == "last":
+            year -= 1
+        elif rel == "next":
+            year += 1
+    d = _safe_date(year, first, 15)
+    return Resolved(d.timestamp(), "season") if d else None
+
+
+def _ago_resolved(m: "re.Match[str]", anchor_ts: float) -> Optional[Resolved]:
+    raw_n, unit = m.group("n").lower(), m.group("u").lower()
+    n = int(raw_n) if raw_n.isdigit() else _NUM_WORDS.get(raw_n)
+    days = _UNIT_DAYS.get(unit)
+    if not n or not days:
+        return None
+    granularity = "day" if days <= 7 else ("month" if days <= 60 else "year")
+    return Resolved(float(anchor_ts) - n * days * 86400.0, granularity)
+
+
 def _month_num(name: str) -> Optional[int]:
     n = (name or "").lower()
     if n in _MONTHS_EN:
@@ -212,6 +289,31 @@ def resolve(text: str, anchor_ts: Optional[float] = None) -> Optional[Resolved]:
                 continue
             return Resolved(float(anchor_ts) + delta * 86400.0, "day")
 
+    # General "N units ago" — anything the fixed table above did not enumerate.
+    if anchor_ts is not None and EXTENDED_RULES:
+        m = _AGO.search(t)
+        if m:
+            r = _ago_resolved(m, anchor_ts)
+            if r:
+                return r
+
+    # Seasons: a real calendar window, and the case the old code answered WRONGLY
+    # ("in the summer of 2022" -> 2022-01-01).  Checked before the bare-year rule,
+    # which is what produced that wrong answer.
+    if anchor_ts is not None and EXTENDED_RULES:
+        m = _SEASON_PAT.search(t)
+        if m:
+            r = _season_resolved(m, anchor_ts)
+            if r:
+                return r
+
+    # Coarse but honest: "recently" places the event within the last couple of weeks.
+    if anchor_ts is not None and EXTENDED_RULES:
+        m = _APPROX.search(t)
+        if m:
+            days = _APPROX_DAYS.get(m.group(1).lower(), -7)
+            return Resolved(float(anchor_ts) + days * 86400.0, "week")
+
     m = _MONTH_YEAR_EN.search(t)
     if m and _month_num(m.group(1)):
         d = _safe_date(int(m.group(2)), _month_num(m.group(1)), 1)
@@ -269,8 +371,21 @@ def format_human(event_ts: float, granularity: str = "day") -> str:
     g = (granularity or "day").lower()
     if g == "year":
         return f"{d.year}"
+    if g == "season":
+        # Which season contains this date?  December belongs to winter, which began
+        # in the previous calendar year's December — the Northern-hemisphere
+        # convention, stated plainly rather than implied.
+        if d.month in (12, 1, 2):
+            label, year = "Winter", d.year if d.month != 12 else d.year
+            return f"{label} {year}"
+        for name, first in (("Spring", 3), ("Summer", 6), ("Autumn", 9)):
+            if first <= d.month < first + 3:
+                return f"{name} {d.year}"
+        return f"{d.year}"
     if g == "month":
         return f"{_MONTH_NAMES_EN[d.month]} {d.year}"
+    if g == "week":
+        return f"around {_MONTH_NAMES_EN[d.month]} {d.day}, {d.year}"
     return f"{_MONTH_NAMES_EN[d.month]} {d.day}, {d.year}"
 
 

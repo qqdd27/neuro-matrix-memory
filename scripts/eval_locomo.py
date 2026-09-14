@@ -315,6 +315,23 @@ def absolutize_relative_dates(text: str, ts: float | None) -> str:
     return f"{text}  (relative time resolved: {'; '.join(hits)})"
 
 
+def _looks_temporal(question: str) -> bool:
+    """Does the question ask about time at all (when, how long, since when)?
+
+    Separated from order_intent, which detects "first/last" specifically: this is the
+    broader "the answer is a date or a duration" case, where a chronological reading
+    of the retrieved facts is what the question needs.
+    """
+    q = (question or "").lower()
+    if not q:
+        return False
+    en = ("when", "what date", "what day", "how long", "how many days", "how many weeks",
+          "how many months", "how many years", "since when", "how often", "at what time")
+    ru = ("когда", "какого числа", "какой день", "как долго", "сколько дней", "сколько недель",
+          "сколько месяцев", "сколько лет", "с каких пор", "как часто", "во сколько")
+    return any(w in q for w in en) or any(w in q for w in ru)
+
+
 def _ctx_line(h: dict, *, resolve_relative: bool = False) -> str:
     """Render one hit the way the LIVE agent sees it.
 
@@ -426,6 +443,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               edge_order: bool = False, fts_lemmas: "bool | None" = None,
               lemma_weight: "float | None" = None, event_date: bool = True,
               anaphora: bool = True, time_order: bool = True,
+              time_nudge: bool = True, time_nudge_weight: "float | None" = None,
+              chrono_context: bool = False,
               judge: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
@@ -467,6 +486,9 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
         store.lemma_weight = float(lemma_weight)
     store.anaphora_enabled = bool(anaphora)
     store.time_order_enabled = bool(time_order)
+    store.time_nudge_enabled = bool(time_nudge)
+    if time_nudge_weight is not None:
+        store.time_nudge_weight = float(time_nudge_weight)
     if fts_lemmas:
         # Facts are written below through remember(), which indexes the lemma
         # form when the flag is on; nothing else to backfill in a fresh store.
@@ -546,6 +568,20 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             # something next to "the bare model scored X%".
             hits = []
         if llm is not None and use_reader:
+            if chrono_context and hits:
+                # GRAVITY's finding, applied to presentation rather than to ranking:
+                # the generator fails not because evidence is missing but because the
+                # temporal relations BETWEEN the retrieved facts are left implicit.
+                # For a question that asks about time, the same facts are handed over
+                # in chronological order, so the sequence is readable instead of being
+                # reconstructed.  This does not change what was retrieved or how it
+                # was ranked — only the order the reader sees, oldest first.
+                from neuro_matrix import temporal as _T
+
+                if _T.order_intent(qa["question"]) or _looks_temporal(qa["question"]):
+                    hits = sorted(
+                        hits,
+                        key=lambda h: float(h.get("event_ts") or h.get("ts") or 0.0))
             ctx_lines = [_ctx_line(h, resolve_relative=resolve_relative) for h in hits]
             pred = llm_answer(llm, qa["question"], ctx_lines)
             # Category 5 (adversarial) stores its gold answer under a
@@ -712,6 +748,20 @@ def main(argv=None) -> int:
                     help="weight of the lemma channel inside RRF (default 2.0); the "
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
+    ap.add_argument("--no-temporal-extended", dest="temporal_extended",
+                    action="store_false", default=True,
+                    help="resolve only the fixed expression table (no arbitrary "
+                         "'N ago', no seasons, no vague phrases) — for A/B measurement")
+    ap.add_argument("--chrono-context", action="store_true",
+                    help="hand temporally-asked questions their retrieved facts in "
+                         "chronological order (GRAVITY: relations between facts must "
+                         "be explicit, retrieval is not the bottleneck)")
+    ap.add_argument("--no-time-nudge", dest="time_nudge", action="store_false",
+                    default=True,
+                    help="disable the additive temporal bonus for 'last/first' "
+                         "questions (for A/B measurement)")
+    ap.add_argument("--time-nudge-weight", type=float, default=None,
+                    help="weight of the additive temporal bonus (default 0.12)")
     ap.add_argument("--only-intent", choices=["last", "first", "any"],
                     default=None,
                     help="measure ONLY the questions that ask for an extreme by date "
@@ -755,6 +805,11 @@ def main(argv=None) -> int:
     llm = None
     qa_filter = None
     use_reader = args.llm
+    # Extended temporal rules (arbitrary "N ago", seasons, vague phrases): switchable
+    # so the date-coverage gain can be measured, not assumed.
+    from neuro_matrix import temporal as _temporal_mod
+
+    _temporal_mod.EXTENDED_RULES = bool(args.temporal_extended)
     use_rerank = args.rerank
     if use_reader or use_rerank:
         provider = args.llm_provider or (
@@ -843,6 +898,9 @@ def main(argv=None) -> int:
                        event_date=bool(args.event_date),
                        anaphora=bool(args.anaphora),
                        time_order=bool(args.time_order),
+                       time_nudge=bool(args.time_nudge),
+                       time_nudge_weight=args.time_nudge_weight,
+                       chrono_context=bool(args.chrono_context),
                        judge=bool(args.judge))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)

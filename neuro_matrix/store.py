@@ -556,6 +556,14 @@ class NeuroMatrixStore:
         # session, so "latest" degenerates to "last session".
         # See docs/locomo-local-v020-time-order.md.
         self.time_order_enabled = False
+        # Additive version of the same idea (Mem0's formula).  OFF: it re-sorted the
+        # candidate list by the `score` field, which AFTER channel fusion no longer
+        # matches the order (fusion ranks by RRF; `score` keeps the older heuristic
+        # value) — so the bonus silently undid the fusion and recall fell 61.3% -> 36.0%
+        # on the target subset.  A correct version has to act on the fused order, not
+        # on that stale number.  Kept for that work; never on by default until measured.
+        self.time_nudge_enabled = False
+        self.time_nudge_weight = 0.12
         # Weight of the lemma channel inside RRF.  Always paired with the surface
         # channel, never replacing it.
         self.lemma_weight = 2.0
@@ -1794,6 +1802,50 @@ class NeuroMatrixStore:
                 pass
         return out
 
+    def _apply_temporal_nudge(self, query: str, results: list[dict[str, Any]],
+                              limit: int) -> list[dict[str, Any]]:
+        """Additive time signal — the Mem0 formula, not a promotion.
+
+        Read off their published result: temporal scoring "nudges ranking toward the
+        right dated instance; semantic relevance always dominates", worth +9.1 pts at
+        top_50 and +6.7 on temporal questions.  Our first attempt promoted the extreme
+        fact to the front, which REPLACES the semantic order and cost 0.9 pp of
+        recall; this adds a bounded bonus instead, so a precise hit keeps winning and
+        a dated instance only wins among near-ties.  Their second finding is also
+        honoured: the pool is widened (the default window is 8, too narrow for a date
+        signal to distinguish anything), while the RETURNED window stays `limit`.
+
+        The bonus is a fraction of the score, so it can never invert a clear ranking.
+        """
+        from . import temporal
+
+        intent = temporal.order_intent(query)
+        if not intent or not results:
+            return results
+        pool_n = min(len(results), max(int(limit) * 4, 32))
+        pool = results[:pool_n]
+        ts_map = self._event_time_map([int(h["fact_id"]) for h in pool])
+        vals = [ts_map[int(h["fact_id"])] for h in pool if int(h["fact_id"]) in ts_map]
+        if len(vals) < 3:
+            return results
+        lo, hi = min(vals), max(vals)
+        span = (hi - lo) or 1.0
+        weight = float(getattr(self, "time_nudge_weight", 0.12))
+        nudged: list[dict[str, Any]] = []
+        for h in pool:
+            h = dict(h)
+            v = ts_map.get(int(h["fact_id"]))
+            if v is not None:
+                norm = (v - lo) / span
+                if intent == "first":
+                    norm = 1.0 - norm
+                bonus = weight * norm * float(h.get("score") or 0.0)
+                h["score"] = round(float(h.get("score") or 0.0) + bonus, 6)
+                h["time_nudge"] = round(bonus, 6)
+            nudged.append(h)
+        nudged.sort(key=lambda x: x["score"], reverse=True)
+        return nudged + results[pool_n:]
+
     def _apply_time_order(self, query: str, results: list[dict[str, Any]],
                           limit: int) -> list[dict[str, Any]]:
         """Promote the earliest/latest fact when the question asks for an extreme.
@@ -2109,6 +2161,7 @@ class NeuroMatrixStore:
             f":mmr={getattr(self, 'mmr_enabled', None)}:bridge={getattr(self, 'bridge_enabled', None)}"
             f":cap={getattr(self, 'per_kind_cap', None)}"
             f":to={getattr(self, 'time_order_enabled', None)}"
+            f":tn={getattr(self, 'time_nudge_enabled', None)}:{getattr(self, 'time_nudge_weight', None)}"
         )
         cache_key = (f"{query}|{limit}|{include_dossiers}|{as_of!r}|rerank={rerank}|{_opts}")
         # Repeated-question cache: an identical normalized ask that was
@@ -2322,6 +2375,16 @@ class NeuroMatrixStore:
             try:
                 results = self._apply_time_order(query, results, limit)
             except Exception:  # noqa: BLE001 - ordering must never break recall
+                pass
+
+        # Additive temporal signal for "last/first" questions (Mem0's formula:
+        # "semantic relevance always dominates").  Applied AFTER the hard promotion
+        # branch, which stays off — the two answer the same question in opposite ways
+        # and are never on together.
+        if getattr(self, "time_nudge_enabled", False) and as_of is None and results:
+            try:
+                results = self._apply_temporal_nudge(query, results, limit)
+            except Exception:  # noqa: BLE001 - scoring must never break recall
                 pass
 
         # LLM rerank (§10, optional): heuristic top-k -> LLM order.  Only when a

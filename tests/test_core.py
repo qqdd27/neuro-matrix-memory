@@ -2314,6 +2314,41 @@ def test_anaphora_makes_a_pronoun_fact_findable_by_name():
     store.close()
 
 
+def test_temporal_resolver_covers_the_gaps_research_pointed_at():
+    """The fixed expression table covered only what someone thought of in advance, so
+    "3 days ago" and "this summer" produced no date at all, and "in the summer of
+    2022" produced a date the text never claimed (2022-01-01).  Extended rules close
+    those; a bare number must still not become a date."""
+    from neuro_matrix import temporal as T
+
+    anchor = 1789000000.0  # 2026-09-10
+    T.EXTENDED_RULES = True
+    got = {}
+    for phrase in ("I joined 3 days ago", "five weeks ago I moved", "this summer we traveled",
+                   "in the summer of 2022", "we went recently", "два месяца назад",
+                   "летом 2022", "back in winter 2021"):
+        r = T.resolve(phrase, anchor)
+        got[phrase] = (r.granularity, T.format_human(r.event_ts, r.granularity)) if r else None
+        assert r is not None, f"no date for {phrase!r}"
+
+    assert got["I joined 3 days ago"][0] == "day"
+    assert got["in the summer of 2022"][1] == "Summer 2022", got["in the summer of 2022"]
+    assert got["this summer we traveled"][1] == "Summer 2026", got["this summer we traveled"]
+    assert got["летом 2022"][1] == "Summer 2022", got["летом 2022"]
+    assert got["we went recently"][0] == "week"
+
+    # numbers and modal verbs must NOT become dates
+    for phrase in ("I have 3 apples and 2 oranges", "you may want to check that",
+                   "the meeting was productive"):
+        assert T.resolve(phrase, anchor) is None, f"false date for {phrase!r}"
+
+    # and the switch really switches
+    T.EXTENDED_RULES = False
+    assert T.resolve("I joined 3 days ago", anchor) is None
+    assert T.resolve("this summer we traveled", anchor) is None
+    T.EXTENDED_RULES = True
+
+
 def test_time_order_promotes_the_extreme_when_the_question_asks_for_it():
     """"last time" must NOT return the most similar fact, but the latest one —
     and an ordinary question must be left exactly as it was ranked."""
@@ -2343,6 +2378,33 @@ def test_time_order_promotes_the_extreme_when_the_question_asks_for_it():
     # a question that asks for no extreme keeps the ranking untouched
     plain = store.search("Where is the pottery studio?", limit=8)
     assert "time_order" not in plain[0]
+    store.close()
+
+
+def test_temporal_nudge_adds_a_bounded_bonus_and_never_replaces_relevance():
+    """Mem0's formula: the date signal NUDGES, it does not promote.  A bonus must be
+    attached only for extreme-seeking questions, must stay a fraction of the score,
+    and must not reorder a clear semantic winner."""
+    path = os.path.join(tempfile.mkdtemp(), "nudge.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.time_order_enabled = False
+    store.time_nudge_enabled = True
+    base = time.time() - 300 * 86400
+    for i in range(4):
+        store.remember(f"Caroline pottery studio session number {i} in Lisbon",
+                       source="turn", session_id="s1",
+                       ts=base + i * 60 * 86400, importance=1.0)
+
+    ask = store.search("When did Caroline last visit the pottery studio?", limit=4)
+    assert ask, "premise: recall must return something"
+    nudged = [h for h in ask if h.get("time_nudge")]
+    assert nudged, "no bonus attached for an extreme-seeking question"
+    for h in nudged:
+        assert 0.0 < float(h["time_nudge"]) <= 0.12 * float(h["score"]) + 1e-6
+
+    # a question with no extreme keeps every score untouched
+    plain = store.search("Where is the pottery studio?", limit=4)
+    assert not [h for h in plain if h.get("time_nudge")], "bonus leaked into a plain question"
     store.close()
 
 
