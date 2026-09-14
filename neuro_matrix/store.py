@@ -1103,6 +1103,55 @@ class NeuroMatrixStore:
                 pass
         return done
 
+    def archive_garbage_capabilities(self) -> int:
+        """Archive capability rows that are fragments rather than capabilities.
+
+        Same defect family as the dead ends above, found in the same way: the capture
+        read the ASSISTANT's own answers, so a formatted reply yielded
+        "[capability] модуль: работы агента на своём домене** (там он попадает ~100%…".
+        It matters more here than anywhere else, because capabilities are part of the
+        CACHEABLE prefix: such a fragment would ship on every single turn, unchanged,
+        ahead of the real rules.  Archiving (never deleting), only unambiguous junk.
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT id, text FROM facts WHERE kind='capability' AND archived=0"
+            ).fetchall()
+        except sqlite3.Error:
+            return 0
+        junk: list[int] = []
+        for r in rows:
+            t = str(r["text"] or "").strip()
+            body = t.split(":", 1)[1].strip() if t.startswith("[capability]") and ":" in t else t
+            head = body.split()[0].lower().strip(".,;:()[]") if body.split() else ""
+            # A real capability names a PURPOSE ("управления состоянием", "fetching
+            # market data").  A fragment starts with whatever word happened to precede
+            # the marker in the assistant's sentence ("старых записей").  Purpose words
+            # are processes or infinitives; genitive adjectives and stray nouns are not.
+            purpose_like = head.endswith(
+                ("ание", "ания", "анию", "ании", "ением", "ения", "ению", "ении",
+                 "ация", "ации", "ацию", "иция", "ции", "цией", "ция",
+                 "ость", "ости", "остью", "ства", "ство", "ством",
+                 "ние", "ния", "нию", "нии", "тие", "тия", "тие",
+                 "ка", "ки", "ку", "кой",
+                 "ать", "ить", "еть", "ыть", "ти",
+                 "ing", "tion", "sion", "ment", "ance", "ence", "data", "market"))
+            if (not body or len(body) < 4 or len(body) > 90 or not head
+                    or not purpose_like
+                    or any(ch in body for ch in ("**", "`", "|", "#", "\n", "•", "…"))
+                    or body.count("(") != body.count(")")
+                    or body.count("[") != body.count("]")
+                    or body.rstrip().endswith("*")):
+                junk.append(int(r["id"]))
+        if not junk:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE facts SET archived=1 WHERE id=?", [(i,) for i in junk])
+            self._conn.commit()
+            self._cache.clear()
+        return len(junk)
+
     def archive_garbage_deadends(self) -> int:
         """Archive dead ends the old auto-detector invented out of assistant prose.
 
@@ -1258,7 +1307,14 @@ class NeuroMatrixStore:
                         logging.getLogger("neuro_matrix").debug(
                             "auto_outcome skipped", exc_info=True)
         if getattr(self, "capability_enabled", True):
-            for txt in (assistant_content, user_content or ""):
+            # The user's own words are the signal, NOT the assistant's report.  Reading
+            # assistant prose produced exactly the same garbage class as the dead ends
+            # above: a live profile stored "[capability] модуль: работы агента на своём
+            # домене** (там он попадает ~100%…" — a fragment of the assistant's own
+            # answer, counted as knowledge about a tool.  Capabilities live in the
+            # CACHEABLE prefix, so such a fragment is not just noise: it ships on every
+            # turn, byte-identical, forever.
+            for txt in (user_content or "",):
                 if txt and not _is_notification(txt) and not _is_trivial(txt):
                     try:
                         self._extract_capabilities(txt, now_, session_id)
@@ -3030,6 +3086,60 @@ class NeuroMatrixStore:
         return self.remember(text, kind="self", source="self-model",
                              ts=ts, importance=1.0)
 
+    # ------------------------------------------------ cacheable prefix (stable layer)
+
+    # Kinds that are stable BY CONSTRUCTION.  A rule or a constraint does not change
+    # between two turns, so a block built only from them is byte-identical across
+    # turns — and byte-identity is the whole game: provider prompt caching keys on an
+    # exact prefix match, so dynamic content near the top of a prompt destroys a 90%
+    # input discount for everything after it.  Recall output is deliberately NOT here:
+    # it is derived from the current question and belongs at the END of the prompt.
+    STABLE_KINDS = ("rule", "constraint", "self", "capability")
+
+    def stable_block(self, *, max_chars: int = 4000) -> str:
+        """The part of memory that is the same on every turn — the cacheable prefix.
+
+        Deterministic by construction: sorted by id, no timestamps, no counters, no
+        "now", no recency ordering.  Two calls with the same stable facts return the
+        same bytes, which is what lets the provider reuse its KV state instead of
+        recomputing the prefill.  Adding ordinary knowledge does not change this block
+        (so the cache survives); adding a rule does (and invalidation is then correct).
+        """
+        rows = []
+        try:
+            q = ("SELECT id, kind, text FROM facts WHERE archived=0 AND kind IN "
+                 "(" + ",".join("?" * len(self.STABLE_KINDS)) + ") ORDER BY id ASC")
+            rows = self._conn.execute(q, tuple(self.STABLE_KINDS)).fetchall()
+        except sqlite3.Error:
+            rows = []
+        head = "[memory:stable " + self.block_version() + "]"
+        out = [head]
+        used = len(head) + 1
+        for r in rows:
+            line = f"- {r['kind']}: {str(r['text']).strip()}"
+            if used + len(line) + 1 > max_chars:
+                break
+            out.append(line)
+            used += len(line) + 1
+        return "\n".join(out) + "\n"
+
+    def block_version(self) -> str:
+        """Version of the stable block — changes only when its CONTENT changes.
+
+        Lets a caller detect invalidation explicitly instead of guessing, and keeps
+        the block self-describing in logs without ever embedding a timestamp (which
+        would itself break the cache).
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT id, kind, text FROM facts WHERE archived=0 AND kind IN "
+                "(" + ",".join("?" * len(self.STABLE_KINDS)) + ") ORDER BY id ASC",
+                tuple(self.STABLE_KINDS)).fetchall()
+            payload = "\n".join(f"{r['id']}|{r['kind']}|{r['text']}" for r in rows)
+        except sqlite3.Error:
+            payload = ""
+        return "v1:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
     def export_experience(self, path: str, *, only: str = "") -> int:
         """Write the accumulated attempts as JSONL for training.
 
@@ -3597,7 +3707,17 @@ class NeuroMatrixStore:
         after = text[idx + mlen: idx + mlen + 200]
         cap = after.split("?")[0].split(".")[0].split("!")[0].split(";")[0]
         cap = cap.strip(" ,;:—–-")
-        if len(cap) < 4:
+        # A capability must read as a thing the tool is FOR, not as a slice of prose.
+        # Markdown emphasis, backticks, bullets and unbalanced brackets are the
+        # fingerprints of a fragment cut out of a formatted answer — and this text ends
+        # up in the cacheable prefix, so a fragment would be repeated on every turn.
+        if any(bad in cap for bad in ("**", "`", "|", "##", "\n", "•", "…")):
+            return None
+        if cap.count("(") != cap.count(")") or cap.count("[") != cap.count("]"):
+            return None
+        if cap.count("**") or cap.rstrip().endswith(("*", "%")):
+            return None
+        if len(cap) < 4 or len(cap) > 90:
             return None
         cap = cap[:160]
         for _stop in ("продолжаем", "дальше ", "потом ", "кроме того",

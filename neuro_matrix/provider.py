@@ -263,6 +263,15 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                         logger.info("neuromatrix: archived %d junk dead ends", g)
                 except Exception as e:  # noqa: BLE001 - never break the agent
                     logger.debug("neuromatrix dead-end cleanup failed: %s", e)
+                try:
+                    # Same retroactive cleanup for capabilities captured out of the
+                    # assistant's prose.  They sit in the cacheable prefix, so a
+                    # fragment there is repeated on every turn until removed.
+                    c = self._store.archive_garbage_capabilities()
+                    if c:
+                        logger.info("neuromatrix: archived %d junk capabilities", c)
+                except Exception as e:  # noqa: BLE001 - never break the agent
+                    logger.debug("neuromatrix capability cleanup failed: %s", e)
 
             threading.Thread(target=_run, name="neuromatrix-structure-backfill",
                              daemon=True).start()

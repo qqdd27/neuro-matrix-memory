@@ -1304,20 +1304,24 @@ def test_deadend_episode_wiring_and_explain() -> None:
 def test_capability_auto_ru_en() -> None:
     path = os.path.join(tempfile.mkdtemp(), "cap.db")
     store = _fresh(path)
+    # The USER's words are the signal.  Reading the assistant's answers instead
+    # filled a live profile with fragments ("[capability] модуль: работы агента на
+    # своём домене** (там он попадает ~100%…") — all 15 stored capabilities were
+    # such junk, and capabilities ship in the cacheable prefix.
     store.add_turn(
-        "Возьмём Riverpod для стейта?",
-        "Используем Riverpod для управления состоянием приложения.", session_id="s1",
+        "Используем Riverpod для управления состоянием приложения.",
+        "ок", session_id="s1",
     )
     store.add_turn(
-        "ок",
-        "We use Riverpod for state management and code generation.", session_id="s2",
+        "We use Riverpod for state management and code generation.",
+        "ок", session_id="s2",
     )
     caps = store.capabilities("Riverpod")
     assert len(caps) == 2, caps
     joined = " | ".join(c["capability"] for c in caps).lower()
     assert "состоянием" in joined and "state management" in joined, joined
     # dedup: identical statement again must not duplicate
-    store.add_turn("", "Используем Riverpod для управления состоянием приложения.",
+    store.add_turn("Используем Riverpod для управления состоянием приложения.", "ок",
                    session_id="s3")
     assert len(store.capabilities("riverpod")) == 2
     store.close()
@@ -2348,6 +2352,94 @@ def test_self_model_reports_what_the_instance_actually_is():
     assert m["attempts"] == 1 and m["dead_ends"] == 0, m
     assert m["measured"]["evidence_hit_at_8"], m["measured"]
     assert m["weak_spots"] and m["strong_spots"], m
+    store.close()
+
+
+def test_capabilities_are_not_harvested_from_the_assistant():
+    """A capability is something the USER said a tool is for.  Reading the assistant's
+    own prose manufactured fragments, and they land in the cacheable prefix."""
+    path = os.path.join(tempfile.mkdtemp(), "cap.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+
+    # the assistant describing a tool must not become a capability
+    store.add_turn("ок",
+                   "NeuroMatrix используется для поиска фактов, "
+                   "и он слаб как универсальный retriever чужих диалогов.",
+                   session_id="s1")
+    caps = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind='capability' AND archived=0").fetchone()["c"]
+    assert caps == 0, "assistant prose must not be harvested as capability"
+
+    # the user saying what a tool is for IS the signal
+    store.add_turn("Используем Riverpod для управления состоянием", "ок", session_id="s2")
+    rows = store._conn.execute(
+        "SELECT text FROM facts WHERE kind='capability' AND archived=0").fetchall()
+    assert rows, "a user's statement of what a tool is for must be captured"
+    body = str(rows[0]["text"])
+    assert "**" not in body and body.count("(") == body.count(")"), body
+    store.close()
+
+
+def test_junk_capability_fragments_are_archived_on_startup():
+    path = os.path.join(tempfile.mkdtemp(), "capjunk.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    with store._lock:
+        store._conn.execute(
+            "INSERT INTO facts (kind, text, ts, source, importance, archived, session_id) "
+            "VALUES ('capability', ?, ?, 'capability', 5.0, 0, '')",
+            ("[capability] модуль: работы агента на своём домене** (там он попадает "
+             "~100% и стоит миллисекунды) и **слаб как универсальный", time.time()))
+        store._conn.commit()
+    assert store.archive_garbage_capabilities() >= 1, "the fragment must be archived"
+    left = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind='capability' AND archived=0").fetchone()["c"]
+    assert left == 0, "archived, not deleted: still in the table"
+    total = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind='capability'").fetchone()["c"]
+    assert total == 1, "archiving must never delete the row"
+    store.close()
+
+
+def test_stable_block_is_byte_identical_between_turns_and_survives_new_knowledge():
+    """The cacheable prefix must not move when ordinary knowledge arrives — otherwise
+    the provider cache breaks on every write and the 90% discount is lost."""
+    path = os.path.join(tempfile.mkdtemp(), "cache.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.remember("never change the site design without permission",
+                   kind="rule", source="turn", session_id="s1")
+    store.remember_self("recall budget is 1500 characters")
+
+    first = store.stable_block()
+    second = store.stable_block()
+    assert first == second, "stable block must be byte-identical between turns"
+    assert "never change the site design" in first, first
+
+    # ordinary knowledge arrives — the cacheable prefix must not budge
+    for i in range(5):
+        store.remember(f"Caroline fixed the pipeline stage {i} on Friday",
+                       source="turn", session_id="s2")
+    assert store.stable_block() == first, "new knowledge must not invalidate the prefix"
+
+    # a new RULE is a real change, and invalidation is then correct
+    v_before = store.block_version()
+    store.remember("always verify with a real test before reporting done",
+                   kind="rule", source="turn", session_id="s3")
+    assert store.block_version() != v_before, "a new rule must bump the block version"
+    assert store.stable_block() != first, "a new rule belongs in the block"
+    assert store.block_version().startswith("v1:"), store.block_version()
+    store.close()
+
+
+def test_stable_block_carries_no_timestamp_anywhere():
+    """One embedded 'now' would break the cache on every single turn."""
+    import re as _re
+    path = os.path.join(tempfile.mkdtemp(), "notime.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.remember("keep the deploy sequential, one service at a time",
+                   kind="rule", source="turn", session_id="s1")
+    block = store.stable_block()
+    bad = _re.findall(r"\d{4}-\d{2}-\d{2}|\d{2}:\d{2}|ago\b|recently", block)
+    assert not bad, f"stable block must not contain time-varying text: {bad}"
     store.close()
 
 
