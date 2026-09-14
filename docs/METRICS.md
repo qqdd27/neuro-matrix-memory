@@ -4,23 +4,24 @@
 
 ## Сводка по прогонам
 
-| отчёт | n | модель | попадание факта@8 | ответы F1 | точность даты |
-|---|---|---|---|---|---|
-| locomo-local-baseline.md | 154 | qwen3.5:9b | — | 7.9% | — |
-| locomo-local-memory-dated.md | 154 | qwen3.5:9b | 31.8% | 15.7% | — |
-| locomo-local-memory.md | 154 | qwen3.5:9b | 31.8% | 15.7% | — |
-| locomo-local-v010.md | 154 | qwen3.5:9b | 53.2% | 24.6% | — |
-| locomo-local-v011.md | 154 | qwen3.5:9b | 53.2% | 28.2% | — |
-| locomo-local-v012-lemmas.md | 154 | qwen3.5:9b | 55.2% | 25.3% | — |
-| locomo-local-v012-typeboost.md | 154 | qwen3.5:9b | 53.9% | 25.1% | — |
-| locomo-local-v013-edgeorder.md | 154 | qwen3.5:9b | 49.4% | 22.2% | — |
-| locomo-local-v013-lemmas-beside.md | 154 | qwen3.5:9b | 62.3% | 28.9% | — |
-| locomo-local-v014-temporal-typeboost.md | ? | qwen3.5:9b | — | — | — |
-| locomo-local-v015-reader-qwen2.5-1.5b.md | 203 | qwen2.5:1.5b | 61.1% | 28.2% | — |
-| locomo-local-v016-event-date.md | 203 | qwen2.5:1.5b | 64.5% | 29.8% | — |
-| locomo-local-v016a-record.md | 607 | qwen2.5:1.5b | 62.3% | 30.4% | — |
-| locomo-local-v016b-event.md | 607 | qwen2.5:1.5b | 62.1% | 32.3% | — |
-| locomo-local-v017-event-human.md | 607 | qwen2.5:1.5b | 62.6% | 32.1% | 62.7% |
+| отчёт | n | модель | попадание факта@8 | ответы F1 | точность даты | судья (смысл) |
+|---|---|---|---|---|---|---|
+| locomo-local-baseline.md | 154 | qwen3.5:9b | — | 7.9% | — | — |
+| locomo-local-memory-dated.md | 154 | qwen3.5:9b | 31.8% | 15.7% | — | — |
+| locomo-local-memory.md | 154 | qwen3.5:9b | 31.8% | 15.7% | — | — |
+| locomo-local-v010.md | 154 | qwen3.5:9b | 53.2% | 24.6% | — | — |
+| locomo-local-v011.md | 154 | qwen3.5:9b | 53.2% | 28.2% | — | — |
+| locomo-local-v012-lemmas.md | 154 | qwen3.5:9b | 55.2% | 25.3% | — | — |
+| locomo-local-v012-typeboost.md | 154 | qwen3.5:9b | 53.9% | 25.1% | — | — |
+| locomo-local-v013-edgeorder.md | 154 | qwen3.5:9b | 49.4% | 22.2% | — | — |
+| locomo-local-v013-lemmas-beside.md | 154 | qwen3.5:9b | 62.3% | 28.9% | — | — |
+| locomo-local-v014-temporal-typeboost.md | ? | qwen3.5:9b | — | — | — | — |
+| locomo-local-v015-reader-qwen2.5-1.5b.md | 203 | qwen2.5:1.5b | 61.1% | 28.2% | — | — |
+| locomo-local-v016-event-date.md | 203 | qwen2.5:1.5b | 64.5% | 29.8% | — | — |
+| locomo-local-v016a-record.md | 607 | qwen2.5:1.5b | 62.3% | 30.4% | — | — |
+| locomo-local-v016b-event.md | 607 | qwen2.5:1.5b | 62.1% | 32.3% | — | — |
+| locomo-local-v017-event-human.md | 607 | qwen2.5:1.5b | 62.6% | 32.1% | 62.7% | — |
+| locomo-local-v018-judge.md | 607 | qwen2.5:1.5b | 62.3% | 31.1% | 66.3% | 40.0% |
 
 ## Ответы F1 по категориям
 
@@ -40,9 +41,17 @@
 | locomo-local-v016a-record.md | 24.3% | 3.8% | 7.6% | 40.6% | 38.4% |
 | locomo-local-v016b-event.md | 23.1% | 2.8% | 16.7% | 43.6% | 41.2% |
 | locomo-local-v017-event-human.md | 24.6% | 5.5% | 18.9% | 42.5% | 39.1% |
+| locomo-local-v018-judge.md | 21.6% | 3.8% | 18.9% | 43.5% | 36.3% |
 
 ## Точность даты по категориям
 
 | отчёт | одиночный факт | время | связь фактов | открытые | ловушки |
 |---|---|---|---|---|---|
 | locomo-local-v017-event-human.md | 0.0% | 63.4% | — | — | — |
+| locomo-local-v018-judge.md | 0.0% | 67.1% | — | — | — |
+
+## Судья: смысл, а не написание
+
+| отчёт | одиночный факт | время | связь фактов | открытые | ловушки |
+|---|---|---|---|---|---|
+| locomo-local-v018-judge.md | 34.1% | 27.5% | 18.2% | 50.8% | 37.0% |

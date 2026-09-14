@@ -186,6 +186,50 @@ def date_hit(pred: str, gold: str) -> "bool | None":
     return False
 
 
+_JUDGE_SYS = (
+    "You grade an answer against a gold answer. Judge MEANING, not wording: a "
+    "different spelling, date format, or phrasing that identifies the same fact "
+    "is CORRECT. A vague, wrong-topic, or evasive answer is INCORRECT. Partially "
+    "right answers (some of the needed facts, or the right event with the wrong "
+    "detail) are PARTIAL. Reply only as JSON: {\"verdict\": "
+    "\"correct\"|\"partial\"|\"incorrect\"}.")
+
+
+def judge_answer(llm, question: str, gold: str, pred: str) -> "float | None":
+    """Ask the local model whether the answer is right — the metric that does not
+    depend on spelling.
+
+    Why this exists: token-F1 scored a correct date 0.00 ("2023-10-10" vs "end of
+    October 2023") and rewards a chatty guess while punishing an honest "I don't
+    know" — measured on adversarial questions, where the smaller reader wins
+    purely by never refusing.  This is reported NEXT TO F1 and date accuracy, never
+    instead of them, and it is applied identically to every configuration, so it
+    cannot be tuned in favour of one.
+
+    Returns 1.0 (correct), 0.5 (partial), 0.0 (incorrect), or None if the judge
+    could not be reached — a failed judge is never counted as a wrong answer.
+    """
+    if llm is None or not str(pred or "").strip():
+        return 0.0
+    try:
+        data = llm.chat_json([
+            {"role": "system", "content": _JUDGE_SYS},
+            {"role": "user", "content": f"QUESTION: {question}\nGOLD: {gold}\nANSWER: {pred}"},
+        ])
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    v = str(data.get("verdict") or "").strip().lower()
+    if v.startswith("correct"):
+        return 1.0
+    if v.startswith("partial"):
+        return 0.5
+    if v.startswith("incorrect"):
+        return 0.0
+    return None
+
+
 def f1_score(pred: str, gold: str) -> float:
     """Token-level F1 between a predicted and gold answer (the standard,
     LLM-judge-free QA metric — SQuAD/LoCoMo-style). 1.0 for an exact token
@@ -380,7 +424,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               type_boost: bool = False,
               type_boost_weight: "float | None" = None,
               edge_order: bool = False, fts_lemmas: "bool | None" = None,
-              lemma_weight: "float | None" = None, event_date: bool = True) -> dict:
+              lemma_weight: "float | None" = None, event_date: bool = True,
+              judge: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -464,6 +509,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     per_cat: dict[int, list[bool]] = {}
     per_cat_f1: dict[int, list[float]] = {}
     per_cat_date: dict[int, list[bool]] = {}
+    per_cat_judge: dict[int, list[float]] = {}
     lat = []
     for qa in sample["qa"]:
         cat = int(qa.get("category") or 0)
@@ -521,10 +567,14 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             dh = date_hit(pred, gold)
             if dh is not None:
                 per_cat_date.setdefault(cat, []).append(bool(dh))
+            if judge and llm is not None:
+                jv = judge_answer(llm, str(qa["question"]), str(gold), str(pred))
+                if jv is not None:
+                    per_cat_judge.setdefault(cat, []).append(float(jv))
     store.close()
     return {"sample_id": sample["sample_id"], "per_cat": per_cat,
             "per_cat_f1": per_cat_f1, "per_cat_date": per_cat_date,
-            "latency_ms": lat}
+            "per_cat_judge": per_cat_judge, "latency_ms": lat}
 
 
 def main(argv=None) -> int:
@@ -659,6 +709,9 @@ def main(argv=None) -> int:
                     help="weight of the lemma channel inside RRF (default 2.0); the "
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
+    ap.add_argument("--judge", action="store_true",
+                    help="also score every answer with the local model as a JUDGE "
+                         "(meaning, not wording) — reported beside F1 and date accuracy")
     ap.add_argument("--no-event-date", dest="event_date", action="store_false", default=True,
                     help="render the RECORD date instead of the fact's EVENT date (A/B "
                          "switch for the event-time change)")
@@ -729,6 +782,7 @@ def main(argv=None) -> int:
     all_per_cat: dict[int, list[bool]] = {}
     all_per_cat_f1: dict[int, list[float]] = {}
     all_per_cat_date: dict[int, list[bool]] = {}
+    all_per_cat_judge: dict[int, list[float]] = {}
     all_lat: list[float] = []
     per_sample_summary = []
     for sample in data:
@@ -752,13 +806,16 @@ def main(argv=None) -> int:
                        edge_order=bool(args.edge_order),
                        fts_lemmas=args.fts_lemmas,
                        lemma_weight=args.lemma_weight,
-                       event_date=bool(args.event_date))
+                       event_date=bool(args.event_date),
+                       judge=bool(args.judge))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_f1", {}).items():
             all_per_cat_f1.setdefault(cat, []).extend(results)
         for cat, results in r.get("per_cat_date", {}).items():
             all_per_cat_date.setdefault(cat, []).extend(results)
+        for cat, results in r.get("per_cat_judge", {}).items():
+            all_per_cat_judge.setdefault(cat, []).extend(results)
         all_lat.extend(r["latency_ms"])
         n = sum(len(v) for v in r["per_cat"].values())
         hits = sum(sum(v) for v in r["per_cat"].values())
@@ -835,6 +892,25 @@ def main(argv=None) -> int:
         d_rate = dh / dn if dn else 0.0
         print(f"\nOVERALL date accuracy: {dh}/{dn} = {d_rate:.1%}")
         lines_md.append(f"\n**Overall date accuracy: {d_rate:.1%}** ({dh}/{dn})")
+
+    if all_per_cat_judge:
+        # Third metric, beside F1 and date accuracy: does the answer MEAN the right
+        # thing?  Judged by the local model with a prompt that never sees which
+        # configuration produced the answer, and applied identically everywhere.
+        jn = sum(len(v) for v in all_per_cat_judge.values())
+        jsum = sum(sum(v) for v in all_per_cat_judge.values())
+        print(f"\n=== JUDGE accuracy (meaning, not wording), n={jn} ===")
+        lines_md += ["", f"## Judge accuracy (meaning), n={jn}", "",
+                     "| Category | n | judge score |", "|---|---|---|"]
+        for cat in sorted(all_per_cat_judge):
+            v = all_per_cat_judge[cat]
+            m = sum(v) / len(v) if v else 0.0
+            name = CATEGORY_NAMES.get(cat, str(cat))
+            print(f"[{name:11s}] n={len(v):4d}  judge = {m:.1%}")
+            lines_md.append(f"| {cat} {name} | {len(v)} | {m:.1%} |")
+        j_rate = jsum / jn if jn else 0.0
+        print(f"\nOVERALL judge accuracy: {j_rate:.1%} (n={jn})")
+        lines_md.append(f"\n**Overall judge accuracy: {j_rate:.1%}** (n={jn})")
 
     if args.out:
         Path(args.out).write_text("\n".join(lines_md) + "\n", encoding="utf-8")

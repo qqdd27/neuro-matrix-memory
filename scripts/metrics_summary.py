@@ -62,6 +62,17 @@ def _overall_date(text: str) -> str:
     return f"{m.group(1)}%" if m else "—"
 
 
+def _overall_judge(text: str) -> str:
+    m = re.search(r"\*\*Overall judge accuracy: ([\d.]+)%\*\*", text)
+    if not m:
+        m = re.search(r"OVERALL judge accuracy: ([\d.]+)%", text)
+    return f"{m.group(1)}%" if m else "—"
+
+
+def _per_cat_judge(text: str) -> dict[str, str]:
+    return _md_body_rows(_section(text, "## Judge accuracy"))
+
+
 def _section(text: str, header: str) -> str:
     i = text.find(header)
     if i < 0:
@@ -106,8 +117,10 @@ def main() -> int:
             "hit": _overall_hit(text),
             "f1": _overall_f1(text),
             "date": _overall_date(text),
+            "judge": _overall_judge(text),
             "cats": _per_cat_f1(text),
             "dcats": _per_cat_date(text),
+            "jcats": _per_cat_judge(text),
         })
 
     lines = ["# NeuroMatrix — все измеренные метрики", "",
@@ -115,10 +128,11 @@ def main() -> int:
              "(`scripts/metrics_summary.py`); «—» означает, что отчёт этой метрики не содержит.",
              "",
              "## Сводка по прогонам", "",
-             "| отчёт | n | модель | попадание факта@8 | ответы F1 | точность даты |",
-             "|---|---|---|---|---|---|"]
+             "| отчёт | n | модель | попадание факта@8 | ответы F1 | точность даты | судья (смысл) |",
+             "|---|---|---|---|---|---|---|"]
     for r in rows:
-        lines.append(f"| {r['file']} | {r['n']} | {r['model']} | {r['hit']} | {r['f1']} | {r['date']} |")
+        lines.append(f"| {r['file']} | {r['n']} | {r['model']} | {r['hit']} | {r['f1']} | "
+                     f"{r['date']} | {r['judge']} |")
 
     lines += ["", "## Ответы F1 по категориям", "",
               "| отчёт | " + " | ".join(CATS.values()) + " |",
@@ -136,12 +150,20 @@ def main() -> int:
             lines.append(f"| {r['file']} | " + " | ".join(
                 r["dcats"].get(c, "—") for c in CATS) + " |")
 
+    lines += ["", "## Судья: смысл, а не написание", "",
+              "| отчёт | " + " | ".join(CATS.values()) + " |",
+              "|---|" + "---|" * len(CATS)]
+    for r in rows:
+        if r["jcats"]:
+            lines.append(f"| {r['file']} | " + " | ".join(
+                r["jcats"].get(c, "—") for c in CATS) + " |")
+
     Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    print(f"{'отчёт':38s} {'n':>5s} {'модель':14s} {'hit@8':>7s} {'F1':>7s} {'дата':>7s}")
+    print(f"{'отчёт':38s} {'n':>5s} {'модель':14s} {'hit@8':>7s} {'F1':>7s} {'дата':>7s} {'судья':>7s}")
     for r in rows:
         print(f"{r['file'][:38]:38s} {r['n']:>5s} {r['model'][:14]:14s} "
-              f"{r['hit']:>7s} {r['f1']:>7s} {r['date']:>7s}")
+              f"{r['hit']:>7s} {r['f1']:>7s} {r['date']:>7s} {r['judge']:>7s}")
     print(f"\nзаписано: {args.out}")
     return 0
 
