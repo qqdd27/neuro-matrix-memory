@@ -2281,6 +2281,39 @@ def test_event_time_is_stored_separately_from_record_time():
     store.close()
 
 
+def test_anaphora_makes_a_pronoun_fact_findable_by_name():
+    """A fact written with a pronoun must be reachable by the name it refers to,
+    and a wrong guess must never rewrite the stored text."""
+    from neuro_matrix import anaphora as A
+
+    # module level: gender agreement and the "no candidates" safe default
+    assert A.pronouns_in("She moved there") == ["she", "there"]
+    assert A.resolve_pronouns("She moved", []) == {}
+    fem = A.resolve_pronouns("She moved to Berlin", ["caroline", "constantine"])
+    assert fem.get("she") == "caroline", fem
+    masc = A.resolve_pronouns("He shipped it", ["caroline", "constantine"])
+    assert masc.get("he") == "constantine", masc
+
+    path = os.path.join(tempfile.mkdtemp(), "anaph.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.anaphora_enabled = True  # off by default (measured neutral); on for the test
+    base = time.time() - 3 * 86400
+    a = store.remember("Caroline moved to Lisbon last spring",
+                       source="turn", session_id="s1", ts=base, importance=1.0)
+    b = store.remember("She opened a small pottery studio there",
+                       source="turn", session_id="s1", ts=base + 60, importance=1.0)
+    assert a and b, "premise: both facts must be stored"
+
+    # stored text is untouched by resolution
+    row = store._conn.execute("SELECT text FROM facts WHERE id = ?", (b,)).fetchone()
+    assert row["text"] == "She opened a small pottery studio there", row["text"]
+
+    # and the pronoun fact is now reachable by the NAME
+    hits = [h["fact_id"] for h in store.search("Caroline pottery studio", limit=5)]
+    assert b in hits, f"pronoun fact not reachable by name: {hits}"
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

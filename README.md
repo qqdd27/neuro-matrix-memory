@@ -616,6 +616,37 @@ hidden by quoting only the flattering one — and the published 42-46% temporal
 figures from other systems are F1, not date accuracy, so they are NOT comparable
 to 63.4%.
 
+## Anaphora: the mechanism works, the gain does not (2026-09)
+
+A fact stored as "She opened a studio there" — or, far more commonly, "Caroline: I
+just joined a group" — is unreachable by the name a question uses.  Pronouns are now
+resolved, in order of certainty: **first person goes to the speaker named by the fact
+itself** ("I" in Caroline's turn *is* Caroline; no inference, no dictionary), and
+gendered pronouns go to a named participant of the same session whose gender is
+known.  The resolution is appended to the indexed text only — the stored text is
+never rewritten — so a wrong guess adds one searchable word and can neither hide a
+fact nor steal a slot.
+
+Two findings from measuring it:
+
+* the widest anaphora is the first person, not "she"/"he" — most turns are about
+  oneself, so the earlier gendered-only design was resolving the rare case;
+* **learned genders must be bounded by the sentence.**  The first learner chose the
+  nearest capitalised word before any pronoun and produced `sweden=f`, `seeing=f`
+  and `caroline=m`.  It now requires the name and the pronoun in the same sentence
+  within four words, and no longer guesses at all for "they"/"we"/"it", where the
+  first candidate is a coin flip.
+
+Measured on 607 questions it changes nothing that outgrows noise — F1 32.1% → 32.4%
+(+0.3, noise ±2 at this sample), evidence-hit@8 62.9% → 62.4%.  **OFF by default**,
+kept behind `anaphora_enabled` / `--no-anaphora`, numbers in
+`docs/locomo-local-v019-anaphora.md`.  The reason is structural: LoCoMo questions
+quote words from the answer turn, so the fact is already reachable lexically, and a
+second route to something already found can displace a better hit elsewhere in a
+fixed window.  The case it should help — question names a person, fact uses a
+pronoun, nothing else overlaps — is absent from the benchmark and is the common case
+in real use.
+
 ## Reader models: which number is comparable to which
 
 Two readers appear in this project's measurements, and **they are not

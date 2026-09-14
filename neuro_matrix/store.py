@@ -196,6 +196,15 @@ CREATE TABLE IF NOT EXISTS fact_lem (
     id INTEGER PRIMARY KEY,
     text TEXT NOT NULL DEFAULT ''
 );
+-- Gender learned from the facts themselves: "Caroline said she…" is proof that
+-- Caroline is feminine, and the user states it over and over.  This is why
+-- resolving "she" needs no name dictionary — only observation.  One row per name,
+-- updated whenever a sentence proves it.
+CREATE TABLE IF NOT EXISTS entity_gender (
+    name TEXT PRIMARY KEY,
+    gender TEXT NOT NULL,
+    updated_at REAL NOT NULL DEFAULT 0
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_lem_fts USING fts5(
     text, content='fact_lem', content_rowid='id', tokenize='unicode61'
 );
@@ -526,6 +535,17 @@ class NeuroMatrixStore:
         # Zero-dependency stdlib resolver; on by default, and it only ever adds a
         # stored date — it never changes which facts are returned.
         self.temporal_enabled = True
+        # Anaphora: resolve "I"/"she"/"там" to a name and add it to the INDEXED text
+        # (never to the stored text, never as a new channel).
+        #
+        # OFF by default: measured on 607 LoCoMo questions it moved nothing that
+        # outgrows noise — F1 32.1% -> 32.4% (+0.3, noise at this sample is ~±2),
+        # evidence-hit@8 62.9% -> 62.4%, date accuracy 63.9% -> 66.3%.  The mechanism
+        # itself works (first person resolves to the speaker with no inference at
+        # all: "Caroline: I joined a group" -> "I Caroline"), which is why the code
+        # and its flag stay — but "does nothing measurable" is recorded as such.
+        # See docs/locomo-local-v019-anaphora.md.
+        self.anaphora_enabled = False
         # Weight of the lemma channel inside RRF.  Always paired with the surface
         # channel, never replacing it.
         self.lemma_weight = 2.0
@@ -615,6 +635,7 @@ class NeuroMatrixStore:
                 "UPDATE entities SET last_seen=?, hits=hits+1 WHERE id=?",
                 (now, ent_id),
             )
+        self._learn_genders(fact_id, text, now)
         for i, a_id in enumerate(entities):
             for b_id in entities[i + 1:]:
                 self._touch_edge(a_id, b_id, now)
@@ -626,9 +647,10 @@ class NeuroMatrixStore:
             try:
                 from . import morphology
 
+                indexed = self._text_with_anaphora(text or "", session_id, now)
                 self._conn.execute(
                     "INSERT OR REPLACE INTO fact_lem(id, text) VALUES (?, ?)",
-                    (int(fact_id), morphology.normalize(text or "")))
+                    (int(fact_id), morphology.normalize(indexed)))
             except (sqlite3.Error, ValueError):
                 pass
         try:
@@ -822,6 +844,95 @@ class NeuroMatrixStore:
         self._cache.clear()
         return done
 
+    def _learn_genders(self, fact_id: int, text: str, now: float) -> None:
+        """Remember the gender a sentence proves: "Caroline said she…" -> caroline=f.
+
+        This runs on the write path because that is where the proof arrives.  It is
+        deliberately quiet: a failure here must never cost a stored fact.
+        """
+        if not getattr(self, "anaphora_enabled", False):
+            return
+        try:
+            from . import anaphora
+
+            rows = self._conn.execute(
+                "SELECT e.key AS key FROM fact_entities fe "
+                "JOIN entities e ON e.id = fe.entity_id WHERE fe.fact_id = ?",
+                (int(fact_id),)).fetchall()
+            names = [str(r["key"]) for r in rows if r["key"]]
+            learned = anaphora.learn_genders(text or "", names)
+            for name, gender in learned.items():
+                self._conn.execute(
+                    "INSERT INTO entity_gender(name, gender, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET gender=excluded.gender, "
+                    "updated_at=excluded.updated_at",
+                    (name, gender, float(now)))
+        except (sqlite3.Error, Exception):  # noqa: BLE001 - never break a write
+            return
+
+    def _gender_hints(self, names: "list[str]") -> dict[str, str]:
+        """Genders already learned for these names, as a lookup for the resolver."""
+        if not names:
+            return {}
+        try:
+            marks = ",".join("?" * len(names))
+            rows = self._conn.execute(
+                f"SELECT name, gender FROM entity_gender WHERE name IN ({marks})",
+                tuple(n.lower() for n in names)).fetchall()
+        except sqlite3.Error:
+            return {}
+        return {str(r["name"]).lower(): str(r["gender"]) for r in rows}
+
+    def _text_with_anaphora(self, text: str, session_id: str, before_ts: float) -> str:
+        """Index text for a fact, with pronouns resolved to names from its session.
+
+        The resolution is appended to the INDEXED form only — the stored text is
+        untouched, so a wrong guess adds a searchable key and can never rewrite what
+        the fact says.  Resolution lives in the existing lemma index rather than a
+        new retrieval channel: eight measured attempts to widen the window all lost
+        to leaving it alone, while a channel that only makes an existing fact
+        reachable (the lemma index) gained 3.4 pp.
+        """
+        if not getattr(self, "anaphora_enabled", False):
+            return text
+        try:
+            from . import anaphora
+
+            cands = self._session_context_entities(session_id, before_ts)
+            terms = anaphora.resolution_terms(text or "", cands, self._gender_hints(cands),
+                                              speaker=anaphora.speaker_of(text or ""))
+        except Exception:  # noqa: BLE001 - optional, must never break a write
+            return text
+        return f"{text} {terms}".strip() if terms else text
+
+    def _session_context_entities(self, session_id: str, before_ts: float,
+                                  *, limit: int = 40) -> list[str]:
+        """Entity keys of the most recent facts before ``before_ts``, freshest first.
+
+        Same session when one is given; otherwise the most recent facts overall —
+        a fact with no session still deserves a chance at a resolvable pronoun.
+        """
+        try:
+            if session_id:
+                rows = self._conn.execute(
+                    "SELECT e.key AS key, MAX(f.ts) AS ts FROM fact_entities fe "
+                    "JOIN facts f ON f.id = fe.fact_id "
+                    "JOIN entities e ON e.id = fe.entity_id "
+                    "WHERE f.archived = 0 AND f.session_id = ? AND f.ts <= ? "
+                    "GROUP BY e.key ORDER BY ts DESC LIMIT ?",
+                    (session_id, float(before_ts), int(limit))).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT e.key AS key, MAX(f.ts) AS ts FROM fact_entities fe "
+                    "JOIN facts f ON f.id = fe.fact_id "
+                    "JOIN entities e ON e.id = fe.entity_id "
+                    "WHERE f.archived = 0 AND f.ts <= ? "
+                    "GROUP BY e.key ORDER BY ts DESC LIMIT ?",
+                    (float(before_ts), int(limit))).fetchall()
+        except sqlite3.Error:
+            return []
+        return [str(r["key"]) for r in rows if r["key"]]
+
     def rebuild_lemmas(self, *, limit: Optional[int] = None, batch: int = 200) -> int:
         """Build the lemma index for facts stored before it existed.
 
@@ -835,7 +946,7 @@ class NeuroMatrixStore:
             if take <= 0:
                 break
             rows = self._conn.execute(
-                "SELECT f.id, f.text FROM facts f "
+                "SELECT f.id, f.text, f.session_id, f.ts FROM facts f "
                 "WHERE f.archived = 0 AND NOT EXISTS "
                 "(SELECT 1 FROM fact_lem l WHERE l.id = f.id) "
                 "ORDER BY f.id LIMIT ?", (int(take),)).fetchall()
@@ -845,9 +956,11 @@ class NeuroMatrixStore:
                 from . import morphology
 
                 for r in rows:
+                    indexed = self._text_with_anaphora(
+                        str(r["text"] or ""), str(r["session_id"] or ""), float(r["ts"]))
                     self._conn.execute(
                         "INSERT OR REPLACE INTO fact_lem(id, text) VALUES (?, ?)",
-                        (int(r["id"]), morphology.normalize(str(r["text"] or ""))))
+                        (int(r["id"]), morphology.normalize(indexed)))
             except Exception:  # noqa: BLE001 - optional dependency
                 break
             self._conn.commit()

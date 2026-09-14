@@ -425,7 +425,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               type_boost_weight: "float | None" = None,
               edge_order: bool = False, fts_lemmas: "bool | None" = None,
               lemma_weight: "float | None" = None, event_date: bool = True,
-              judge: bool = False) -> dict:
+              anaphora: bool = True, judge: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -464,6 +464,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
         store.fts_lemmatize = bool(fts_lemmas)
     if lemma_weight is not None:
         store.lemma_weight = float(lemma_weight)
+    store.anaphora_enabled = bool(anaphora)
     if fts_lemmas:
         # Facts are written below through remember(), which indexes the lemma
         # form when the flag is on; nothing else to backfill in a fresh store.
@@ -709,6 +710,8 @@ def main(argv=None) -> int:
                     help="weight of the lemma channel inside RRF (default 2.0); the "
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
+    ap.add_argument("--no-anaphora", dest="anaphora", action="store_false", default=True,
+                    help="disable pronoun resolution (for A/B measurement)")
     ap.add_argument("--judge", action="store_true",
                     help="also score every answer with the local model as a JUDGE "
                          "(meaning, not wording) — reported beside F1 and date accuracy")
@@ -807,6 +810,7 @@ def main(argv=None) -> int:
                        fts_lemmas=args.fts_lemmas,
                        lemma_weight=args.lemma_weight,
                        event_date=bool(args.event_date),
+                       anaphora=bool(args.anaphora),
                        judge=bool(args.judge))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)
