@@ -28,6 +28,8 @@ FILES = [
     "propositions.py",
     "question_types.py",
     "morphology.py",
+    "temporal.py",
+    "anaphora.py",
     "config_schema.py",
     "plugin.yaml",
 ]
