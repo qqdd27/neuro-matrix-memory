@@ -2202,6 +2202,34 @@ def test_lemma_normalisation_is_deterministic_and_precise():
     assert M.lemma("memory") == "memory", "cache was not invalidated on switch"
 
 
+def test_temporal_resolve_absolute_and_relative_dates():
+    """Absolute dates resolve without an anchor; relative/partial ones need
+    the fact's own record time and must not silently guess without it."""
+    from neuro_matrix import temporal
+
+    r = temporal.resolve("She graduated on March 5, 2019")
+    assert r is not None and r.granularity == "day"
+    assert time.strftime("%Y-%m-%d", time.localtime(r.event_ts)) == "2019-03-05"
+
+    r = temporal.resolve("5 марта 2019 года она закончила университет")
+    assert r is not None and r.granularity == "day"
+    assert time.strftime("%Y-%m-%d", time.localtime(r.event_ts)) == "2019-03-05"
+
+    r = temporal.resolve("In May 2023 they moved to Berlin")
+    assert r is not None and r.granularity == "month"
+
+    # relative phrase: unresolvable without an anchor
+    assert temporal.resolve("my school event last week") is None
+    anchor = time.mktime((2023, 6, 9, 10, 0, 0, 0, 0, -1))
+    r = temporal.resolve("my school event last week", anchor)
+    assert r is not None
+    assert time.strftime("%Y-%m-%d", time.localtime(r.event_ts)) == "2023-06-02"
+
+    # a bare four-digit dollar figure is the known false-positive shared with
+    # the old shape-only regex -- not a regression, parity with it
+    assert temporal.resolve("just a random sentence") is None
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

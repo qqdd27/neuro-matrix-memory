@@ -285,7 +285,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               bridge_adaptive: bool = False, bridge_edge: str = "count",
               bridge_topk: int = 0, fts: "bool | None" = None,
               fts_weight: "float | None" = None,
-              fusion_blend: "float | None" = None, diag: int = 0,
+              fusion_blend: "float | None" = None, diag: int = 0, diag_cat: int = 2,
               resolve_relative: bool = False, slots: bool = False,
               slot_weight: "float | None" = None, role_bridge: bool = False,
               role_bridge_weight: "float | None" = None,
@@ -372,7 +372,6 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               f"({embedder.model})", flush=True)
 
     dmap = _dia_map(conv)
-    temporal_cat = 2
     diag_shown = [0]
     per_cat: dict[int, list[bool]] = {}
     per_cat_f1: dict[int, list[float]] = {}
@@ -408,9 +407,9 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
             gold = qa.get("answer")
             if gold is None:
                 gold = qa.get("adversarial_answer", "")
-            if diag and cat == temporal_cat and diag_shown[0] < diag:
+            if diag and cat == diag_cat and diag_shown[0] < diag:
                 diag_shown[0] += 1
-                print(f"\n--- DIAG temporal #{diag_shown[0]} [{sample['sample_id']}] ---")
+                print(f"\n--- DIAG cat{cat} #{diag_shown[0]} [{sample['sample_id']}] ---")
                 print(f"Q    : {qa['question']}")
                 print(f"GOLD : {gold!r}")
                 print(f"PRED : {pred!r}   F1={f1_score(pred, gold):.2f}")
@@ -558,8 +557,11 @@ def main(argv=None) -> int:
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
     ap.add_argument("--diag", type=int, default=0,
-                    help="print N temporal questions with gold answer, retrieved "
-                         "context and the reader's prediction (diagnosis mode)")
+                    help="print N questions (category --diag-cat) with gold answer, "
+                         "retrieved context and the reader's prediction (diagnosis mode)")
+    ap.add_argument("--diag-cat", type=int, default=2,
+                    help="category to print with --diag (1=single-hop, 2=temporal "
+                         "[default], 3=multi-hop, 4=open-domain, 5=adversarial)")
     ap.add_argument("--fusion-blend", type=float, default=None,
                     help="1.0 = pure RRF order; lower values let the evidence "
                          "score (kind priority, importance, content relevance) "
@@ -633,6 +635,7 @@ def main(argv=None) -> int:
                        bridge_edge=args.bridge_edge, bridge_topk=args.bridge_topk,
                        fts=(False if args.no_fts else None), fts_weight=args.fts_weight,
                        fusion_blend=args.fusion_blend, diag=args.diag,
+                       diag_cat=args.diag_cat,
                        resolve_relative=bool(args.rel_time),
                        slots=bool(args.slots), slot_weight=args.slot_weight,
                        role_bridge=bool(args.role_bridge),
