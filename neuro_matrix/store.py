@@ -546,6 +546,16 @@ class NeuroMatrixStore:
         # and its flag stay — but "does nothing measurable" is recorded as such.
         # See docs/locomo-local-v019-anaphora.md.
         self.anaphora_enabled = False
+        # "last time" / "first time": promote the extreme-by-date candidate to the
+        # front.  Safe by construction (relevance picks the pool, the date picks the
+        # extreme inside it, one position changes) — and measured to buy nothing:
+        # on the 112 questions that actually ask for an extreme, F1 40.8% -> 40.9%,
+        # evidence-hit@8 62.2% -> 61.3%, temporal 11.3% -> 9.9%.  The reason is a data
+        # ceiling, not the idea: only ~8.5% of facts carry an event date at all, and
+        # for the rest the fallback is the record time — identical for every fact of a
+        # session, so "latest" degenerates to "last session".
+        # See docs/locomo-local-v020-time-order.md.
+        self.time_order_enabled = False
         # Weight of the lemma channel inside RRF.  Always paired with the surface
         # channel, never replacing it.
         self.lemma_weight = 2.0
@@ -1750,6 +1760,71 @@ class NeuroMatrixStore:
             return []
         return [int(r["id"]) for r in rows]
 
+    def _event_time_map(self, fact_ids: "list[int]") -> dict[int, float]:
+        """fact_id -> the time of the EVENT it reports, falling back to when it was
+        recorded.  Most facts carry no explicit date, and for those the record time is
+        the only honest answer to "when" — not an invention, but the weaker of the two
+        facts we actually hold."""
+        out: dict[int, float] = {}
+        if not fact_ids:
+            return out
+        ph = ",".join("?" * len(fact_ids))
+        try:
+            for r in self._conn.execute(
+                    f"SELECT fact_id, event_ts FROM fact_time "
+                    f"WHERE fact_id IN ({ph})", list(fact_ids)).fetchall():
+                try:
+                    out[int(r["fact_id"])] = float(r["event_ts"])
+                except (TypeError, ValueError):
+                    continue
+        except sqlite3.Error:
+            pass
+        missing = [int(i) for i in fact_ids if int(i) not in out]
+        if missing:
+            ph2 = ",".join("?" * len(missing))
+            try:
+                for r in self._conn.execute(
+                        f"SELECT id, ts FROM facts WHERE id IN ({ph2})",
+                        missing).fetchall():
+                    try:
+                        out[int(r["id"])] = float(r["ts"])
+                    except (TypeError, ValueError):
+                        continue
+            except sqlite3.Error:
+                pass
+        return out
+
+    def _apply_time_order(self, query: str, results: list[dict[str, Any]],
+                          limit: int) -> list[dict[str, Any]]:
+        """Promote the earliest/latest fact when the question asks for an extreme.
+
+        The candidate pool is bounded to the top of the ranking (never the whole
+        result set), so the promoted fact is still one the memory considered relevant:
+        relevance decides WHO is in the pool, the date decides which of them is the
+        extreme.  With no decidable intent, or fewer than two dated candidates, the
+        ranking is returned untouched.
+        """
+        from . import temporal
+
+        intent = temporal.order_intent(query)
+        if not intent:
+            return results
+        pool = results[: max(int(limit or 8), 12)]
+        ts_map = self._event_time_map([int(h["fact_id"]) for h in pool])
+        dated = [h for h in pool if int(h["fact_id"]) in ts_map]
+        if len(dated) < 2:
+            return results
+
+        def _key(h: dict[str, Any]) -> float:
+            return ts_map[int(h["fact_id"])]
+
+        pick = max(dated, key=_key) if intent == "last" else min(dated, key=_key)
+        if results and results[0]["fact_id"] == pick["fact_id"]:
+            return results
+        promoted = dict(pick)
+        promoted["time_order"] = intent
+        return [promoted] + [h for h in results if h["fact_id"] != pick["fact_id"]]
+
     def _apply_fusion(self, query: str, results: list[dict[str, Any]], limit: int,
                       q_entities: Optional[dict[int, float]] = None) -> list[dict[str, Any]]:
         """Fuse up to four ranked lists — heuristic, lexical (BM25), dense
@@ -2033,6 +2108,7 @@ class NeuroMatrixStore:
             f":rb={getattr(self, 'role_bridge_enabled', None)}:{getattr(self, 'role_bridge_weight', None)}"
             f":mmr={getattr(self, 'mmr_enabled', None)}:bridge={getattr(self, 'bridge_enabled', None)}"
             f":cap={getattr(self, 'per_kind_cap', None)}"
+            f":to={getattr(self, 'time_order_enabled', None)}"
         )
         cache_key = (f"{query}|{limit}|{include_dossiers}|{as_of!r}|rerank={rerank}|{_opts}")
         # Repeated-question cache: an identical normalized ask that was
@@ -2234,6 +2310,18 @@ class NeuroMatrixStore:
             try:
                 results = self._apply_fusion(query, results, limit, q_entities)
             except Exception:  # noqa: BLE001 - fusion must never break recall
+                pass
+
+        # "last time" / "first time": the question asks for an EXTREME by date, not
+        # for the closest match by words.  Only the single extreme candidate is
+        # promoted to the front; every other position is left exactly as the ranking
+        # had it.  Deliberately not a re-sort: measured reorderings (edge order, type
+        # routing) lost to leaving the window alone, and a full re-sort by date would
+        # drown a precise hit under an old-but-dated one.
+        if getattr(self, "time_order_enabled", False) and as_of is None and results:
+            try:
+                results = self._apply_time_order(query, results, limit)
+            except Exception:  # noqa: BLE001 - ordering must never break recall
                 pass
 
         # LLM rerank (§10, optional): heuristic top-k -> LLM order.  Only when a

@@ -425,7 +425,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               type_boost_weight: "float | None" = None,
               edge_order: bool = False, fts_lemmas: "bool | None" = None,
               lemma_weight: "float | None" = None, event_date: bool = True,
-              anaphora: bool = True, judge: bool = False) -> dict:
+              anaphora: bool = True, time_order: bool = True,
+              judge: bool = False) -> dict:
     conv = sample["conversation"]
     session_keys = sorted(
         (key for key in conv if key.startswith("session_") and not key.endswith("_date_time")),
@@ -465,6 +466,7 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
     if lemma_weight is not None:
         store.lemma_weight = float(lemma_weight)
     store.anaphora_enabled = bool(anaphora)
+    store.time_order_enabled = bool(time_order)
     if fts_lemmas:
         # Facts are written below through remember(), which indexes the lemma
         # form when the flag is on; nothing else to backfill in a fresh store.
@@ -710,6 +712,14 @@ def main(argv=None) -> int:
                     help="weight of the lemma channel inside RRF (default 2.0); the "
                          "lemma index always runs BESIDE the surface index, never "
                          "instead of it")
+    ap.add_argument("--only-intent", choices=["last", "first", "any"],
+                    default=None,
+                    help="measure ONLY the questions that ask for an extreme by date "
+                         "(the subset the time-order mechanism acts on)")
+    ap.add_argument("--no-time-order", dest="time_order", action="store_false",
+                    default=True,
+                    help="disable promoting the earliest/latest fact for "
+                         "'first time'/'last time' questions (for A/B measurement)")
     ap.add_argument("--no-anaphora", dest="anaphora", action="store_false", default=True,
                     help="disable pronoun resolution (for A/B measurement)")
     ap.add_argument("--judge", action="store_true",
@@ -770,6 +780,27 @@ def main(argv=None) -> int:
                   f"sampling {n_sample}/{len(all_qas)} questions "
                   f"(seed={args.llm_seed}). This costs real API calls.")
 
+    if args.only_intent:
+        # Measure the mechanism on the questions it actually acts on.  On the full
+        # sample its effect is diluted by ~500 questions it never touches, which is
+        # how a real +3 pp on the target subset can read as noise overall.
+        from neuro_matrix import temporal as _T
+
+        wanted = [
+            (s["sample_id"], qa["question"]) for s in data for qa in s["qa"]
+            if qa.get("evidence") and qa.get("question")
+            and (lambda it: it is not None if args.only_intent == "any"
+                 else it == args.only_intent)(_T.order_intent(qa["question"]))
+        ]
+        qa_filter = set(wanted)
+        cats: dict[int, int] = {}
+        for s in data:
+            for qa in s["qa"]:
+                if (s["sample_id"], qa.get("question")) in qa_filter:
+                    cats[int(qa.get("category") or 0)] = cats.get(int(qa.get("category") or 0), 0) + 1
+        print(f"only-intent={args.only_intent}: {len(wanted)} questions "
+              f"(by category {dict(sorted(cats.items()))})")
+
     embedder = None
     if args.embeddings or args.embed_model:
         from neuro_matrix.embeddings import OllamaEmbedder
@@ -811,6 +842,7 @@ def main(argv=None) -> int:
                        lemma_weight=args.lemma_weight,
                        event_date=bool(args.event_date),
                        anaphora=bool(args.anaphora),
+                       time_order=bool(args.time_order),
                        judge=bool(args.judge))
         for cat, results in r["per_cat"].items():
             all_per_cat.setdefault(cat, []).extend(results)

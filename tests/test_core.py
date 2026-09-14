@@ -2314,6 +2314,38 @@ def test_anaphora_makes_a_pronoun_fact_findable_by_name():
     store.close()
 
 
+def test_time_order_promotes_the_extreme_when_the_question_asks_for_it():
+    """"last time" must NOT return the most similar fact, but the latest one —
+    and an ordinary question must be left exactly as it was ranked."""
+    path = os.path.join(tempfile.mkdtemp(), "torder.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.time_order_enabled = True  # off by default (measured neutral); on for the test
+    base = time.time() - 400 * 86400
+    first = store.remember("Caroline visited the pottery studio in Lisbon",
+                           source="turn", session_id="s1", ts=base, importance=1.0)
+    mid = store.remember("Caroline visited the pottery studio studio trip to Porto",
+                         source="turn", session_id="s1", ts=base + 200 * 86400,
+                         importance=1.0)
+    last = store.remember("Caroline visited the pottery studio again in Madrid",
+                          source="turn", session_id="s1", ts=base + 390 * 86400,
+                          importance=1.0)
+    assert first and mid and last, "premise: all three facts must be stored"
+
+    # the EXTREME by date comes first, even though the middle fact is lexically
+    # the closest to the question
+    hits = store.search("When did Caroline last visit the pottery studio?", limit=8)
+    assert hits[0]["fact_id"] == last, [h["fact_id"] for h in hits[:3]]
+    assert hits[0].get("time_order") == "last"
+
+    hits_first = store.search("What was the first pottery studio trip?", limit=8)
+    assert hits_first[0]["fact_id"] == first, [h["fact_id"] for h in hits_first[:3]]
+
+    # a question that asks for no extreme keeps the ranking untouched
+    plain = store.search("Where is the pottery studio?", limit=8)
+    assert "time_order" not in plain[0]
+    store.close()
+
+
 def _run_all() -> None:
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

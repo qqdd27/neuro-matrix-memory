@@ -272,3 +272,38 @@ def format_human(event_ts: float, granularity: str = "day") -> str:
     if g == "month":
         return f"{_MONTH_NAMES_EN[d.month]} {d.year}"
     return f"{_MONTH_NAMES_EN[d.month]} {d.day}, {d.year}"
+
+
+# --------------------------------------------------------------------------
+# Order intent: "last time" / "first time" ask for an EXTREME, not for the
+# closest match.  This is the one place where the memory is allowed to reorder
+# its answer by time, and it is not a heuristic guess: the question states the
+# criterion itself.  Everything else that reordered the window (edge ordering,
+# type routing) measured worse than leaving it alone; this is different because
+# the order asked for is the order the question is about.
+# --------------------------------------------------------------------------
+_LAST_PAT = re.compile(
+    r"\b(last|latest|most recent|most recently|recently|final|the other day)\b",
+    re.IGNORECASE)
+_FIRST_PAT = re.compile(
+    r"\b(first|earliest|initially|originally|in the beginning|at first)\b",
+    re.IGNORECASE)
+_LAST_PAT_RU = re.compile(
+    r"(последн\w*|недавн\w*|самый свеж\w*|напоследок)", re.IGNORECASE)
+_FIRST_PAT_RU = re.compile(
+    r"(впервые|перв\w*|изначальн\w*|самый ранн\w*|поначалу)", re.IGNORECASE)
+
+
+def order_intent(query: str) -> Optional[str]:
+    """'last', 'first', or None when the question does not ask for an extreme.
+
+    "first" wins when both appear ("the first time and the last") because the
+    earlier event is the narrower, more specific one to surface.
+    """
+    if not query:
+        return None
+    if _FIRST_PAT.search(query) or _FIRST_PAT_RU.search(query):
+        return "first"
+    if _LAST_PAT.search(query) or _LAST_PAT_RU.search(query):
+        return "last"
+    return None
