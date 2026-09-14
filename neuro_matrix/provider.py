@@ -1053,6 +1053,50 @@ def _tool_deadends(prov: NeuromatrixMemoryProvider, a: dict) -> str:
                       ensure_ascii=False)
 
 
+
+def _tool_attempt(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """Record ONE try at ONE goal and what came of it — including failures.
+
+    Knowledge answers "what is true"; this answers the question an agent asks while
+    working: "have I tried this, and what happened".  A failure recorded here is why
+    the same dead end does not get walked twice.
+    """
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    goal = (a.get("goal") or "").strip()
+    approach = (a.get("approach") or "").strip()
+    outcome = (a.get("outcome") or "").strip().lower()
+    if not goal or not approach:
+        return tool_error("attempt requires 'goal' and 'approach'")
+    if outcome not in ("ok", "partial", "fail"):
+        return tool_error("'outcome' must be one of: ok, partial, fail")
+    fid = store.record_attempt(
+        goal, approach, outcome,
+        reason=(a.get("reason") or "").strip(),
+        evidence=(a.get("evidence") or "").strip(),
+        session_id=(a.get("session_id") or "").strip())
+    return json.dumps({"ok": bool(fid), "attempt_id": fid, "goal": goal,
+                       "outcome": outcome}, ensure_ascii=False)
+
+
+def _tool_attempts(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """What has already been tried for a goal, with the outcomes.  Newest first."""
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    rows = store.attempts((a.get("goal") or "").strip(),
+                          limit=int(a.get("limit") or 20))
+    tried = [{"goal": r.get("g"), "approach": r.get("a"), "outcome": r.get("o"),
+              "reason": r.get("r"), "evidence": r.get("e"), "ts": r.get("ts")}
+             for r in rows]
+    failed = [r for r in tried if r.get("outcome") == "fail"]
+    worked = [r for r in tried if r.get("outcome") == "ok"]
+    return json.dumps({"ok": True, "count": len(tried), "attempts": tried,
+                       "summary": {"failed": len(failed), "worked": len(worked)}},
+                      ensure_ascii=False)
+
+
 def _tool_capabilities(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     """What do we know <entity> is good for (durable capability facts,
     captured automatically from 'X используется для Y' statements)."""
@@ -1331,6 +1375,8 @@ _HANDLERS = {
     "consolidate": _tool_consolidate,
     "stats": _tool_stats,
     "deadend": _tool_deadend,
+    "attempt": _tool_attempt,
+    "attempts": _tool_attempts,
     "deadends": _tool_deadends,
     "capabilities": _tool_capabilities,
     "ingest": _tool_ingest,

@@ -48,6 +48,11 @@ ALL_KINDS = (
     "episodic", "episode", "decision", "goal", "constraint",
     "lesson", "correction", "foresight", "artifact", "deadend",
     "capability", "doc", "status", "resolved", "rule", "trait",
+    # An attempt at a goal with its outcome — the unit of experience replay.
+    # It must be a REGISTERED kind: an unregistered one is silently rewritten to
+    # "episodic", and episodic facts without a durable anchor are dropped, which is
+    # how the first version of this lost every attempt it was given.
+    "attempt",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -2807,6 +2812,178 @@ class NeuroMatrixStore:
             "AND f.active_until IS NULL ORDER BY f.ts DESC, f.id DESC LIMIT 1",
             (concept_eid,)).fetchone()
         return dict(row) if row else None
+
+    # ------------------------------------------------ attempts (experience replay)
+
+    def record_attempt(self, goal: str, approach: str, outcome: str, *,
+                       reason: str = "", evidence: str = "", session_id: str = "",
+                       ts: Optional[float] = None, importance: float = 1.0) -> Optional[int]:
+        """Record ONE try at ONE goal, and what came of it.
+
+        Knowledge memory answers "what is true".  This answers the different question
+        an agent actually asks while working: "have I tried this, and what happened".
+        The distinction matters because a failed attempt is information — often the
+        most valuable kind — and a store that only keeps successes makes the agent
+        retry dead ends forever (the failure this project spent a day removing from
+        its own dead-end detector).
+
+        ``goal``        what was being achieved ("make the build pass on Windows")
+        ``approach``    what was tried ("pin flame to 1.17.0")
+        ``outcome``     'ok' | 'partial' | 'fail'
+        ``reason``      why it worked or did not
+        ``evidence``    the observable that settles it (compiler output, test name)
+
+        Returns the fact id, or None when the attempt is not worth storing (no goal
+        or no approach).
+        """
+        g = (goal or "").strip()
+        a = (approach or "").strip()
+        if not g or not a:
+            return None
+        oc = (outcome or "").strip().lower()
+        if oc not in ("ok", "partial", "fail"):
+            oc = "partial" if oc else "fail"
+        now = float(ts if ts is not None else time.time())
+        mark = {"ok": "✓", "partial": "~", "fail": "✗"}[oc]
+        text = (f"{mark} Goal: {g} | Tried: {a} | Result: {oc}"
+                + (f" — {reason.strip()}" if reason else ""))
+        fid = None
+        try:
+            self.remember(
+                text, kind="attempt", source="attempt", session_id=session_id,
+                ts=now, importance=float(importance),
+                meta={"goal": g, "approach": a, "outcome": oc,
+                      "reason": (reason or "").strip(),
+                      "evidence": (evidence or "").strip()})
+        except Exception:  # noqa: BLE001 - never break the caller
+            return None
+        # the goal is an entity, so a later question about that goal can find its
+        # attempts through the ordinary recall path
+        try:
+            ent = self._resolve_entities(g, now)
+            if ent:
+                row = self._conn.execute(
+                    "SELECT id FROM facts WHERE kind='attempt' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                fid = int(row["id"]) if row else None
+                if fid:
+                    for e in ent:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) "
+                            "VALUES (?, ?)", (fid, e))
+        except sqlite3.Error:
+            pass
+        return fid
+
+    def attempts(self, goal: str = "", *, limit: int = 20) -> list[dict[str, Any]]:
+        """Attempts, newest first, optionally filtered to a goal (case-insensitive)."""
+        try:
+            if goal:
+                rows = self._conn.execute(
+                    "SELECT id, text, ts, json_extract(meta,'$.goal') g, "
+                    "json_extract(meta,'$.approach') a, json_extract(meta,'$.outcome') o, "
+                    "json_extract(meta,'$.reason') r, json_extract(meta,'$.evidence') e "
+                    "FROM facts WHERE kind='attempt' AND archived=0 "
+                    "AND json_extract(meta,'$.goal') LIKE ? COLLATE NOCASE "
+                    "ORDER BY ts DESC LIMIT ?",
+                    (f"%{goal.strip()}%", int(limit))).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, text, ts, json_extract(meta,'$.goal') g, "
+                    "json_extract(meta,'$.approach') a, json_extract(meta,'$.outcome') o, "
+                    "json_extract(meta,'$.reason') r, json_extract(meta,'$.evidence') e "
+                    "FROM facts WHERE kind='attempt' AND archived=0 "
+                    "ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()
+        except sqlite3.Error:
+            return []
+        return [dict(r) for r in rows]
+
+    def sweep_attempts(self, *, min_failures: int = 3) -> dict[str, Any]:
+        """Turn repeated failures into a warning the agent gets without asking.
+
+        Three failed tries at one goal, sharing a reason, is no longer an anecdote —
+        it is a fact about the world ("this approach does not work here"), and the
+        memory should say so at recall time instead of waiting to be asked.  This is
+        the step from stored experience to learned experience.
+
+        Returns a report of what was promoted.
+        """
+        report: dict[str, Any] = {"promoted": 0, "goals": []}
+        try:
+            rows = self._conn.execute(
+                "SELECT json_extract(meta,'$.goal') g, "
+                "json_extract(meta,'$.reason') r, COUNT(*) c FROM facts "
+                "WHERE kind='attempt' AND archived=0 "
+                "AND json_extract(meta,'$.outcome')='fail' "
+                "GROUP BY g HAVING c >= ?", (int(max(2, min_failures)),)).fetchall()
+        except sqlite3.Error:
+            return report
+        for r in rows:
+            goal = str(r["g"] or "").strip()
+            if not goal:
+                continue
+            # the most common failure reason for that goal, if any were recorded
+            try:
+                top = self._conn.execute(
+                    "SELECT json_extract(meta,'$.reason') r, COUNT(*) c FROM facts "
+                    "WHERE kind='attempt' AND archived=0 AND "
+                    "json_extract(meta,'$.outcome')='fail' AND "
+                    "json_extract(meta,'$.goal') = ? AND "
+                    "json_extract(meta,'$.reason') IS NOT NULL "
+                    "GROUP BY r ORDER BY c DESC LIMIT 1", (goal,)).fetchone()
+            except sqlite3.Error:
+                top = None
+            reason = (str(top["r"]) if top and top["r"] else "").strip()
+            already = False
+            try:
+                already = bool(self._conn.execute(
+                    "SELECT 1 FROM facts WHERE kind='deadend' AND archived=0 "
+                    "AND json_extract(meta,'$.subject') = ? COLLATE NOCASE LIMIT 1",
+                    (goal,)).fetchone())
+            except sqlite3.Error:
+                pass
+            if already:
+                continue
+            fail_n = int(r["c"])
+            text = (f"{fail_n} attempts at '{goal}' failed"
+                    + (f": {reason[:120]}" if reason else ""))
+            try:
+                self.mark_deadend(goal, text, source="sweep")
+                report["promoted"] += 1
+                report["goals"].append({"goal": goal, "failures": fail_n,
+                                        "reason": reason[:160]})
+            except Exception:  # noqa: BLE001
+                continue
+        return report
+
+    def export_experience(self, path: str, *, only: str = "") -> int:
+        """Write the accumulated attempts as JSONL for training.
+
+        This is the bridge from memory to weights: a line per attempt, each one a
+        (goal, approach, outcome, reason) record that a model can learn from — the
+        successes as positive examples and the failures as the negative ones the user
+        insisted are experience too.  ``only`` filters to one outcome ('ok'/'fail').
+
+        Returns the number of lines written.
+        """
+        import json as _json
+
+        rows = self.attempts(limit=1_000_000)
+        if only:
+            rows = [r for r in rows if str(r.get("o") or "") == only]
+        n = 0
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(_json.dumps({
+                    "goal": r.get("g") or "",
+                    "approach": r.get("a") or "",
+                    "outcome": r.get("o") or "",
+                    "reason": r.get("r") or "",
+                    "evidence": r.get("e") or "",
+                    "ts": r.get("ts"),
+                }, ensure_ascii=False) + "\n")
+                n += 1
+        return n
 
     def decide(
         self,

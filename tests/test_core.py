@@ -2314,6 +2314,53 @@ def test_anaphora_makes_a_pronoun_fact_findable_by_name():
     store.close()
 
 
+def test_attempts_record_failures_as_experience_and_promote_repeats():
+    """The user's point, made concrete: a negative result IS experience.  Repeated
+    failures at one goal must stop being anecdotes and become a warning, and the
+    whole history must be exportable for training."""
+    import json as _json
+
+    path = os.path.join(tempfile.mkdtemp(), "att.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    goal = "make the Flutter build pass on Windows"
+    a1 = store.record_attempt(goal, "pin flame to 1.17.0", "fail",
+                              reason="same linker error", evidence="flutter analyze")
+    a2 = store.record_attempt(goal, "downgrade dart sdk", "fail",
+                              reason="same linker error", evidence="flutter analyze")
+    a2b = store.record_attempt(goal, "rebuild the toolchain from scratch", "fail",
+                               reason="same linker error", evidence="flutter analyze")
+    a3 = store.record_attempt(goal, "add cmake flag -Wno-error", "ok",
+                              reason="linker stopped treating the warning as fatal")
+    assert a1 and a2 and a2b and a3, "attempts must be stored"
+
+    # bad input is refused rather than stored as noise
+    assert store.record_attempt("", "   ", "fail") is None
+    # an unknown outcome is coerced to 'partial' — a claim of failure must be explicit
+    assert store.record_attempt(goal, "x", "не-исход") is not None
+
+    rows = store.attempts(goal)
+    assert len(rows) == 5, rows
+    outcomes = {str(r["o"]) for r in rows}
+    assert "ok" in outcomes and "fail" in outcomes, outcomes
+
+    # two failures is not yet a verdict; three is
+    rep = store.sweep_attempts(min_failures=3)
+    assert rep["promoted"] == 1, rep
+    warned = store.deadends(goal)
+    assert warned, "repeated failures did not become a warning"
+    assert "failed" in str(warned[0].get("reason", "")), warned[0]
+
+    # and the history leaves for training
+    out = os.path.join(tempfile.mkdtemp(), "exp.jsonl")
+    n = store.export_experience(out)
+    assert n == 5, n
+    lines = [_json.loads(x) for x in open(out, encoding="utf-8").read().strip().split("\n")]
+    assert all({"goal", "approach", "outcome", "reason"} <= set(x) for x in lines)
+    fails = [x for x in lines if x["outcome"] == "fail"]
+    assert len(fails) == 3, fails
+    store.close()
+
+
 def test_recall_marks_kind_age_and_source():
     """A rule, a dead end and a plain observation must not arrive looking identical —
     and a dead-end warning must carry its age and where it came from, or the agent
