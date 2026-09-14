@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -250,9 +251,18 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     # the data a user already has.
                     m = self._store.rebuild_lemmas(limit=5000)
                     if m:
-                        logger.info("neuromatrix: indexed %d pre-existing facts by lemma", m)
-                except Exception as e:  # noqa: BLE001
+                        logger.info("neuromatrix: lemmatised %d pre-existing facts", m)
+                except Exception as e:  # noqa: BLE001 - never break the agent
                     logger.debug("neuromatrix lemma backfill failed: %s", e)
+                try:
+                    # Retroactive cleanup: dead ends invented by the old auto-detector
+                    # out of the assistant's own prose.  They arrive with the highest
+                    # recall score, so leaving them costs real context on every turn.
+                    g = self._store.archive_garbage_deadends()
+                    if g:
+                        logger.info("neuromatrix: archived %d junk dead ends", g)
+                except Exception as e:  # noqa: BLE001 - never break the agent
+                    logger.debug("neuromatrix dead-end cleanup failed: %s", e)
 
             threading.Thread(target=_run, name="neuromatrix-structure-backfill",
                              daemon=True).start()
@@ -469,6 +479,7 @@ class NeuromatrixMemoryProvider(MemoryProvider):
             budget = int(getattr(self, "_max_recall_chars", 1500))
             used = 0
             lines: list[str] = []
+            rule_lines: list[str] = []
             for r in results:
                 # Attach the EVENT date (when it happened), not just the record
                 # date, so the agent sees time the way the memory knows it.
@@ -481,7 +492,13 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                 line = self._format_hit(r)
                 if lines and used + len(line) > budget:
                     break
-                lines.append(line)
+                # A standing rule and an observation are not the same kind of claim:
+                # one must be obeyed, the other weighed.  Kept in separate lists so
+                # the rules are stated as rules instead of dissolving into the list.
+                if str(r.get("kind") or "") in ("rule", "constraint", "policy"):
+                    rule_lines.append(line)
+                else:
+                    lines.append(line)
                 used += len(line) + 1
             # Chronological trace: ONE added line stating the retrieved dated events in
             # order, with the gap between consecutive ones.  Measured on 607 questions
@@ -506,6 +523,9 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                         used += len(trace)
             except Exception as e:  # noqa: BLE001 - never break recall
                 logger.debug("neuromatrix timeline failed: %s", e)
+            if rule_lines:
+                parts.append("Standing rules (must be followed):")
+                parts.extend(rule_lines)
             parts.extend(lines)
             if lines:
                 self._recall = RecallStatus(provider_label="NeuroMatrix", count=len(lines))
@@ -694,8 +714,53 @@ class NeuromatrixMemoryProvider(MemoryProvider):
     # ------------------------------------------------------------ formatting
 
     @staticmethod
+    def _clip(text: str, limit: int = 300) -> str:
+        """Cut text at a boundary the reader can still parse.
+
+        The old form was ``text[:300]``, which slices mid-word and mid-table-cell —
+        that is where the fragments the user sees ("кап — **: 32") come from: a cut
+        through the middle of a markdown row reads as knowledge even though it is
+        rubble.  This prefers a sentence end, then a clause boundary, then a word
+        boundary, and marks the omission so a truncated fact never looks complete.
+        """
+        s = str(text or "")
+        s = " ".join(s.split())
+        # Markdown is not prose.  A table row carried into memory reads as rubble
+        # ("| гипотеза | результат | |---|---|"), and it is what makes fragments look
+        # like knowledge once they are cut.  Collapse the furniture, keep the words.
+        if any(ch in s for ch in ("|", "**", "```")):
+            s = re.sub(r"\|+", " ", s)
+            s = s.replace("**", "").replace("```", " ")
+            s = re.sub(r"^[#>\-\s]+", "", s)
+            s = " ".join(s.split())
+        if len(s) <= limit:
+            return s
+        window = s[:limit]
+        for sep in (". ", "! ", "? ", "; ", ", ", " — ", " - "):
+            cut = window.rfind(sep)
+            if cut >= limit * 0.55:
+                return window[: cut + 1].rstrip() + " …"
+        cut = window.rfind(" ")
+        if cut <= 0:
+            return window + "…"
+        return window[:cut].rstrip() + " …"
+
+    @staticmethod
     def _format_hit(r: Dict[str, Any]) -> str:
         via = f" (via {', '.join(r['via'][:3])})" if r.get("via") else ""
+        # What KIND of thing this is travels with the line: a standing rule the agent
+        # must obey and an observation it may weigh are not the same sort of claim, and
+        # a flat list hides that difference.  Dossiers already read as summaries.
+        kind = str(r.get("kind") or "episodic")
+        tag = ""
+        if kind in ("rule", "constraint", "policy"):
+            tag = "[rule] "
+        elif kind in ("deadend",):
+            tag = "[dead end] "
+        elif kind in ("capability",):
+            tag = "[capability] "
+        elif kind in ("trait",):
+            tag = "[trait] "
         if r["source"] == "dossier":
             return f"- {r['text']}"
         # Event date when the fact names one (with the weekday, a calendar lookup
@@ -718,11 +783,11 @@ class NeuromatrixMemoryProvider(MemoryProvider):
                     human = ""
                 if human:
                     when = f"{when} · {human}"
-                return f"- {r['text'][:300]}{via} [event {when}]"
+                return f"- {tag}{NeuromatrixMemoryProvider._clip(r['text'], 300)}{via} [event {when}]"
             except (TypeError, ValueError, OSError):
                 pass
         when = time.strftime("%Y-%m-%d", time.localtime(r["ts"])) if r.get("ts") else ""
-        return f"- {r['text'][:300]}{via} [{when}]"
+        return f"- {tag}{NeuromatrixMemoryProvider._clip(r['text'], 300)}{via} [{when}]"
 
     # ------------------------------------------------------------ shutdown
 

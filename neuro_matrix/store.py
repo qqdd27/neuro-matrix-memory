@@ -1095,6 +1095,53 @@ class NeuroMatrixStore:
                 pass
         return done
 
+    def archive_garbage_deadends(self) -> int:
+        """Archive dead ends the old auto-detector invented out of assistant prose.
+
+        Before this fix the outcome detector also read the ASSISTANT's replies, which
+        are full of the marker words it looks for ("error", "failed", "не работает"),
+        so every technical answer manufactured "dead ends" whose subject was the
+        nearest word and whose reason was a 120-character fragment of markdown.  In
+        one live profile all eighteen stored dead ends were of this kind, and they are
+        served back to the agent with the HIGHEST recall score — ahead of real
+        knowledge.
+
+        Runs at startup because the fix is retroactive: new garbage can no longer be
+        produced, but old rows stay until something removes them.  Archiving, never
+        deleting, and only for rows that are unambiguously junk.
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT id, json_extract(meta,'$.subject') s, "
+                "json_extract(meta,'$.reason') r FROM facts "
+                "WHERE kind='deadend' AND archived=0").fetchall()
+        except sqlite3.Error:
+            return 0
+        junk: list[int] = []
+        for r in rows:
+            s = str(r["s"] or "").strip()
+            reason = str(r["r"] or "")
+            if not s or s.isdigit() or len(s) < 3:
+                junk.append(int(r["id"]))
+                continue
+            if any(ch in s or ch in reason for ch in ("|", "**", "#", "`", "\n")):
+                junk.append(int(r["id"]))
+                continue
+            if not re.search(r"[A-Za-z]", s) and not s[:1].isupper():
+                junk.append(int(r["id"]))
+                continue
+            if len(reason.strip()) < 15:
+                junk.append(int(r["id"]))
+        if not junk:
+            return 0
+        try:
+            self._conn.executemany(
+                "UPDATE facts SET archived = 1 WHERE id = ?", [(i,) for i in junk])
+            self._conn.commit()
+        except sqlite3.Error:
+            return 0
+        return len(junk)
+
     def rebuild_event_times(self, *, limit: Optional[int] = None, batch: int = 200) -> int:
         """Resolve event times for facts stored before this existed.
 
@@ -1185,7 +1232,16 @@ class NeuroMatrixStore:
                 logging.getLogger("neuro_matrix").debug(
                     "auto_decide skipped", exc_info=True)
         if getattr(self, "outcome_enabled", True):
-            for txt in (user_content or "", assistant_content or ""):
+            # ONLY the user's turns.  This ran over assistant turns too, and an
+            # assistant reply is full of the very words the marker list looks for
+            # ("error", "failed", "не работает", "упал") — so every technical answer
+            # manufactured dead ends out of its own prose: "кап — **: 32",
+            # "607 — а в арифметике: я взял наблюдение…".  Eighteen of eighteen
+            # stored dead ends in a live profile were such garbage, and they were
+            # surfaced back with the HIGHEST recall score (9.5), ahead of real
+            # knowledge.  A person saying "X did not work" is the signal; a report
+            # about failures is not.
+            for txt in (user_content or "",):
                 if txt and not _is_notification(txt) and not _is_trivial(txt):
                     try:
                         self._auto_outcome_from_turn(txt, now_, session_id)
@@ -2583,7 +2639,8 @@ class NeuroMatrixStore:
                 if _keyset:
                     _de_rows = self._conn.execute(
                         "SELECT json_extract(meta,'$.subject') s, "
-                        "json_extract(meta,'$.reason') r, ts FROM facts "
+                        "json_extract(meta,'$.reason') r, "
+                        "json_extract(meta,'$.source') src, ts FROM facts "
                         "WHERE kind='deadend' AND archived=0 "
                         "AND json_extract(meta,'$.subject') IS NOT NULL "
                         "ORDER BY ts DESC LIMIT 12").fetchall()
@@ -2592,9 +2649,26 @@ class NeuroMatrixStore:
                         if len(_warns) >= 2:
                             break
                         if str(_dr["s"]).lower() in _keyset:
+                            # Age and provenance travel WITH the warning: a dead end
+                            # from a year ago and one from yesterday are different
+                            # claims, and "learned automatically" is weaker evidence
+                            # than "the user said so".  Without them the agent cannot
+                            # weigh the warning it is being handed.
+                            _src = ""
+                            try:
+                                _src = str(_dr["src"] or "")
+                            except (KeyError, IndexError, TypeError):
+                                _src = ""
+                            _when = ""
+                            try:
+                                _when = time.strftime("%Y-%m-%d", time.localtime(float(_dr["ts"])))
+                            except (TypeError, ValueError, OSError):
+                                _when = ""
+                            _meta_bits = ", ".join(x for x in (_when, _src) if x)
+                            _suffix = f" [{_meta_bits}]" if _meta_bits else ""
                             _warns.append({
                                 "fact_id": None,
-                                "text": (f"⚠ Known dead end: {_dr['s']} — "
+                                "text": (f"⚠ Known dead end{_suffix}: {_dr['s']} — "
                                          f"{str(_dr['r'] or '')[:120]}"),
                                 "kind": "deadend",
                                 "source": "deadend-warning",
@@ -3382,7 +3456,7 @@ class NeuroMatrixStore:
                 marker, idx = m, i
         if marker is None:
             return None
-        before = user_text[max(0, idx - 260):idx]
+        before = user_text[max(0, idx - 70):idx]
         keys = extract_entities(before)
         subject = keys[-1] if keys else None
         if subject is None:
@@ -3404,12 +3478,35 @@ class NeuroMatrixStore:
                         break
         if not subject or len(subject) < 2 or subject.lower() in self._DECIDE_SKIP:
             return None
+        # A dead end is a claim about a NAMED thing.  Without this check the nearest
+        # word before the marker is used whatever it is, which is how "кап", "607",
+        # "список" and "28" became subjects: ordinary prose next to a marker word.
+        # A subject must look like a term — Latin script, a capital, or an entity
+        # this memory already knows.  Numbers and plain lowercase Russian words are
+        # prose, not subjects.
+        _subj = str(subject).strip()
+        _looks_like_term = bool(re.search(r"[A-Za-z]", _subj)) or _subj[:1].isupper()
+        if not _looks_like_term:
+            try:
+                _known = self._conn.execute(
+                    "SELECT 1 FROM entities WHERE key = ? COLLATE NOCASE LIMIT 1",
+                    (_subj,)).fetchone()
+            except sqlite3.Error:
+                _known = None
+            if not _known:
+                return None
         after = user_text[idx + len(marker): idx + len(marker) + 260]
         seg = after
         rm = OUTCOME_REASON_RE.search(after)
         if rm:
             seg = after[rm.end():]
         seg = seg.split("?")[0].split(".")[0].split("!")[0]
+        # Markdown is not prose: a reason cut out of a table row or a bolded fragment
+        # reads as "| **сказать связь один раз строкой**" — noise that later reaches
+        # the agent as if it were knowledge.
+        if any(ch in seg for ch in ("|", "**", "#", "\n", "```")):
+            seg = re.sub(r"[|#*`]+", " ", seg)
+        seg = " ".join(seg.split())
         seg = seg.strip(" ,;:-—").replace("и теперь", "").replace("и надо", "")
         seg = seg.strip(" ,;:-—")
         if (len(seg) < 3 or seg.lower().startswith(

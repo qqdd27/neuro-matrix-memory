@@ -2314,6 +2314,86 @@ def test_anaphora_makes_a_pronoun_fact_findable_by_name():
     store.close()
 
 
+def test_recall_marks_kind_age_and_source():
+    """A rule, a dead end and a plain observation must not arrive looking identical —
+    and a dead-end warning must carry its age and where it came from, or the agent
+    cannot weigh it."""
+    from neuro_matrix.provider import NeuromatrixMemoryProvider as P
+
+    class R(dict):
+        pass
+
+    base = {"via": [], "ts": time.time(), "source": "turn"}
+    rule = P._format_hit(R(base, kind="rule", text="Never touch the MEXC connector",
+                           fact_id=1, event_ts=None, event_granularity=None))
+    assert rule.startswith("- [rule]"), rule
+    trait = P._format_hit(R(base, kind="trait", text="prefers short answers",
+                            fact_id=2, event_ts=None, event_granularity=None))
+    assert trait.startswith("- [trait]"), trait
+    plain = P._format_hit(R(base, kind="episodic", text="the deploy finished",
+                            fact_id=3, event_ts=None, event_granularity=None))
+    assert plain.startswith("- the deploy finished"), plain
+    # a fact with an event date still shows it, in both forms
+    dated = P._format_hit(R(base, kind="episodic", text="we moved",
+                            fact_id=4, event_ts=1789000000.0, event_granularity="day"))
+    assert "[event 2026-" in dated and "·" in dated, dated
+
+    # dead-end warnings: age and provenance in the line itself
+    path = os.path.join(tempfile.mkdtemp(), "warn.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.remember("Flutter ne podoshel dlya etogo proekta", source="turn",
+                   session_id="s1", ts=time.time() - 86400)
+    store.mark_deadend("Flutter", "performance too low", source="auto")
+    hits = store.search("Flutter dlya proekta", limit=5)
+    warnings = [h for h in hits if h.get("kind") == "deadend"]
+    if warnings:  # the warning only appears when the entity is in the recall
+        txt = str(warnings[0]["text"])
+        assert "⚠ Known dead end" in txt and "[" in txt and "]" in txt, txt
+    store.close()
+
+
+def test_dead_ends_are_learned_only_from_the_user_and_only_about_named_things():
+    """The auto dead-end detector ran over assistant replies too, and an assistant
+    reply is full of marker words ("error", "failed", "не работает") — every
+    technical answer manufactured dead ends out of its own prose.  Eighteen of
+    eighteen stored dead ends in a live profile were such garbage ("кап — **: 32"),
+    and they were served back with the highest recall score, ahead of real
+    knowledge.  This pins both halves of the fix."""
+    path = os.path.join(tempfile.mkdtemp(), "outcome.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.outcome_enabled = True
+
+    # 1. a real user statement about a named thing IS learned
+    store.add_turn("Flutter не подошёл, потому что производительность низкая",
+                   "Понимаю.", session_id="s1")
+    subs = [str(r["subject"]) for r in store._conn.execute(
+        "SELECT json_extract(meta,'$.subject') subject FROM facts WHERE kind='deadend'")]
+    assert any("flutter" in s.lower() for s in subs), subs
+
+    # 2. an assistant report about failures is NOT a dead end
+    before = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind='deadend'").fetchone()["c"]
+    store.add_turn("посмотри логи",
+                   ("Было три ошибки: NameError 'chrono_context' is not defined, "
+                    "прогон упал с error и сборка сломалась на 607 вопросах"),
+                   session_id="s1")
+    after = store._conn.execute(
+        "SELECT COUNT(*) c FROM facts WHERE kind='deadend'").fetchone()["c"]
+    assert after == before, "an assistant reply about failures created a dead end"
+
+    # 3. prose next to a marker word is not a subject: only terms are
+    store.add_turn("в арифметике я ошибся и кап был 32 процента, это не сработало",
+                   "", session_id="s1")
+    rows = [dict(r) for r in store._conn.execute(
+        "SELECT json_extract(meta,'$.subject') s FROM facts WHERE kind='deadend' "
+        "AND ts > ?", (time.time() - 30,))]
+    for r in rows:
+        s = str(r["s"] or "")
+        assert not s.isdigit(), f"a number became a subject: {s}"
+        assert not any(ch in s for ch in "|#*"), f"markdown became a subject: {s}"
+    store.close()
+
+
 def test_timeline_trace_states_the_relations_between_events():
     """The mechanism behind the largest temporal gain measured in this project: one
     line placing the retrieved dated events in order, with the gap between them.

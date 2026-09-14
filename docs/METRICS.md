@@ -22,6 +22,11 @@
 | locomo-local-v016b-event.md | 607 | qwen2.5:1.5b | 62.1% | 32.3% | — | — |
 | locomo-local-v017-event-human.md | 607 | qwen2.5:1.5b | 62.6% | 32.1% | 62.7% | — |
 | locomo-local-v018-judge.md | 607 | qwen2.5:1.5b | 62.3% | 31.1% | 66.3% | 40.0% |
+| locomo-local-v019-anaphora.md | ? | qwen2.5:1.5b | — | — | — | — |
+| locomo-local-v020-time-order.md | ? | qwen2.5:1.5b | — | — | — | — |
+| locomo-local-v021-temporal-research.md | ? | qwen2.5:1.5b | — | — | — | — |
+| locomo-local-v022-llm-dates.md | ? | qwen2.5:1.5b | — | — | — | — |
+| locomo-local-v023-timeline.md | ? | qwen2.5:1.5b | — | — | — | — |
 
 ## Ответы F1 по категориям
 
