@@ -453,8 +453,8 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
               type_boost_weight: "float | None" = None,
               edge_order: bool = False, fts_lemmas: "bool | None" = None,
               lemma_weight: "float | None" = None, event_date: bool = True,
-              anaphora: bool = True, time_order: bool = True,
-              time_nudge: bool = True, time_nudge_weight: "float | None" = None,
+              anaphora: "bool | None" = None, time_order: "bool | None" = None,
+              time_nudge: "bool | None" = None, time_nudge_weight: "float | None" = None,
               chrono_context: bool = False, llm_dates: bool = False,
               time_distance: bool = False, timeline: bool = False,
               judge: bool = False) -> dict:
@@ -496,9 +496,16 @@ def run_sample(sample: dict, k: int, *, llm: "LLMClient | None" = None,
         store.fts_lemmatize = bool(fts_lemmas)
     if lemma_weight is not None:
         store.lemma_weight = float(lemma_weight)
-    store.anaphora_enabled = bool(anaphora)
-    store.time_order_enabled = bool(time_order)
-    store.time_nudge_enabled = bool(time_nudge)
+    # A rejected mechanism must stay rejected.  These three used to default to True
+    # HERE while the product ships them OFF, so every run after that silently measured
+    # a configuration no user ever had (found as a reproducible 61.4% -> 59.8% search
+    # regression).  None means "leave the product's own default alone".
+    if anaphora is not None:
+        store.anaphora_enabled = bool(anaphora)
+    if time_order is not None:
+        store.time_order_enabled = bool(time_order)
+    if time_nudge is not None:
+        store.time_nudge_enabled = bool(time_nudge)
     if time_nudge_weight is not None:
         store.time_nudge_weight = float(time_nudge_weight)
     if fts_lemmas:

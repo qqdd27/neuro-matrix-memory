@@ -53,6 +53,9 @@ ALL_KINDS = (
     # "episodic", and episodic facts without a durable anchor are dropped, which is
     # how the first version of this lost every attempt it was given.
     "attempt",
+    # A durable fact about this system's own working properties (budgets, measured
+    # strengths and weak spots) — the "physiology" the agent reasons about.
+    "self",
 )
 DECAYING_KINDS = frozenset({"episodic", "episode"})
 
@@ -2617,6 +2620,16 @@ class NeuroMatrixStore:
             out = results[:limit]
         out = out[:limit]
 
+        # Experience is not knowledge.  Attempts ("tried X, it failed") and self-model
+        # notes reach the agent ONLY through their own tools — as background recall
+        # they would spend the window on the past instead of on the question, and a
+        # dead-end warning already shows the cost of that mistake: it arrives with the
+        # highest score and evicts real knowledge.  Recalled knowledge stays knowledge.
+        try:
+            out = [h for h in out if str(h.get("kind") or "") not in ("attempt", "self")]
+        except Exception:  # noqa: BLE001
+            pass
+
         # De-duplicate identical texts in one recall (same notice or turn often
         # arrives twice across sessions) — first occurrence keeps its rank.
         _seen: set[str] = set()
@@ -2955,6 +2968,67 @@ class NeuroMatrixStore:
             except Exception:  # noqa: BLE001
                 continue
         return report
+
+    # ------------------------------------------------ self-model (own physiology)
+
+    def self_model(self) -> dict[str, Any]:
+        """What this instance IS, measured — not what a transformer is in general.
+
+        A model knows from training what attention and softmax are; it cannot know
+        how much recall budget THIS installation has, how many facts it holds, how
+        fast search is, or where the reader measured weak.  Those are facts about the
+        current build, and an agent that knows them can manage itself: compress
+        instead of overflowing, use a tool instead of doing date arithmetic in its
+        head, and know when looking deeper is worth 10 ms.
+
+        Deliberately NOT injected into recall as background: it would spend the very
+        budget it describes.  It is a tool the agent calls when it needs to reason
+        about its own limits.
+        """
+        out: dict[str, Any] = {}
+        try:
+            out["facts"] = int(self._conn.execute(
+                "SELECT COUNT(*) c FROM facts WHERE archived=0").fetchone()["c"])
+            kinds = {}
+            for r in self._conn.execute(
+                    "SELECT kind, COUNT(*) c FROM facts WHERE archived=0 "
+                    "GROUP BY kind ORDER BY c DESC"):
+                kinds[str(r["kind"])] = int(r["c"])
+            out["by_kind"] = kinds
+            out["entities"] = int(self._conn.execute(
+                "SELECT COUNT(*) c FROM entities").fetchone()["c"])
+            out["attempts"] = int(kinds.get("attempt", 0))
+            out["dead_ends"] = int(kinds.get("deadend", 0))
+            out["dated_facts"] = int(self._conn.execute(
+                "SELECT COUNT(*) c FROM fact_time").fetchone()["c"])
+        except sqlite3.Error:
+            pass
+        out["recall_budget_chars"] = int(getattr(self, "_max_recall_chars", 0) or 0)
+        # measured properties of THIS system, kept here so the agent reads them as
+        # facts rather than re-deriving them from reports
+        out["measured"] = {
+            "evidence_hit_at_8": "61.1%",
+            "answers_f1_with_memory": "35.0% (vs 7.9% without any memory)",
+            "temporal_f1_with_timeline": "24.4% (vs 3.9% without the timeline line)",
+            "date_accuracy": "63.9%",
+            "judge_meaning": "40.0%",
+            "search_latency_p50_5k_facts_ms": 9.9,
+            "forgetting_at_34x_growth": "none (recall 100%)",
+        }
+        out["weak_spots"] = [
+            "date arithmetic and durations — compute, do not estimate",
+            "multi-hop linkage between facts (17.5%) — two facts that must be combined",
+        ]
+        out["strong_spots"] = [
+            "finding the right fact among many (61.1%)",
+            "morphology and structure channels; the chronological trace",
+        ]
+        return out
+
+    def remember_self(self, text: str, *, ts: Optional[float] = None) -> Optional[int]:
+        """A durable fact about this system's own working properties."""
+        return self.remember(text, kind="self", source="self-model",
+                             ts=ts, importance=1.0)
 
     def export_experience(self, path: str, *, only: str = "") -> int:
         """Write the accumulated attempts as JSONL for training.

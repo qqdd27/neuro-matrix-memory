@@ -2314,6 +2314,43 @@ def test_anaphora_makes_a_pronoun_fact_findable_by_name():
     store.close()
 
 
+def test_experience_never_returns_as_background_recall():
+    """Attempts and self-notes are experience, not knowledge: they must be reachable
+    only through their own tools, never as ordinary recall — otherwise the window
+    fills with the past instead of the question."""
+    path = os.path.join(tempfile.mkdtemp(), "gate.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    goal = "make the Flutter build pass"
+    store.record_attempt(goal, "pin flame to 1.17.0", "fail",
+                         reason="linker error about symbols")
+    sid = store.remember_self("recall budget is 1500 characters")
+    assert sid, "a self-note must be storable"
+
+    # both are findable by their own text...
+    assert store.attempts(goal), "attempts(goal) must return the attempt"
+    # ...and neither leaks into ordinary recall
+    for q in ("Flutter build linker error symbols", "recall budget characters"):
+        kinds = {str(h.get("kind") or "") for h in store.search(q, limit=8)}
+        assert "attempt" not in kinds, f"attempt leaked into recall for {q!r}: {kinds}"
+        assert "self" not in kinds, f"self-note leaked into recall for {q!r}: {kinds}"
+    store.close()
+
+
+def test_self_model_reports_what_the_instance_actually_is():
+    """The physiology must be measured from THIS store, not recited from a report."""
+    path = os.path.join(tempfile.mkdtemp(), "self.db")
+    store = NeuroMatrixStore(path, llm=None, llm_daily_budget=0)
+    store.remember("the server runs on Linux", source="turn", session_id="s1")
+    store.record_attempt("ship the build", "skip tests", "fail", reason="broke prod")
+    m = store.self_model()
+    assert m["facts"] >= 2, m
+    assert m["by_kind"].get("attempt", 0) == 1, m["by_kind"]
+    assert m["attempts"] == 1 and m["dead_ends"] == 0, m
+    assert m["measured"]["evidence_hit_at_8"], m["measured"]
+    assert m["weak_spots"] and m["strong_spots"], m
+    store.close()
+
+
 def test_attempts_record_failures_as_experience_and_promote_repeats():
     """The user's point, made concrete: a negative result IS experience.  Repeated
     failures at one goal must stop being anecdotes and become a warning, and the

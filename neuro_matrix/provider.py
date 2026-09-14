@@ -1097,6 +1097,24 @@ def _tool_attempts(prov: NeuromatrixMemoryProvider, a: dict) -> str:
                       ensure_ascii=False)
 
 
+
+def _tool_self(prov: NeuromatrixMemoryProvider, a: dict) -> str:
+    """What this instance is: its own budget, size, speed and measured weak spots.
+
+    Not background context — called when the agent has a reason to reason about its
+    own limits (context is filling up, a date must be computed, a hard multi-hop
+    question is coming).
+    """
+    store = _ws(prov, a)
+    if store is None:
+        return tool_error("provider not initialized or shared workspace not configured")
+    model = store.self_model()
+    if a.get("remember"):
+        fid = store.remember_self(str(a["remember"]))
+        model["remembered"] = fid
+    return json.dumps({"ok": True, **model}, ensure_ascii=False)
+
+
 def _tool_capabilities(prov: NeuromatrixMemoryProvider, a: dict) -> str:
     """What do we know <entity> is good for (durable capability facts,
     captured automatically from 'X используется для Y' statements)."""
@@ -1376,6 +1394,7 @@ _HANDLERS = {
     "stats": _tool_stats,
     "deadend": _tool_deadend,
     "attempt": _tool_attempt,
+    "self": _tool_self,
     "attempts": _tool_attempts,
     "deadends": _tool_deadends,
     "capabilities": _tool_capabilities,
